@@ -103,34 +103,86 @@ class Labels:
         return self._map.get(str(tid), "")
 
 
-def build_items(result, labels):
+def _iou(a, b):
+    """IoU of two [x1,y1,x2,y2] boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+class SimpleTracker:
+    """Tiny greedy-IoU tracker for STABLE person ids across frames.
+
+    We drive detection with model.predict (stateless and reliable) instead of
+    model.track -- Ultralytics' built-in ByteTrack, run persistently in this
+    long-lived demand-gated process, would intermittently stop emitting any
+    detections at all. This assigns ids ourselves so the People naming feature
+    keeps working, while detection stays rock-solid.
+    """
+
+    def __init__(self, iou_thresh=0.3, max_age=15):
+        self.iou_thresh = iou_thresh
+        self.max_age = max_age
+        self.tracks = {}        # id -> [box, frames_since_seen]
+        self.next_id = 1
+
+    def update(self, boxes):
+        """boxes: list of [x1,y1,x2,y2]. Returns a parallel list of ids."""
+        ids = [None] * len(boxes)
+        used = set()
+        for bi, box in enumerate(boxes):
+            best_id, best = None, self.iou_thresh
+            for tid, (tbox, _age) in self.tracks.items():
+                if tid in used:
+                    continue
+                v = _iou(box, tbox)
+                if v >= best:
+                    best, best_id = v, tid
+            if best_id is None:
+                best_id = self.next_id
+                self.next_id += 1
+            used.add(best_id)
+            ids[bi] = best_id
+            self.tracks[best_id] = [box, 0]
+        for tid in list(self.tracks):          # age out tracks not seen this frame
+            if tid not in used:
+                self.tracks[tid][1] += 1
+                if self.tracks[tid][1] > self.max_age:
+                    del self.tracks[tid]
+        return ids
+
+
+def build_items(result, labels, tracker):
     """Per-person geometry for the browser canvas: id, name, box, 17 keypoints.
 
     box  = [x1, y1, x2, y2] in source-frame pixels.
     kpts = [[x, y, conf], ...17]  (COCO order; conf 0-1). The browser hides joints
-           and bones below KP_MIN_CONF.
+           and bones below KP_MIN_CONF. Stable ids come from `tracker`.
     """
     items = []
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
+        tracker.update([])                     # age out existing tracks
         return items
     xyxy = boxes.xyxy.cpu().numpy()
     n = len(xyxy)
-    # Track ids are OPTIONAL: ByteTrack may not assign one every frame. The skeleton
-    # is drawn from keypoints regardless; the id (and operator name) is just an extra
-    # when present. Gating the whole person on a track id would hide skeletons.
-    ids = boxes.id.int().tolist() if boxes.id is not None else [None] * n
+    box_list = [[int(v) for v in xyxy[i]] for i in range(n)]
+    ids = tracker.update(box_list)
     kp = result.keypoints
     kdata = kp.data.cpu().numpy() if (kp is not None and kp.data is not None) else None
     for i in range(n):
-        x1, y1, x2, y2 = (int(v) for v in xyxy[i])
-        tid = ids[i] if i < len(ids) else None
+        tid = ids[i]
         kpts = []
         if kdata is not None and i < len(kdata):
             for kx, ky, kc in kdata[i]:
                 kpts.append([int(kx), int(ky), round(float(kc), 2)])
         items.append({"id": tid, "name": labels.get(tid) if tid is not None else "",
-                      "box": [x1, y1, x2, y2], "kpts": kpts})
+                      "box": box_list[i], "kpts": kpts})
     return items
 
 
@@ -143,22 +195,29 @@ def main():
 
     print(f"[pose_service] torch {torch.__version__} cuda={torch.cuda.is_available()} "
           f"device={'cuda:0' if torch.cuda.is_available() else 'cpu'}", flush=True)
+    # GPU quirk on this Jetson image (debugged at length 2026-06-09): the FIRST
+    # model instance's CUDA inference in a process returns ZERO detections until
+    # CUDA is initialized, AND warming a model's OWN predictor poisons it (it then
+    # returns nothing on the real camera frames -> the skeleton silently never
+    # appears). Fix: warm CUDA with a THROWAWAY instance we discard, then create the
+    # real model and send it straight to the loop -- its first real predict sets up
+    # its own clean predictor on the already-initialized CUDA context. (Verified: a
+    # second, never-self-warmed instance detected reliably while the first returned
+    # nothing on the identical frame.)
+    try:
+        _warm = YOLO(MODEL)
+        _warm.predict(np.zeros((IMGSZ, IMGSZ, 3), np.uint8), imgsz=IMGSZ, verbose=False)
+        del _warm
+        print("[pose_service] cuda warmed (throwaway instance)", flush=True)
+    except Exception as e:
+        print(f"[pose_service] cuda warm skipped: {e}", flush=True)
+
     model = YOLO(MODEL)
     print(f"[pose_service] model={MODEL} infer_hz={INFER_HZ} conf={CONF} imgsz={IMGSZ} "
           f"always_on={ALWAYS_ON}", flush=True)
 
-    # Warm up the model + tracker now: the cold first inference does slow CUDA/JIT
-    # and tracker init (tens of seconds on Jetson). Doing it at startup means the
-    # first frame after the Skeleton toggle is fast, not a 30 s stall. Mirrors
-    # detect_service's warmup.
-    try:
-        model.track(np.zeros((IMGSZ, IMGSZ, 3), np.uint8), persist=True,
-                    tracker="bytetrack.yaml", verbose=False)
-        print("[pose_service] warmup done", flush=True)
-    except Exception as e:
-        print(f"[pose_service] warmup skipped: {e}", flush=True)
-
     labels = Labels()
+    tracker = SimpleTracker()
     idle_logged = False
     while True:
         t0 = time.time()
@@ -177,9 +236,8 @@ def main():
             continue
 
         try:
-            result = model.track(frame, persist=True, conf=CONF, imgsz=IMGSZ,
-                                 tracker="bytetrack.yaml", verbose=False)[0]
-            items = build_items(result, labels)
+            result = model.predict(frame, conf=CONF, imgsz=IMGSZ, verbose=False)[0]
+            items = build_items(result, labels, tracker)
         except Exception as e:
             print(f"[pose_service] inference error: {e}", flush=True)
             time.sleep(DT)

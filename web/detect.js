@@ -68,7 +68,7 @@
     window.CamOverlay.setDetect(on);
     if (on) {
       pollObjects(); pollStatus();
-      objTimer = setInterval(pollObjects, 1000);
+      objTimer = setInterval(pollObjects, 120);   // responsive box tracking
       statusTimer = setInterval(pollStatus, 3000);
     } else {
       clearInterval(objTimer); objTimer = null;

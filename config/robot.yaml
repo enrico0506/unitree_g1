@@ -13,8 +13,8 @@ server:
 
 # Velocity caps. G1 is rated ~0.8 m/s forward; raise carefully.
 speeds:
-  max_vx: 0.7          # m/s   forward / back   (W / S)
-  max_vy: 0.3        # m/s   strafe           (A / D)
+  max_vx: 1,5          # m/s   forward / back   (W / S)
+  max_vy: 0.7        # m/s   strafe           (A / D)
   max_vyaw: 2.0        # rad/s rotation          (arrow keys)
   slow_scale: 0.4      # multiplier while holding SHIFT (precise/slow mode)
 

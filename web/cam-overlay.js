@@ -126,6 +126,22 @@
     ctx.clearRect(0, 0, cw, ch);
     if (detectOn && detectData) drawDetect(detectData, cw, ch);
     if (poseOn && poseData) drawPose(poseData, cw, ch);   // skeletons on top
+
+    // On-canvas readout: proves the overlay layer is rendering and shows the live
+    // count the browser is receiving (skeleton people / detected objects).
+    if (poseOn || detectOn) {
+      const parts = [];
+      if (poseOn) parts.push("skeleton: " + (poseData && poseData.items ? poseData.items.length : "…"));
+      if (detectOn) parts.push("objects: " + (detectData && detectData.items ? detectData.items.length : "…"));
+      const txt = parts.join("    ");
+      ctx.font = "14px ui-monospace, Menlo, monospace";
+      ctx.textBaseline = "top";
+      const tw = ctx.measureText(txt).width;
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(8, 8, tw + 14, 24);
+      ctx.fillStyle = "#39d98a";
+      ctx.fillText(txt, 15, 13);
+    }
   }
   requestAnimationFrame(frame);
 

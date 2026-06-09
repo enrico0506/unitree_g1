@@ -96,7 +96,7 @@
     window.CamOverlay.setPose(on);
     if (on) {
       pollTracks(); pollStatus();
-      tracksTimer = setInterval(pollTracks, 1000);
+      tracksTimer = setInterval(pollTracks, 80);   // ~12 Hz, matches the pose service
       statusTimer = setInterval(pollStatus, 3000);
     } else {
       clearInterval(tracksTimer); tracksTimer = null;
