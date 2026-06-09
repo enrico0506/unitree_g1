@@ -1,0 +1,26 @@
+# Object-detection service for the G1 dashboard (staged; install after validation).
+#
+# Install:
+#   sudo cp /home/unitree/projects/g1/perception/detect/g1-detect.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now g1-detect     # enable only once validated
+#
+# Runs the detect container; reads /dev/shm/g1_camera.jpg, writes /dev/shm/g1_detect.jpg.
+# Independent of g1-web: if this is stopped, the raw camera feed/dashboard are unaffected.
+
+[Unit]
+Description=G1 object-detection (YOLO-World) annotator
+After=docker.service g1-web.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Clear any stale container, then run in the foreground so systemd tracks it.
+ExecStartPre=-/usr/bin/docker rm -f g1-detect
+ExecStart=/home/unitree/projects/g1/perception/detect/run_detect.sh
+ExecStop=-/usr/bin/docker stop g1-detect
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

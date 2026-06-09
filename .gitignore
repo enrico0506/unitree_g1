@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Model weights (large, downloadable pretrained models — not source) ---
+# e.g. perception/detect/models/clip/ViT-B-32.pt is 337 MB (> GitHub's 100 MB limit).
+# See the READMEs for how to obtain these. Regenerate/re-download into */models/.
+*.pt
+*.pth
+*.onnx
+*.engine
+perception/*/models/
+
+# --- Generated map data (re-created by running the mapper) ---
+maps/*.npy
+maps/*.ply
+
+# --- Debug / test capture frames ---
+perception/pose/*test*.jpg
+perception/**/*_test*.jpg
+
+# --- Local, machine-specific Claude Code settings ---
+.claude/settings.local.json
+
+# --- OS / editor cruft ---
+.DS_Store
+*.swp
+*~

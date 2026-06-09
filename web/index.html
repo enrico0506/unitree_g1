@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+  <title>G1 Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/vendor/three/three.module.js",
+      "three/addons/OrbitControls.js": "/static/vendor/three/OrbitControls.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header>
+    <h1>G1 Dashboard</h1>
+    <nav class="tabs">
+      <button class="tab current" data-tab="drive">Drive</button>
+      <button class="tab" data-tab="info">Logs &amp; Info</button>
+    </nav>
+    <div id="status" class="status">
+      <span class="dot"></span>
+      <span id="statusText">Connecting...</span>
+    </div>
+    <div id="battery" class="battery" title="Battery state of charge">
+      <span class="batt-icon"><i class="batt-fill"></i></span>
+      <span id="batteryText">—</span>
+    </div>
+  </header>
+
+  <!-- ========================= DRIVE TAB ========================= -->
+  <div id="tab-drive" class="tab-panel current">
+    <section class="windows">
+      <div class="media-window">
+        <div class="window-title">Camera <span id="camBadge" class="badge">…</span></div>
+        <div class="cam-bar">
+          <button id="poseToggle" title="Overlay people skeletons (YOLO11-pose)">Skeleton</button>
+          <button id="detectToggle" title="Overlay object-detection boxes (YOLO-World, open-vocab)">Object Detection</button>
+        </div>
+        <img id="camFeed" src="/camera/stream" alt="camera feed">
+        <canvas id="camCanvas"></canvas>
+        <div id="peopleBar" class="people-bar" hidden>
+          <span class="people-label">People <span id="poseBadge" class="badge">…</span></span>
+          <div id="peopleList" class="people-list"><span class="people-empty">none in view</span></div>
+        </div>
+        <div id="objBar" class="people-bar" hidden>
+          <span class="people-label">Objects <span id="detectBadge" class="badge">…</span></span>
+          <div id="objList" class="people-list"><span class="people-empty">nothing detected</span></div>
+        </div>
+      </div>
+
+      <div class="media-window">
+        <div class="window-title">LiDAR 3D — drag or use the pad <span id="lidarBadge" class="badge">…</span></div>
+        <div id="lidarView" class="lidar-canvas"></div>
+        <div class="nav-pad">
+          <button id="navUp"    class="n-up"    title="Tilt up">▲</button>
+          <button id="navLeft"  class="n-left"  title="Rotate left">◀</button>
+          <button id="navRight" class="n-right" title="Rotate right">▶</button>
+          <button id="navDown"  class="n-down"  title="Tilt down">▼</button>
+          <button id="navZoomIn"  class="n-zin"  title="Zoom in">+</button>
+          <button id="navZoomOut" class="n-zout" title="Zoom out">−</button>
+        </div>
+        <div class="orient-legend"><b style="color:#4ea1ff">↑ Z up</b> · X fwd · Y left</div>
+        <div class="view-bar">
+          <button id="viewHome" title="Reset orientation — Z up, cloud framed">⌂ Reset</button>
+          <button id="viewTop" title="Top-down (floor-plan) view">Top</button>
+          <button id="view3d" title="3D oblique view">3D</button>
+          <button id="viewFit" title="Frame the whole cloud">Fit</button>
+          <button id="ptMinus" title="Smaller points">−</button>
+          <button id="ptPlus" title="Bigger points">+</button>
+          <button id="viewColor" title="Toggle height colours / flat">Colour</button>
+          <button id="viewGrid" title="Toggle ground grid">Grid</button>
+        </div>
+        <div class="map-bar">
+          <button id="mapToggle" data-map="start">● Start Mapping</button>
+          <button id="mapSave" data-map="save">Save</button>
+          <input id="mapName" type="text" placeholder="map name" maxlength="24" autocomplete="off">
+          <button id="mapDiscard" data-map="clear">Discard</button>
+          <select id="mapLoad" title="Load a saved map"><option value="">Load map…</option></select>
+          <span id="mapStatus" class="map-status">live view</span>
+        </div>
+      </div>
+    </section>
+
+    <main>
+      <section class="panel modes">
+        <h2>Mode</h2>
+        <div class="mode-buttons">
+          <button data-mode="zero_torque" class="mode-btn">Zero Torque<br><small>FSM 0</small></button>
+          <button data-mode="damp" class="mode-btn current">Damp<br><small>FSM 1</small></button>
+          <button data-mode="stand" class="mode-btn">Stand<br><small>FSM 4</small></button>
+          <button data-mode="walk" class="mode-btn">Walk<br><small>FSM 802</small></button>
+        </div>
+        <p class="mode-hint" id="modeHint">
+          Mode "damp" (FSM 1): joints relaxed. Robot will not respond to movement.
+          Select "Stand" then "Walk" to enable WASD / arrow control.
+        </p>
+      </section>
+
+      <section class="panel buttons">
+        <h2>Touch</h2>
+        <div class="dpad">
+          <button data-hold="w" class="up">▲<br><small>W</small></button>
+          <button data-hold="a" class="left">◄<br><small>A</small></button>
+          <button data-tap="stop" class="center stop">STOP</button>
+          <button data-hold="d" class="right">►<br><small>D</small></button>
+          <button data-hold="s" class="down">▼<br><small>S</small></button>
+        </div>
+        <div class="rot">
+          <button data-hold="rotL" class="go">⟲ rotate L</button>
+          <button data-hold="rotR" class="go">rotate R ⟳</button>
+        </div>
+        <div class="posture">
+          <button data-cmd="low_stand">Low Stand</button>
+          <button data-cmd="high_stand">High Stand</button>
+          <button data-cmd="wave">Wave</button>
+          <button data-cmd="shake">Shake</button>
+        </div>
+      </section>
+
+      <section class="panel keys">
+        <h2>Keyboard</h2>
+        <p class="hint">
+          <b>W / S</b> forward / back &middot;
+          <b>A / D</b> strafe &middot;
+          <b>← / →</b> rotate<br>
+          <b>SPACE</b> stop &middot;
+          <b>1-4</b> mode (zero / damp / stand / walk)<br>
+          <b>9 / 0</b> wave / shake
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <!-- ====================== LOGS & INFO TAB ====================== -->
+  <div id="tab-info" class="tab-panel">
+    <main>
+      <section class="panel">
+        <h2>Robot</h2>
+        <div class="vel-line"><span>connection</span><b id="infoConn">—</b></div>
+        <div class="vel-line"><span>battery</span><b id="infoBattery">—</b></div>
+        <div class="vel-line"><span>FSM</span><b id="fsmVal">—</b></div>
+        <div class="vel-line"><span>mode</span><b id="infoMode">—</b></div>
+        <p id="fsmMismatch" class="mode-hint"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Velocity (commanded)</h2>
+        <div class="vel-line"><span>vx (fwd)</span><b id="vxVal">+0.00</b></div>
+        <div class="vel-line"><span>vy (strafe)</span><b id="vyVal">+0.00</b></div>
+        <div class="vel-line"><span>vyaw (rot)</span><b id="vyawVal">+0.00</b></div>
+        <div class="vel-line"><span>caps</span><b id="infoSpeeds">—</b></div>
+      </section>
+
+      <section class="panel">
+        <h2>Odometry / Pose</h2>
+        <div class="vel-line"><span>x (m)</span><b id="poseX">—</b></div>
+        <div class="vel-line"><span>y (m)</span><b id="poseY">—</b></div>
+        <div class="vel-line"><span>yaw (°)</span><b id="poseYaw">—</b></div>
+      </section>
+
+      <section class="panel">
+        <h2>Sensors &amp; Map</h2>
+        <div class="vel-line"><span>camera</span><b id="infoCam">—</b></div>
+        <div class="vel-line"><span>lidar view</span><b id="infoView">—</b></div>
+        <div class="vel-line"><span>map</span><b id="infoMap">—</b></div>
+      </section>
+
+      <section class="panel log">
+        <h2>Event log <button id="logClear" class="log-clear">clear</button></h2>
+        <div id="eventLog" class="event-log"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/controller.js"></script>
+  <script src="/static/camera.js"></script>
+  <script src="/static/cam-overlay.js"></script>
+  <script src="/static/pose.js"></script>
+  <script src="/static/detect.js"></script>
+  <script type="module" src="/static/lidar.js"></script>
+</body>
+</html>

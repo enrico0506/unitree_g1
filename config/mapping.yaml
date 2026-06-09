@@ -1,0 +1,177 @@
+# ============================================================================
+# G1 EDU U6 — Remote control and FSM mapping
+# ============================================================================
+# Discovered empirically by reading rt/wirelesscontroller and watching
+# LocoClient.GetFsmId() responses with scripts/read_state.py and
+# scripts/remote_mapper.py.
+#
+# Robot:    Unitree G1 EDU U6
+# Location: MyBotShop IEA
+# Owner:    Enrico
+# Last updated: 2026-05-28
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# REMOTE BUTTONS
+# ----------------------------------------------------------------------------
+# Each physical button on the Unitree remote toggles one bit in the
+# WirelessController_.keys uint16. Map: bit index -> human-readable name.
+# Verified by pressing each button individually with remote_mapper.py.
+# ----------------------------------------------------------------------------
+remote_keys:
+  # ---- Verified ----
+  0:  R1            # top-right shoulder
+  1:  L1            # top-left shoulder
+  4:  R2            # bottom-right shoulder
+  5:  L2            # bottom-left shoulder
+  8:  A             # face button
+  9:  B             # face button
+  10: X             # face button
+  11: Y             # face button
+  12: up            # D-pad up
+  13: left          # D-pad left
+  14: down          # D-pad down
+  15: right         # D-pad right
+
+  # ---- NOT YET VERIFIED — press these and update ----
+  2:  start?        # likely "start"
+  3:  select?       # likely "select"
+  6:  F1?           # likely "F1"
+  7:  F2?           # likely "F2"
+
+
+# ----------------------------------------------------------------------------
+# FSM MODES
+# ----------------------------------------------------------------------------
+# IDs returned by LocoClient.GetFsmId(). Update as you observe transitions.
+# Numbers below are the common Unitree G1 defaults — confirm with read_state.py
+# before trusting them.
+# ----------------------------------------------------------------------------
+fsm_modes:
+  0:
+    name: zero_torque
+    description: Motors off, robot limp. Hold robot before entering.
+    verified: false
+
+  1:
+    name: damping
+    description: Soft hold. Safest powered state. Usually the boot state.
+    verified: false
+
+  2:
+    name: get_ready
+    description: Squat / get-ready pose, partial torque.
+    verified: false
+
+  3:
+    name: lock_stand
+    description: Locked-knee stand, low power.
+    verified: false
+
+  4:
+    name: stand
+    description: Active balancing stand, knees bent.
+    verified: false
+
+  200:
+    name: main_control
+    description: Locomotion mode active, robot can walk via sticks.
+    verified: false
+
+
+# ----------------------------------------------------------------------------
+# REMOTE COMBOS — FSM TRIGGERS
+# ----------------------------------------------------------------------------
+# Combos observed via remote_mapper.py. Mark `triggers_fsm` only after you
+# confirm with read_state.py that fsm_id actually changes when pressed.
+#
+# Format:
+#   combo_name:
+#     bits:         list of bit indices that must be set
+#     hex:          combined bitmask (for quick reference)
+#     observed:     true if you've seen the combo on the wire
+#     triggers_fsm: target fsm_id, or null if no transition observed
+#     notes:        anything useful
+# ----------------------------------------------------------------------------
+remote_combos:
+  L2+Y:
+    bits: [5, 11]
+    hex: 0x0820
+    observed: true
+    triggers_fsm: null    # update after testing with read_state.py
+    notes: ""
+
+  L2+B:
+    bits: [5, 9]
+    hex: 0x0220
+    observed: true
+    triggers_fsm: null    # Unitree convention: usually damping (fsm_id=1)
+    notes: "Conventionally maps to damping on G1."
+
+  L2+up:
+    bits: [5, 12]
+    hex: 0x1020
+    observed: true
+    triggers_fsm: null
+    notes: ""
+
+  R2+A:
+    bits: [4, 8]
+    hex: 0x0110
+    observed: true
+    triggers_fsm: null
+    notes: ""
+
+  # ---- Combos NOT yet tested, but worth trying ----
+  L2+A:
+    bits: [5, 8]
+    hex: 0x0120
+    observed: false
+    triggers_fsm: null    # Unitree convention: usually stand-up (fsm_id=4)
+    notes: "Try with robot supported — likely stand-up."
+
+  L2+X:
+    bits: [5, 10]
+    hex: 0x0420
+    observed: false
+    triggers_fsm: null
+    notes: ""
+
+  start:
+    bits: [2]
+    hex: 0x0004
+    observed: false
+    triggers_fsm: null    # Unitree convention: enter main control (200)
+    notes: "Conventionally enters locomotion mode."
+
+  select:
+    bits: [3]
+    hex: 0x0008
+    observed: false
+    triggers_fsm: null
+    notes: ""
+
+
+# ----------------------------------------------------------------------------
+# NETWORK
+# ----------------------------------------------------------------------------
+network:
+  robot_ip: 192.168.123.161
+  robot_subnet: 192.168.123.0/24
+  laptop_interface_hint: eth0   # auto-detected in scripts/read_state.py
+
+
+# ----------------------------------------------------------------------------
+# SDK NOTES
+# ----------------------------------------------------------------------------
+sdk:
+  lowstate_topic: rt/lowstate
+  lowstate_type:  unitree_sdk2py.idl.unitree_hg.msg.dds_.LowState_
+  remote_topic:   rt/wirelesscontroller
+  remote_type:    unitree_sdk2py.idl.unitree_go.msg.dds_.WirelessController_
+  fsm_query:      LocoClient.GetFsmId()
+  fsm_topic_note: |
+    G1 does NOT publish FSM state on rt/sportmodestate the way Go2 does.
+    The unitree_hg.msg.dds_ namespace has no SportModeState_ at all.
+    Read FSM only via LocoClient.GetFsmId().

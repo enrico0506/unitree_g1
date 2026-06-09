@@ -1,0 +1,587 @@
+:root {
+  --bg: #0e0f15;
+  --panel: #181a24;
+  --panel2: #20232f;
+  --fg: #e6e6f0;
+  --dim: #7a7f95;
+  --accent: #ffb74d;
+  --ok: #4caf50;
+  --warn: #f44336;
+  --border: #2a2e3d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+h1 { margin: 0; font-size: 22px; }
+h2 {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  color: var(--dim);
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* Status indicator */
+.status {
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  color: var(--dim);
+}
+.status .dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: var(--warn);
+  transition: background 0.2s;
+}
+.status.connected .dot { background: var(--ok); }
+.status.connected { color: var(--fg); }
+
+/* Battery pill (header) — colour follows charge level via currentColor */
+.battery {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 16px;
+  font-size: 14px;
+  color: var(--dim);          /* unknown / not reporting */
+}
+.battery .batt-icon {
+  position: relative;
+  width: 26px;
+  height: 13px;
+  padding: 1.5px;
+  border: 1.5px solid currentColor;
+  border-radius: 3px;
+}
+.battery .batt-icon::after {  /* + terminal nub */
+  content: "";
+  position: absolute;
+  right: -4px;
+  top: 3px;
+  width: 2.5px;
+  height: 5px;
+  background: currentColor;
+  border-radius: 0 1px 1px 0;
+}
+.battery .batt-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: currentColor;
+  border-radius: 1px;
+  transition: width 0.4s ease;
+}
+.battery.ok   { color: var(--ok); }
+.battery.warn { color: var(--accent); }
+.battery.crit { color: var(--warn); }
+.battery.crit .batt-icon { animation: battpulse 1.2s ease-in-out infinite; }
+@keyframes battpulse { 50% { opacity: 0.35; } }
+
+/* Overlay canvas: skeletons + detection boxes drawn over the raw camera feed */
+#camCanvas {
+  position: absolute;
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: 6px;
+}
+.tab {
+  background: var(--panel);
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.tab.current {
+  background: var(--panel2);
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.tab-panel { display: none; }
+.tab-panel.current { display: block; }
+
+/* Event log */
+.panel.log h2 { display: flex; align-items: center; justify-content: space-between; }
+.log-clear {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--panel2);
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.event-log {
+  max-height: 320px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.log-line { color: var(--dim); white-space: pre-wrap; }
+.log-line.ok { color: var(--ok); }
+.log-line.warn { color: var(--accent); }
+
+/* Two-window layout (camera | lidar) */
+.windows {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+  margin-bottom: 12px;
+}
+@media (min-width: 720px) {
+  .windows { grid-template-columns: 1fr 1fr; }
+}
+
+.media-window {
+  position: relative;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  min-height: 240px;
+}
+.window-title {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  z-index: 2;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: rgba(14, 15, 21, 0.6);
+  padding: 3px 8px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+.badge {
+  color: var(--warn);
+  font-size: 11px;
+  margin-left: 4px;
+}
+.badge.live { color: var(--ok); }
+
+#camFeed {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+#camFeed.offline { opacity: 0.85; }
+
+.lidar-canvas {
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+.orient-legend {
+  position: absolute;
+  left: 110px;          /* sits just right of the 92px gizmo */
+  bottom: 12px;
+  z-index: 2;
+  font-size: 11px;
+  color: var(--dim);
+  background: rgba(14, 15, 21, 0.6);
+  padding: 2px 6px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+.lidar-canvas:active { cursor: grabbing; }
+.lidar-canvas canvas { display: block; }
+
+/* On-screen navigation pad (laptop-friendly orbit/tilt/zoom), bottom-right */
+.nav-pad {
+  position: absolute;
+  right: 8px;
+  bottom: 58px;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  grid-template-columns: 34px 34px 34px;
+  grid-template-areas:
+    ".    up    ."
+    "left .     right"
+    ".    down  ."
+    "zout .     zin";
+  background: rgba(14, 15, 21, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+}
+.nav-pad button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.nav-pad button:active { background: var(--accent); color: #1a1a1a; }
+.n-up { grid-area: up; } .n-left { grid-area: left; }
+.n-right { grid-area: right; } .n-down { grid-area: down; }
+.n-zin { grid-area: zin; } .n-zout { grid-area: zout; }
+
+/* View/analysis toolbar overlaid top-right of the lidar window */
+.view-bar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  background: rgba(14, 15, 21, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+}
+.view-bar button {
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 30px;
+}
+.view-bar button:hover { border-color: var(--accent); }
+
+/* Map control bar overlaid at the bottom of the lidar window */
+.map-bar {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(14, 15, 21, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.map-bar button,
+.map-bar input,
+.map-bar select {
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.map-bar input { width: 96px; }
+.map-bar #mapToggle.active {
+  background: var(--warn);
+  color: #fff;
+  border-color: var(--warn);
+}
+.map-status {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--dim);
+}
+.map-status.unsaved { color: var(--accent); }
+
+/* Layout */
+main {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 720px) {
+  main {
+    grid-template-columns: 1fr 1fr;
+  }
+  .panel.modes,
+  .panel.buttons,
+  .panel.log {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Panels */
+.panel {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+/* Mode selector */
+.mode-buttons {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.mode-btn {
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 8px;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: background 0.15s, border-color 0.15s;
+}
+.mode-btn small {
+  display: block;
+  font-size: 10px;
+  color: var(--dim);
+  margin-top: 2px;
+}
+.mode-btn:hover { border-color: var(--accent); }
+.mode-btn.current {
+  background: var(--ok);
+  color: white;
+  border-color: var(--ok);
+}
+.mode-btn.current small { color: rgba(255, 255, 255, 0.8); }
+
+/* Pulse while transitioning */
+.mode-btn.transitioning {
+  background: var(--accent);
+  color: #1a1a1a;
+  border-color: var(--accent);
+  animation: pulse 1s ease-in-out infinite;
+}
+.mode-btn.transitioning small { color: rgba(0, 0, 0, 0.6); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+.mode-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--dim);
+  line-height: 1.5;
+}
+.mode-hint.warn { color: var(--warn); }
+
+/* Velocity / FSM readout */
+.vel-line {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  color: var(--dim);
+}
+.vel-line b { color: var(--fg); }
+
+.hint {
+  color: var(--dim);
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 0;
+}
+
+/* Buttons (general) */
+button {
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 10px;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: background 0.1s, opacity 0.15s;
+}
+button:active,
+button.active {
+  background: var(--accent);
+  color: #1a1a1a;
+}
+button.stop {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+button.stop:active,
+button.stop.active {
+  background: var(--warn);
+  color: white;
+}
+button.go {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Disabled state — used for movement buttons outside walk mode */
+button[disabled],
+button.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+button[disabled]:active,
+button.disabled:active {
+  background: var(--panel2);
+  color: var(--fg);
+}
+
+/* D-pad layout */
+.dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 60px);
+  gap: 6px;
+  max-width: 260px;
+  margin: 0 auto 14px auto;
+}
+.dpad .up    { grid-column: 2; grid-row: 1; }
+.dpad .left  { grid-column: 1; grid-row: 2; }
+.dpad .center{ grid-column: 2; grid-row: 2; }
+.dpad .right { grid-column: 3; grid-row: 2; }
+.dpad .down  { grid-column: 2; grid-row: 3; }
+.dpad button small { display: block; font-size: 10px; color: var(--dim); }
+
+/* Rotation row */
+.rot {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  max-width: 260px;
+  margin: 0 auto 14px auto;
+}
+
+/* Posture row */
+.posture {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+/* Pose/skeleton toggle — overlaid top-right of the camera window (like view-bar) */
+.cam-bar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  background: rgba(14, 15, 21, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+}
+.cam-bar button {
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.cam-bar button:hover { border-color: var(--accent); }
+.cam-bar button.active {
+  background: var(--accent);
+  color: #1a1a1a;
+  border-color: var(--accent);
+}
+
+/* People label bar — overlaid at the bottom of the camera window (like map-bar) */
+.people-bar {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: rgba(14, 15, 21, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.people-bar[hidden] { display: none; }
+.people-label {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.people-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.people-empty { font-size: 12px; color: var(--dim); }
+.people-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+.people-id { font-size: 12px; color: var(--accent); }
+/* Object-detection count chips (e.g. "door ×2") in the Objects bar */
+.obj-chip {
+  font-size: 12px;
+  padding: 2px 8px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+}
+.people-row input {
+  width: 84px;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.people-row input:focus { outline: none; border-color: var(--accent); }

@@ -1,0 +1,977 @@
+"""Web-based teleop controller for the Unitree G1.
+
+Serves a webpage at http://<robot-ip>:8080.
+
+ARCHITECTURE
+    Browser ──HTTP──> serves static files from web/
+    Browser <─WS────> robot dispatcher  ─> G1 LocoClient   (commands)
+                                          H2 LocoClient    (FSM read-back)
+
+MODES (UI-level)
+    zero_torque  Motors off; robot collapses if not on gantry.   FSM 0
+    damp         Joints relaxed; safe neutral state.              FSM 1
+    stand        Robot is standing but not accepting velocity.    FSM 4
+    walk         Standing + velocity commands enabled.            FSM 802
+
+USAGE
+    pip3 install fastapi 'uvicorn[standard]' 'websockets>=10'
+    python3 scripts/robot_web_controller.py
+"""
+
+import asyncio
+import json
+import math
+import os
+import subprocess
+import sys
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+from unitree_sdk2py.g1.loco.g1_loco_api import ROBOT_API_ID_LOCO_SET_VELOCITY
+from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient as H2LocoClient
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_
+
+import yaml
+
+from camera_source import CameraSource
+from lidar_source import LidarSource, pack_cloud, OdomReader
+from map_builder import MapBuilder
+
+
+# --- Paths ---
+BASE_DIR = Path(__file__).resolve().parent.parent
+WEB_DIR = BASE_DIR / "web"
+CONFIG_PATH = BASE_DIR / "config" / "robot.yaml"
+CAMERA_SHM = "/dev/shm/g1_camera.jpg"   # frames written here by camera_service.py
+
+# Pose lane (people skeletons). Produced by the separate pose container
+# (~/perception/pose/pose_service.py); we only read/write these shm files.
+POSE_SHM = "/dev/shm/g1_pose.jpg"          # annotated JPEG (skeletons + labels)
+POSE_TRACKS = "/dev/shm/g1_pose_tracks.json"  # [{id, name, cx, cy}] live track list
+POSE_LABELS = "/dev/shm/g1_pose_labels.json"  # {"<id>": "name"} operator labels
+POSE_DEMAND = "/dev/shm/g1_pose_demand"    # heartbeat: pose only infers while watched
+
+# Detect lane (object detection). Produced by the separate g1-detect container
+# (perception/detect/detect_service.py, under this project); we only read/write these shm files.
+DETECT_SHM    = "/dev/shm/g1_detect.jpg"          # annotated JPEG (boxes + labels)
+DETECT_TRACKS = "/dev/shm/g1_detect_tracks.json"  # {w,h,items:[{cls,conf,box}]} live detections
+DETECT_DEMAND = "/dev/shm/g1_detect_demand"       # heartbeat: detect only infers while watched
+
+# Battery: the G1 publishes BMS state (state-of-charge, pack voltage, current) on a
+# low-frequency DDS topic as unitree_hg.BmsState_. The hg LowState_ has no battery
+# fields, so this is the source. soc is 0-100.
+BMS_TOPIC = "rt/lf/bmsstate"
+
+
+def load_config(path=CONFIG_PATH):
+    """Load config/robot.yaml; fall back to built-in defaults if absent."""
+    defaults = {
+        "network": {"interface": "eth0", "domain_id": 0},
+        "server": {"host": "0.0.0.0", "port": 8080},
+        "speeds": {"max_vx": 1.5, "max_vy": 1.0, "max_vyaw": 2.0, "slow_scale": 0.4},
+        "control": {"send_hz": 30, "watchdog_timeout": 2.0,
+                    "move_duration_s": 1.0, "cmd_resend_hz": 3},
+        "camera": {"stream_hz": 25},
+        "lidar": {"stream_hz": 10, "max_points": 25000, "camera_height_m": 1.3},
+        "map": {"dir": "maps", "voxel_size_m": 0.05, "max_points": 300000,
+                "max_range_m": 4.0, "yaw_sign": 1},
+        "mapping": {"run_cmd": "/home/unitree/g1_mapping_ws/run_mapping.sh"},
+    }
+    try:
+        with open(path) as f:
+            loaded = yaml.safe_load(f) or {}
+        for section, vals in loaded.items():
+            if section in defaults and isinstance(vals, dict):
+                defaults[section].update(vals)
+        print(f"Loaded config from {path}", flush=True)
+    except FileNotFoundError:
+        print(f"Config {path} not found; using defaults", flush=True)
+    return defaults
+
+
+CFG = load_config()
+
+# --- Config (sourced from config/robot.yaml) ---
+INTERFACE = CFG["network"]["interface"]
+DOMAIN_ID = CFG["network"]["domain_id"]
+
+HOST = CFG["server"]["host"]
+PORT = CFG["server"]["port"]
+
+# Velocity caps -- edit in config/robot.yaml. Pushed to the browser on connect.
+MAX_VX = CFG["speeds"]["max_vx"]
+MAX_VY = CFG["speeds"]["max_vy"]
+MAX_VYAW = CFG["speeds"]["max_vyaw"]
+SLOW_SCALE = CFG["speeds"]["slow_scale"]
+
+WATCHDOG_TIMEOUT = CFG["control"]["watchdog_timeout"]
+SEND_HZ = CFG["control"]["send_hz"]
+DT = 1.0 / SEND_HZ
+MOVE_DURATION = CFG["control"]["move_duration_s"]
+RESEND_PERIOD = 1.0 / CFG["control"]["cmd_resend_hz"]
+
+FSM_POLL_HZ = 2.0          # GetFsmId is a blocking RPC; keep it light
+FSM_BROADCAST_HZ = 2.0
+
+CAMERA_STREAM_HZ = CFG["camera"]["stream_hz"]
+LIDAR_STREAM_HZ = CFG["lidar"]["stream_hz"]
+LIDAR_MAX_POINTS = CFG["lidar"]["max_points"]
+LIDAR_CAMERA_HEIGHT = CFG["lidar"]["camera_height_m"]
+
+MAP_DIR = str((BASE_DIR / CFG["map"]["dir"]).resolve())
+MAP_VOXEL = CFG["map"]["voxel_size_m"]
+MAP_MAX_POINTS = CFG["map"]["max_points"]
+MAP_MAX_RANGE = CFG["map"]["max_range_m"]
+MAP_YAW_SIGN = CFG["map"]["yaw_sign"]
+MAPPING_RUN_CMD = CFG["mapping"]["run_cmd"]   # on-demand FAST-LIO launch wrapper
+
+VALID_MODES = {"zero_torque", "damp", "stand", "walk"}
+INITIAL_MODE = "damp"
+
+# --- Verified FSM mapping (Enrico's G1, MyBotShop IEA, 2026-05-28) ---
+FSM_ZERO_TORQUE = 0
+FSM_DAMPING = 1
+FSM_READY_STAND = 4
+FSM_MAIN_CONTROL = 802
+
+FSM_NAMES = {
+    FSM_ZERO_TORQUE:  "zero_torque",
+    FSM_DAMPING:      "damping",
+    FSM_READY_STAND:  "ready_stand",
+    FSM_MAIN_CONTROL: "main_control",
+}
+
+UI_TO_FSM = {
+    "zero_torque": FSM_ZERO_TORQUE,
+    "damp":        FSM_DAMPING,
+    "stand":       FSM_READY_STAND,
+    "walk":        FSM_MAIN_CONTROL,
+}
+
+# Reverse map: robot FSM id -> UI mode. Lets us reconcile the displayed mode to
+# the robot's ACTUAL state (read by the FSM poller) so the dashboard reflects
+# reality after a page reload or a dashboard restart -- not just the last command.
+FSM_TO_UI = {fsm: ui for ui, fsm in UI_TO_FSM.items()}
+
+
+# --- Shared state ---
+class ControlState:
+    def __init__(self):
+        self.vx = 0.0
+        self.vy = 0.0
+        self.vyaw = 0.0
+        self.last_packet_time = 0.0
+        self.is_moving = False
+        self.pending_cmd = None
+        self.mode = INITIAL_MODE
+        self.fsm_id = None
+        self.fsm_name = "unknown"
+        self.transitioning = False
+        # True once we've enabled continuous gait in the current walk session
+        self.gait_enabled = False
+        # Battery (from rt/lf/bmsstate; None until the first BMS message arrives)
+        self.battery_soc = None      # % state-of-charge
+        self.battery_v = None        # pack volts
+        self.battery_current = None  # amps (negative = discharging)
+
+
+state = ControlState()
+client: LocoClient = None
+reader: H2LocoClient = None
+clients: set = set()
+
+camera: CameraSource = None
+pose: CameraSource = None
+detect: CameraSource = None
+lidar: LidarSource = None
+odom: OdomReader = None
+mapper: MapBuilder = None
+
+_mode_lock = threading.Lock()
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def send_velocity(vx, vy, vyaw, duration):
+    """Fire-and-forget velocity command -- does NOT wait for a robot reply.
+
+    Velocity is sent via the no-reply RPC path so the command thread never blocks
+    on a slow robot response (a blocking Move() at high rate freezes the command
+    loop -> movement stalls AND the shared DDS bus starves the camera RPC, which
+    is why driving made the camera stutter and movement intermittently stop)."""
+    p = json.dumps({"velocity": [vx, vy, vyaw], "duration": duration})
+    client._CallNoReply(ROBOT_API_ID_LOCO_SET_VELOCITY, p)
+
+
+def fsm_name(fsm_id):
+    if fsm_id is None:
+        return "unknown"
+    return FSM_NAMES.get(fsm_id, f"fsm_{fsm_id}")
+
+
+# ---------------------------------------------------------------------------
+# FSM read-back (uses H2 client against G1)
+# ---------------------------------------------------------------------------
+
+def call_with_timeout(fn, timeout):
+    result = {"value": None, "exc": None}
+
+    def runner():
+        try:
+            result["value"] = fn()
+        except Exception as e:
+            result["exc"] = e
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive() or result["exc"] is not None:
+        return None
+    return result["value"]
+
+
+def fsm_poll_loop():
+    period = 1.0 / FSM_POLL_HZ
+    while True:
+        result = call_with_timeout(reader.GetFsmId, 1.0)
+        if result is not None:
+            code, fsm = result
+            if code == 0:
+                if fsm != state.fsm_id:
+                    print(f"[FSM] {state.fsm_id} ({fsm_name(state.fsm_id)}) "
+                          f"-> {fsm} ({fsm_name(fsm)})", flush=True)
+                    # If we left main_control, we lost continuous gait state
+                    if fsm != FSM_MAIN_CONTROL:
+                        state.gait_enabled = False
+                state.fsm_id = fsm
+                state.fsm_name = fsm_name(fsm)
+
+                # Reflect the robot's ACTUAL mode in the UI selection, so a page
+                # reload or a dashboard restart shows reality -- not the last
+                # commanded mode (which defaults to "damp"). Skip while a commanded
+                # transition owns state.mode; and keep "walk" intent when the robot
+                # has merely dropped to ready_stand, since command_loop's drive-time
+                # auto-rearm steps it back up (downgrading to "stand" here would
+                # disable the drive buttons and defeat that recovery).
+                if not state.transitioning:
+                    ui = FSM_TO_UI.get(fsm)
+                    if (ui is not None and ui != state.mode
+                            and not (state.mode == "walk"
+                                     and fsm == FSM_READY_STAND)):
+                        print(f"[MODE] sync '{state.mode}' -> '{ui}' "
+                              f"from robot FSM {fsm}", flush=True)
+                        state.mode = ui
+        time.sleep(period)
+
+
+# ---------------------------------------------------------------------------
+# Locomotion mode setup
+# ---------------------------------------------------------------------------
+
+def enable_continuous_gait():
+    """Tell the locomotion controller to step continuously and accept
+    full 2D + rotational velocity. This is what enables strafe and yaw."""
+    if state.gait_enabled:
+        return
+    print("[GAIT] enabling continuous gait (SetBalanceMode 1)", flush=True)
+    try:
+        # SetBalanceMode(1) = continuous gait (walk-able); 0 = static stand-only.
+        # (BalanceStand() on the G1 SDK just calls SetBalanceMode, so this is all
+        # that's needed -- and it takes a required arg, which is why the old
+        # bare BalanceStand() call errored.)
+        ret = client.SetBalanceMode(1)
+        print(f"[GAIT] SetBalanceMode(1) returned {ret}", flush=True)
+    except Exception as e:
+        print(f"[GAIT] SetBalanceMode failed: {e}", flush=True)
+    state.gait_enabled = True
+
+
+# ---------------------------------------------------------------------------
+# Mode commands
+# ---------------------------------------------------------------------------
+
+def wait_for_fsm(target_fsm, timeout=15.0, poll_period=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if state.fsm_id == target_fsm:
+            return True
+        time.sleep(poll_period)
+    return False
+
+
+def enter_mode(new_mode):
+    new_mode = (new_mode or "").lower()
+    if new_mode not in VALID_MODES:
+        print(f"[mode error: unknown '{new_mode}']", flush=True)
+        return
+
+    try:
+        client.StopMove()
+    except Exception:
+        pass
+    state.is_moving = False
+    state.vx = state.vy = state.vyaw = 0.0
+    state.gait_enabled = False
+
+    # Set transitioning BEFORE mode so the FSM poller's mode-sync can't briefly
+    # overwrite our just-set intent in the gap between these two assignments.
+    state.transitioning = True
+    state.mode = new_mode
+    print(f"[MODE] requested {new_mode}, current FSM={state.fsm_id}",
+          flush=True)
+
+    try:
+        ok = False
+
+        if new_mode == "zero_torque":
+            client.ZeroTorque()
+            ok = wait_for_fsm(FSM_ZERO_TORQUE, timeout=5.0)
+
+        elif new_mode == "damp":
+            client.Damp()
+            ok = wait_for_fsm(FSM_DAMPING, timeout=5.0)
+
+        elif new_mode == "stand":
+            if state.fsm_id == FSM_MAIN_CONTROL:
+                client.Damp()
+                wait_for_fsm(FSM_DAMPING, timeout=5.0)
+            client.SetFsmId(FSM_READY_STAND)
+            ok = wait_for_fsm(FSM_READY_STAND, timeout=15.0)
+
+        elif new_mode == "walk":
+            # Must be in ready_stand (FSM 4) first
+            if state.fsm_id != FSM_READY_STAND:
+                if state.fsm_id != FSM_DAMPING:
+                    client.Damp()
+                    if not wait_for_fsm(FSM_DAMPING, timeout=5.0):
+                        print("[MODE] walk: damp step failed", flush=True)
+                        return
+                client.SetFsmId(FSM_READY_STAND)
+                if not wait_for_fsm(FSM_READY_STAND, timeout=15.0):
+                    print(f"[MODE] walk: ready_stand failed, "
+                          f"FSM stuck at {state.fsm_id}", flush=True)
+                    return
+
+            # First attempt: often accepted but doesn't transition
+            ret1 = client.SetFsmId(FSM_MAIN_CONTROL)
+            print(f"[MODE] SetFsmId({FSM_MAIN_CONTROL}) #1 returned {ret1}",
+                  flush=True)
+
+            if wait_for_fsm(FSM_MAIN_CONTROL, timeout=3.0):
+                ok = True
+            else:
+                print("[MODE] walk: first attempt didn't transition, "
+                      "priming via ready_stand and retrying...", flush=True)
+                client.SetFsmId(FSM_READY_STAND)
+                wait_for_fsm(FSM_READY_STAND, timeout=10.0)
+                time.sleep(0.5)
+
+                ret2 = client.SetFsmId(FSM_MAIN_CONTROL)
+                print(f"[MODE] SetFsmId({FSM_MAIN_CONTROL}) #2 "
+                      f"returned {ret2}", flush=True)
+                ok = wait_for_fsm(FSM_MAIN_CONTROL, timeout=15.0)
+
+            # If we reached main_control, enable continuous gait so that
+            # strafe and yaw actually engage stepping (not just leaning).
+            if ok:
+                time.sleep(0.5)
+                enable_continuous_gait()
+
+            
+
+        if ok:
+            pass   # walk reached; speed is governed by the velocity we send
+        else:
+            print(f"[MODE] {new_mode} TIMEOUT, FSM stuck at {state.fsm_id}",
+                  flush=True)
+    finally:
+        state.transitioning = False
+
+
+def apply_cmd(name):
+    name = (name or "").lower()
+    if name == "low_stand":
+        client.LowStand()
+        print("[CMD] low_stand", flush=True)
+    elif name == "high_stand":
+        client.HighStand()
+        print("[CMD] high_stand", flush=True)
+    elif name == "wave":
+        client.WaveHand()
+        print("[CMD] wave", flush=True)
+    elif name == "shake":
+        client.ShakeHand()
+        print("[CMD] shake", flush=True)
+    else:
+        print(f"[cmd error: unknown '{name}']", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+async def broadcast(msg):
+    if not clients:
+        return
+    text = json.dumps(msg)
+    dead = []
+    for ws in list(clients):
+        try:
+            await ws.send_text(text)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.discard(ws)
+
+
+def make_state_msg():
+    return {
+        "type": "fsm_state",
+        "fsm_id": state.fsm_id,
+        "fsm_name": state.fsm_name,
+        "ui_mode": state.mode,
+        "transitioning": state.transitioning,
+    }
+
+
+def make_telemetry_msg():
+    x, y, yaw = odom.get_pose() if odom else (0.0, 0.0, 0.0)
+    return {
+        "type": "telemetry",
+        "x": round(x, 3),
+        "y": round(y, 3),
+        "yaw_deg": round(math.degrees(yaw), 1),
+        "odom_live": bool(odom and odom.is_live()),
+        "battery_soc": state.battery_soc,
+        "battery_v": state.battery_v,
+        "battery_current": state.battery_current,
+    }
+
+
+def run_enter_mode(name):
+    """Run enter_mode under the mode lock (skips if a transition is already running)."""
+    if not _mode_lock.acquire(blocking=False):
+        print(f"[MODE] ignored '{name}' -- transition in progress", flush=True)
+        return
+    try:
+        enter_mode(name)
+    finally:
+        _mode_lock.release()
+
+
+def command_loop():
+    """Send blocking robot RPCs (Move/StopMove/gestures) in a DEDICATED THREAD.
+
+    client.Move() is a blocking DDS RPC that waits for the robot's reply. It must
+    NOT run on the asyncio event loop -- doing so freezes the camera MJPEG stream
+    and WebSockets every time it's called (i.e. continuously while walking, which
+    is exactly when the camera "lost signal"). Running it here keeps the event
+    loop free for streaming.
+    """
+    DEADZONE = 0.02            # m/s; below this a change isn't worth an RPC
+    last_sent = (0.0, 0.0, 0.0)
+    last_send_time = 0.0
+    last_rearm_time = 0.0
+    last_gait_time = 0.0
+
+    while True:
+        now = time.time()
+
+        # One-shot gesture command -- run in a thread so a blocking gesture RPC
+        # (wave/shake) can't stall the velocity loop.
+        if state.pending_cmd is not None:
+            cmd = state.pending_cmd
+            state.pending_cmd = None
+            threading.Thread(target=apply_cmd, args=(cmd,), daemon=True).start()
+
+        # Watchdog: browser went silent -> force stop.
+        idle = now - state.last_packet_time
+        if (idle > WATCHDOG_TIMEOUT and state.last_packet_time > 0
+                and (state.is_moving
+                     or (state.vx, state.vy, state.vyaw) != (0.0, 0.0, 0.0))):
+            print(f"[WATCHDOG] {idle:.2f}s idle -> stop", flush=True)
+            state.vx = state.vy = state.vyaw = 0.0
+
+        # Desired velocity (zero unless actively walking).
+        if state.mode == "walk" and not state.transitioning:
+            desired = (clamp(state.vx, -MAX_VX, MAX_VX),
+                       clamp(state.vy, -MAX_VY, MAX_VY),
+                       clamp(state.vyaw, -MAX_VYAW, MAX_VYAW))
+        else:
+            desired = (0.0, 0.0, 0.0)
+
+        moving = desired != (0.0, 0.0, 0.0)
+        changed = any(abs(desired[i] - last_sent[i]) > DEADZONE for i in range(3))
+        in_walk = state.mode == "walk" and not state.transitioning
+
+        # Send only on CHANGE or as a low-rate refresh -- these are blocking RPCs;
+        # flooding them at loop rate saturates the DDS layer (kills movement+camera).
+        if in_walk and (changed or (now - last_send_time) >= RESEND_PERIOD):
+            try:
+                if (moving and state.fsm_id == FSM_READY_STAND
+                        and (now - last_rearm_time) > 5.0):
+                    # Robot dropped out of walking (idle timeout / safety) but the user
+                    # is driving -> auto re-arm (in a thread) so it ALWAYS moves.
+                    last_rearm_time = now
+                    print("[RECOVER] FSM=ready_stand while driving -> re-arming walk",
+                          flush=True)
+                    threading.Thread(target=run_enter_mode, args=("walk",),
+                                     daemon=True).start()
+                else:
+                    if moving and not state.gait_enabled and (now - last_gait_time) > 3.0:
+                        # re-assert stepping off-thread (blocking RPC) so we don't stall
+                        last_gait_time = now
+                        threading.Thread(target=enable_continuous_gait, daemon=True).start()
+                    # Non-blocking velocity. Zero = Move(0,0,0) keepalive (keeps the gait
+                    # hot; NEVER StopMove -> that drops gait and makes the next command
+                    # only lean / not respond until walk is re-entered).
+                    send_velocity(desired[0], desired[1], desired[2], MOVE_DURATION)
+                    state.is_moving = moving
+                    last_sent = desired
+                    last_send_time = now
+            except Exception as e:
+                print(f"[move error: {e}]", flush=True)
+
+        time.sleep(DT)
+
+
+async def broadcast_loop():
+    """Async, non-blocking: just pushes FSM + telemetry to clients."""
+    last_broadcast = 0.0
+    last_broadcast_fsm = None
+    last_transitioning = None
+    broadcast_period = 1.0 / FSM_BROADCAST_HZ
+
+    while True:
+        now = time.time()
+        should_broadcast = (
+            state.fsm_id != last_broadcast_fsm
+            or state.transitioning != last_transitioning
+            or (now - last_broadcast) >= broadcast_period
+        )
+        if should_broadcast:
+            await broadcast(make_state_msg())
+            await broadcast(make_telemetry_msg())
+            last_broadcast = now
+            last_broadcast_fsm = state.fsm_id
+            last_transitioning = state.transitioning
+
+        await asyncio.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI lifecycle
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client, reader, camera, pose, detect, lidar, odom, mapper
+    print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
+    ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
+
+    client = LocoClient()
+    client.SetTimeout(1.0)   # short: a slow reply can't stall the bus for 10s
+    client.Init()
+    print("G1 LocoClient ready (commands).", flush=True)
+
+    reader = H2LocoClient()
+    reader.SetTimeout(1.0)
+    reader.Init()
+    print("H2 LocoClient ready (FSM read-back).", flush=True)
+
+    fsm_thread = threading.Thread(target=fsm_poll_loop, daemon=True)
+    fsm_thread.start()
+    print("FSM poller started.", flush=True)
+
+    # Battery: subscribe to the BMS topic and stash SOC/voltage/current on `state`.
+    # The callback runs on the DDS thread (just a few field copies; non-blocking).
+    def _on_bms(msg):
+        try:
+            state.battery_soc = int(msg.soc)
+            cells = [v for v in msg.bmsvoltage if v]          # mV per pack, 0 = absent
+            state.battery_v = round(max(cells) / 1000.0, 1) if cells else None
+            state.battery_current = round(msg.current / 1000.0, 2)  # mA -> A
+        except Exception:
+            pass
+    bms_sub = ChannelSubscriber(BMS_TOPIC, BmsState_)
+    bms_sub.Init(_on_bms, 10)
+    print(f"BMS subscriber started ({BMS_TOPIC}).", flush=True)
+
+    # Camera runs in its OWN process (own DDS participant + RPC), so a busy/blocked
+    # locomotion RPC can't starve it. It writes frames to shared memory; we read them.
+    cam_proc = subprocess.Popen(
+        [sys.executable, str(BASE_DIR / "scripts" / "camera_service.py"),
+         INTERFACE, str(CAMERA_STREAM_HZ), CAMERA_SHM])
+    camera = CameraSource(path=CAMERA_SHM)
+    print("Camera service (separate process) started.", flush=True)
+
+    # Pose lane reader. The pose container (g1-pose.service) is OPTIONAL and runs
+    # independently; if it's down, pose.is_live() is False and the skeleton view
+    # just shows "no signal" -- the raw camera feed is unaffected.
+    pose = CameraSource(path=POSE_SHM)
+    pose.backend = "pose"
+
+    # Detect lane reader. The g1-detect container is OPTIONAL and runs independently;
+    # if it's down, detect.is_live() is False and the object-detection view just shows
+    # "no signal" -- the raw camera feed is unaffected.
+    detect = CameraSource(path=DETECT_SHM)
+    detect.backend = "detect"
+
+    odom = OdomReader()
+    odom.start()
+    mapper = MapBuilder(MAP_DIR, run_cmd=MAPPING_RUN_CMD, max_points=MAP_MAX_POINTS)
+
+    lidar = LidarSource(max_points=LIDAR_MAX_POINTS, mount_height=LIDAR_CAMERA_HEIGHT,
+                        odom=odom, mapper=mapper)
+    lidar.start()
+
+    # Blocking robot RPCs run in their own thread; the event loop only streams.
+    cmd_thread = threading.Thread(target=command_loop, daemon=True)
+    cmd_thread.start()
+    print("Command loop started (robot RPCs off the event loop).", flush=True)
+
+    task = asyncio.create_task(broadcast_loop())
+    print(f"Web controller live at http://<robot-ip>:{PORT}", flush=True)
+
+    yield
+
+    task.cancel()
+    try:
+        client.StopMove()
+    except Exception:
+        pass
+    if camera is not None:
+        camera.stop()
+    try:
+        cam_proc.terminate()
+    except Exception:
+        pass
+    if lidar is not None:
+        lidar.stop()
+    if odom is not None:
+        odom.stop()
+    print("Shutdown -- robot left in current posture.", flush=True)
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+
+
+@app.get("/")
+async def index():
+    return FileResponse(WEB_DIR / "index.html")
+
+
+# ---------------------------------------------------------------------------
+# Camera — MJPEG over HTTP multipart (consumed by a plain <img>)
+# ---------------------------------------------------------------------------
+
+@app.get("/camera/status")
+async def camera_status():
+    return JSONResponse({
+        "live": bool(camera and camera.is_live()),
+        "backend": camera.backend if camera else "none",
+    })
+
+
+@app.get("/camera/stream")
+async def camera_stream():
+    boundary = "frame"
+    period = 1.0 / CAMERA_STREAM_HZ
+
+    async def gen():
+        while True:
+            jpeg = camera.get_jpeg() if camera else None
+            if jpeg:
+                yield (
+                    b"--" + boundary.encode() + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    + jpeg + b"\r\n"
+                )
+            await asyncio.sleep(period)
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pose — people skeletons (YOLO11-pose). Same MJPEG pattern as the camera, but
+# the source JPEG is produced by the pose container. Reading the stream also
+# heartbeats POSE_DEMAND so the container only runs the GPU while someone watches.
+# ---------------------------------------------------------------------------
+
+def _fresh(path, ttl=2.5):
+    """True if `path` was written within `ttl` seconds (overlay JSON liveness)."""
+    try:
+        return (time.time() - os.path.getmtime(path)) < ttl
+    except OSError:
+        return False
+
+
+@app.get("/camera/pose/status")
+async def pose_status():
+    # Liveness now tracks the geometry JSON (the browser draws it on a canvas; the
+    # service no longer bakes an annotated JPEG).
+    return JSONResponse({"live": _fresh(POSE_TRACKS), "backend": "pose"})
+
+
+@app.get("/camera/pose/stream")
+async def pose_stream():
+    boundary = "frame"
+    period = 1.0 / CAMERA_STREAM_HZ
+
+    async def gen():
+        while True:
+            try:                       # heartbeat -> pose_service runs while watched
+                with open(POSE_DEMAND, "wb") as f:
+                    f.write(b"1")
+            except OSError:
+                pass
+            jpeg = pose.get_jpeg() if pose else None
+            if jpeg:
+                yield (
+                    b"--" + boundary.encode() + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    + jpeg + b"\r\n"
+                )
+            await asyncio.sleep(period)
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
+
+
+@app.get("/camera/pose/tracks")
+async def pose_tracks():
+    """Pose geometry {w, h, items:[{id, name, box, kpts}]} (written by pose_service).
+
+    Polling this also heartbeats POSE_DEMAND, so the pose container only runs the
+    GPU while the Skeleton overlay is on (the browser polls this once a second).
+    """
+    try:
+        with open(POSE_DEMAND, "wb") as f:
+            f.write(b"1")
+    except OSError:
+        pass
+    try:
+        with open(POSE_TRACKS) as f:
+            return JSONResponse(json.load(f))
+    except (OSError, ValueError):
+        return JSONResponse({"w": 0, "h": 0, "items": []})
+
+
+@app.post("/camera/pose/label")
+async def pose_label(req: Request):
+    """Map a track id to an operator-chosen name (empty name clears it)."""
+    try:
+        data = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    tid = str(data.get("id", "")).strip()
+    name = str(data.get("name", "")).strip()[:32]
+    if not tid:
+        return JSONResponse({"ok": False, "error": "missing id"}, status_code=400)
+    labels = {}
+    try:
+        with open(POSE_LABELS) as f:
+            labels = json.load(f) or {}
+    except (OSError, ValueError):
+        pass
+    if name:
+        labels[tid] = name
+    else:
+        labels.pop(tid, None)
+    tmp = POSE_LABELS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(labels, f)
+    os.replace(tmp, POSE_LABELS)      # atomic -> pose_service never reads a partial file
+    return JSONResponse({"ok": True, "labels": labels})
+
+
+# ---------------------------------------------------------------------------
+# Detect — object detection (YOLO-World). Same MJPEG pattern as the pose lane;
+# the source JPEG is produced by the separate g1-detect container. Reading the
+# stream heartbeats DETECT_DEMAND so the container only runs the GPU while watched.
+# ---------------------------------------------------------------------------
+
+@app.get("/camera/detect/status")
+async def detect_status():
+    return JSONResponse({"live": _fresh(DETECT_TRACKS), "backend": "detect"})
+
+
+@app.get("/camera/detect/stream")
+async def detect_stream():
+    boundary = "frame"
+    period = 1.0 / CAMERA_STREAM_HZ
+
+    async def gen():
+        while True:
+            try:                       # heartbeat -> detect_service runs while watched
+                with open(DETECT_DEMAND, "wb") as f:
+                    f.write(b"1")
+            except OSError:
+                pass
+            jpeg = detect.get_jpeg() if detect else None
+            if jpeg:
+                yield (
+                    b"--" + boundary.encode() + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    + jpeg + b"\r\n"
+                )
+            await asyncio.sleep(period)
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
+
+
+@app.get("/camera/detect/objects")
+async def detect_objects():
+    """Detection geometry {w, h, items:[{cls, conf, box}]} (written by detect_service).
+
+    Polling this also heartbeats DETECT_DEMAND, so the detect container only runs
+    the GPU while the Object Detection overlay is on.
+    """
+    try:
+        with open(DETECT_DEMAND, "wb") as f:
+            f.write(b"1")
+    except OSError:
+        pass
+    try:
+        with open(DETECT_TRACKS) as f:
+            return JSONResponse(json.load(f))
+    except (OSError, ValueError):
+        return JSONResponse({"w": 0, "h": 0, "items": []})
+
+
+# ---------------------------------------------------------------------------
+# LiDAR — 3D point cloud (Z-up) over a dedicated binary WebSocket
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/lidar")
+async def ws_lidar(ws: WebSocket):
+    await ws.accept()
+    print("[ws/lidar] client connected", flush=True)
+    live_period = 1.0 / LIDAR_STREAM_HZ
+    map_period = 0.4   # map clouds are larger -> throttle harder
+    last_view = None
+    try:
+        while True:
+            # Show the map while mapping or when one is loaded; else the live cloud.
+            show_map = mapper is not None and (mapper.active or mapper.has_points())
+            cloud = mapper.get_map() if show_map else (lidar.get_cloud() if lidar else None)
+            view = "map" if show_map else "live"
+            if view != last_view:
+                await ws.send_text(json.dumps({"type": "lidar_meta", "view": view}))
+                last_view = view
+            if cloud is not None and len(cloud):
+                await ws.send_bytes(pack_cloud(cloud))
+            await asyncio.sleep(map_period if show_map else live_period)
+    except WebSocketDisconnect:
+        print("[ws/lidar] client disconnected", flush=True)
+    except Exception as e:
+        print(f"[ws/lidar] error: {e}", flush=True)
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
+    print("[ws] client connected", flush=True)
+
+    # Push speed caps so the UI matches config/robot.yaml (single source of truth).
+    await ws.send_text(json.dumps({
+        "type": "config",
+        "max_vx": MAX_VX, "max_vy": MAX_VY, "max_vyaw": MAX_VYAW,
+        "slow_scale": SLOW_SCALE,
+    }))
+    await ws.send_text(json.dumps(make_state_msg()))
+    if mapper is not None:
+        await ws.send_text(json.dumps(mapper.status()))
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            mtype = msg.get("type")
+            state.last_packet_time = time.time()
+
+            if mtype == "move":
+                if state.mode == "walk" and not state.transitioning:
+                    state.vx = float(msg.get("vx", 0.0))
+                    state.vy = float(msg.get("vy", 0.0))
+                    state.vyaw = float(msg.get("vyaw", 0.0))
+
+            elif mtype == "stop":
+                # Zero the velocity; command_loop sends Move(0,0,0), which halts
+                # translation while keeping the gait ready (no StopMove -> stays drivable).
+                state.vx = state.vy = state.vyaw = 0.0
+                state.is_moving = False
+
+            elif mtype == "mode":
+                requested = msg.get("name", "")
+                threading.Thread(target=run_enter_mode, args=(requested,),
+                                 daemon=True).start()
+
+            elif mtype == "cmd":
+                state.pending_cmd = msg.get("name", "")
+
+            elif mtype == "map" and mapper is not None:
+                action = msg.get("action", "")
+                if action == "start":
+                    mapper.start()
+                elif action == "stop":
+                    mapper.stop()
+                elif action == "clear":
+                    mapper.clear()
+                elif action == "save":
+                    mapper.save(msg.get("name", ""))
+                elif action == "load":
+                    mapper.load(msg.get("name", ""))
+                await broadcast(mapper.status())
+
+    except WebSocketDisconnect:
+        print("[ws] client disconnected", flush=True)
+        state.vx = state.vy = state.vyaw = 0.0
+        state.is_moving = False
+    except Exception as e:
+        print(f"[ws] error: {e}", flush=True)
+    finally:
+        clients.discard(ws)
+
+
+if __name__ == "__main__":
+    # The safety prompt only makes sense when a human launched this in a terminal.
+    # Under systemd there is no stdin, so input() raised EOFError and the service
+    # crash-looped. Gate the prompt on an interactive TTY: manual launches still get
+    # the Enter-to-confirm gate; the service starts headless without it.
+    if sys.stdin.isatty():
+        print("WARNING: Robot must be on its gantry or in a clear open area.")
+        print("WARNING: Keep the physical e-stop in reach.")
+        input("Press Enter to start, or Ctrl+C to abort... ")
+    else:
+        print("No TTY (systemd service) -- starting without interactive confirmation.",
+              flush=True)
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")

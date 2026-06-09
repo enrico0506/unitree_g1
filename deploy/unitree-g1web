@@ -1,0 +1,11 @@
+# Allow the 'unitree' user to manage ONLY the g1-web dashboard service without a
+# password. Scoped to specific systemctl verbs on g1-web so it can be reloaded
+# after code changes (e.g. by Claude Code) without granting broad sudo.
+#
+# Install (validate first, then place with the required 0440 perms):
+#   sudo visudo -cf /home/unitree/projects/g1/deploy/unitree-g1web \
+#     && sudo install -m 0440 -o root -g root \
+#        /home/unitree/projects/g1/deploy/unitree-g1web /etc/sudoers.d/unitree-g1web
+#
+# After install, `sudo systemctl restart g1-web` needs no password.
+unitree ALL=(root) NOPASSWD: /usr/bin/systemctl restart g1-web, /usr/bin/systemctl restart g1-web.service, /usr/bin/systemctl start g1-web, /usr/bin/systemctl stop g1-web, /usr/bin/systemctl status g1-web

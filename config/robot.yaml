@@ -1,0 +1,50 @@
+# G1 robot dashboard configuration.
+# Single source of truth for tuning -- edit here, no need to touch the code.
+# Loaded by scripts/robot_web_controller.py at startup. Speed caps are also
+# pushed to the browser on connect, so the UI stays in sync automatically.
+
+network:
+  interface: eth0      # DDS network interface to the robot
+  domain_id: 0
+
+server:
+  host: 0.0.0.0        # listen on all interfaces
+  port: 8080
+
+# Velocity caps. G1 is rated ~0.8 m/s forward; raise carefully.
+speeds:
+  max_vx: 0.7          # m/s   forward / back   (W / S)
+  max_vy: 0.3        # m/s   strafe           (A / D)
+  max_vyaw: 2.0        # rad/s rotation          (arrow keys)
+  slow_scale: 0.4      # multiplier while holding SHIFT (precise/slow mode)
+
+control:
+  send_hz: 30          # command-loop tick rate (Hz) for responsive change detection
+  watchdog_timeout: 2.0  # s; stop if the browser goes silent this long
+  # Velocity is sent to the robot only on CHANGE plus a low-rate refresh -- NOT
+  # every tick. Move() is a blocking RPC; flooding it at 30 Hz saturates the DDS
+  # RPC layer and eventually kills movement + starves the camera RPC.
+  move_duration_s: 1.0   # robot holds the commanded velocity this long (deadman)
+  cmd_resend_hz: 3       # refresh rate that keeps the deadman alive / gait hot
+
+camera:
+  stream_hz: 25          # head-camera FPS (1080p ~121KB/frame). 30 = smoother but
+                         # ~3.6 MB/s of WiFi; lower to 15 if the feed lags.
+
+lidar:
+  stream_hz: 10          # cloud updates/s served to the browser
+  max_points: 25000      # cap points per frame (perf)
+  camera_height_m: 1.3   # head-camera height; aligns the floor to the grid
+
+
+map:
+  dir: maps              # saved maps go here (under the project root)
+  voxel_size_m: 0.05     # map resolution (smaller = denser, bigger files)
+  max_points: 300000     # cap on accumulated map size
+  max_range_m: 4.0       # (legacy, unused) was for the old depth-based mapper
+  yaw_sign: 1            # (legacy, unused) the FAST-LIO mapper fixes the frame properly
+
+# Mapping is now real SLAM (FAST-LIO on the head Mid-360), run ON-DEMAND only
+# while recording. Start/Stop Mapping in the dashboard spawn/stop this launch.
+mapping:
+  run_cmd: /home/unitree/g1_mapping_ws/run_mapping.sh
