@@ -1,0 +1,100 @@
+# Obstacle slow-down / stop / gap-following -- single source of tuning.
+# Read by BOTH obstacle_node.py (ROS2, domain 99) and guard.py (dashboard,
+# domain 0). Kept OUT of config/robot.yaml on purpose: load_config there
+# silently drops unknown sections, and this feature is self-contained.
+#
+# Distances are metres, angles degrees, rates rad/s or m/s as noted.
+
+# --- obstacle source (which backend writes /dev/shm/g1_obstacle.json) -------
+source: lidar   # lidar = obstacle/ raw-LiDAR node (run_obstacle.sh); nav2costmap = g1_nav costmap teleop-guard (g1_nav/teleop_guard.sh)
+
+# --- LiDAR input -----------------------------------------------------------
+topic: /livox/lidar          # Livox Mid-360 topic. Our driver runs xfer_format=1 (CustomMsg) --
+                             # this build's PointCloud2 path stalls after one frame. The node
+                             # auto-detects the type and parses CustomMsg (decimated).
+sensor_height_m: 1.10        # Mid-360 height above the floor -- MEASURE on your robot.
+                             # The published cloud is already x-fwd/y-left/z-up (the driver
+                             # applies the 180 deg mount roll), so the floor sits at z ~= -this.
+
+# --- perception (Stages 2-4) ----------------------------------------------
+obstacle_range_m: 3.0        # farthest point we keep (horizontal). MUST be >= slow_at_m, else a
+                             # fully-open direction relaxes only to this and never reaches CLEAR / full speed.
+slow_at_m: 1.6               # only slow within this -- keeps full speed when it has space (less sensitive)
+stop_at_m: 0.6               # hard stop at/under this distance (per direction)
+slow_min_scale: 0.5          # MIN speed in the slow zone: the robot KEEPS MOVING (>=50%) when it has
+                             # space and never crawls to a freeze. Only the hard stop (inside stop_at) = 0.
+
+# --- safety bubble + blind-zone prediction --------------------------------
+# The Mid-360 sits ~1.1 m up and tilted ~12 deg UP, so it is BLIND to obstacles
+# closer than ~1.0 m straight ahead (MEASURED). Two mitigations:
+safety_bubble_m: 0.35        # extra clearance kept on ALL sides beyond the body so the ARMS don't clip
+                             # corners. ADDED to slow_at_m + stop_at_m (robot slows/stops this much earlier,
+                             # every direction). Raise for more margin; lower (~0.15) for tighter gaps.
+front_blind_zone_m: 1.0      # MEASURED front blind distance. A wall approaching head-on VANISHES here;
+                             # below this the sensor has no data straight ahead.
+predict_blind_zone: true     # dead-reckon a front wall THROUGH the blind cone: when it was last seen near
+                             # the blind edge and the robot keeps driving forward, estimate its distance as
+                             # (last seen - distance driven) so the front stop still fires. Auto-invalidated
+                             # on turning / backing up / after predict_timeout_s (the estimate drifts).
+predict_timeout_s: 4.0       # max seconds to trust the dead-reckoned estimate while still creeping forward
+# --- ground-plane removal + footprint self-mask (replaces the blunt height band) ---
+# A fixed height band cannot tell "flat floor" / "my own legs" / "a real low obstacle"
+# apart -- they all sit low and close. Instead we fit the local floor as a TILTED plane
+# (so the humanoid's sway doesn't fool a fixed z threshold), drop everything near that
+# plane, and separately mask out the robot's own footprint box by POSITION (not height).
+# A harness pole / gantry foot OUTSIDE the footprint that sticks up from the floor is
+# then KEPT even when it is low and close.
+ground_removal: true         # true = plane removal + footprint mask (below). false = legacy height band.
+ground_clearance_m: 0.08     # keep points sticking up MORE than this above the fitted floor (floor itself drops)
+ground_band_m: 0.5           # floor-candidate points are below sensor_height+this (used only to FIT the plane)
+ground_min_points: 80        # need >= this many candidates to fit a plane (else assume a level floor)
+obstacle_max_above_m: 1.9    # cut points higher than this above the floor (ceiling / overhead)
+self_front_m: 0.35           # footprint self-mask: forward extent (covers a forward leg swing) -- MEASURE/tune
+self_back_m: 0.35            # footprint self-mask: rearward extent -- MEASURE/tune
+self_half_width_m: 0.30      # footprint self-mask: half-width (covers the leg stance) -- MEASURE/tune
+
+# --- legacy height band (used ONLY when ground_removal is false) -------------------
+min_height_m: -0.4           # height band lower edge (sensor-relative z): cuts the FLOOR and the robot's
+                             # own legs / lower body / swinging feet so they aren't read as obstacles.
+                             # Raise toward -0.2 if it still sees its legs; lower to detect lower obstacles.
+max_height_m: 0.50           # height band upper edge (cuts ceiling / overhead)
+blind_radius_m: 0.45         # drop self-returns / points closer than this
+min_cluster_points: 10       # k: the k-th closest point is the robust nearest (1 = noise)
+filter_alpha: 0.25           # per-direction distance EMA: filt = a*new + (1-a)*filt (lower = smoother)
+ease_scale: true             # node: smoothstep S-curve for distance->scale (false = linear ramp)
+tight_open_m: 1.2            # node: a direction starts counting as "closing in" below this
+tight_min: 0.7              # node: floor of the global tight-space multiplier (gentle: 70% when boxed in)
+scale_slew_per_s: 1.8        # guard: max change in the applied speed-scale per second (smoothness)
+
+# --- announcements (Stage 5) ----------------------------------------------
+announce_cooldown_s: 3.0     # min seconds between repeats of the same announcement
+speaker_id: 0                # AudioClient TtsMaker speaker id
+led_warnings: true           # tint the robot LED orange (slow) / red (stop)
+
+# --- fail-safe (the agreed behaviour) -------------------------------------
+stale_timeout_s: 1.0         # no fresh frame for this long while enabled -> FAULT
+startup_grace_s: 8.0         # after enabling, wait this long for the first frame before faulting
+fault_stop_s: 3.0            # on FAULT: stop forward for this long, announce, then auto-disable
+
+# --- Stage 8: gap-following / steering ------------------------------------
+front_sweep_deg: 60          # build the depth profile over +/- this, in front
+bin_size_deg: 5              # profile angular resolution
+min_bin_points: 3            # points needed before a profile bin counts as a real obstacle
+robot_half_width_m: 0.25     # half the G1 body width -- MEASURE. Used to inflate obstacles.
+clearance_margin_m: 0.10     # extra room demanded on each side of a gap
+gap_standoff_m: 0.9          # a bin nearer than this is "blocked" for gap-finding (>= stop_at)
+steer_gain: 1.0              # yaw_cmd = gain * gap_centre_angle (rad)
+max_yaw_rate: 0.6            # cap on the auto steering yaw (rad/s)
+steer_deadband_deg: 5        # gap centre within this of straight-ahead -> no turn
+gap_sticky_margin_m: 0.3     # a new gap must beat the held one by this (metres) to switch
+steer_alpha: 0.4             # EMA on the steering command (same idea as filter_alpha)
+centering_gain: 0.5          # vy_cmd = gain * (right_dist - left_dist), corridor centering
+max_lateral_speed: 0.2       # cap on the centering strafe (m/s)
+turn_factor_min: 0.3         # forward-speed multiplier at full steering sweep (Stage 8c)
+search_yaw_rate: 0.4         # turn-in-place rate when boxed in with no gap (Stage 8f)
+
+# --- defaults (all opt-in; flipped from the dashboard at runtime) ----------
+enabled_default: false       # obstacle guard OFF until the operator turns it on
+gap_follow_default: false    # autonomous yaw/strafe steering OFF until tuned
+recovery_default: false      # turn-in-place search OFF until tuned
+publish_hz: 10               # node processing / shm-write rate (matches LiDAR)

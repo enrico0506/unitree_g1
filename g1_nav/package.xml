@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>g1_nav</name>
+  <version>0.0.1</version>
+  <description>
+    Nav2 migration for the Unitree G1 (ROS 2 Foxy).
+    Pipeline: Mid-360 (Livox CustomMsg) -> PointCloud2 -> Patchwork++ ground seg
+    -> STVL-fused local costmap -> Nav2 planner/controller (DWB, holonomic)
+    -> /cmd_vel -> domain bridge -> Unitree LocoClient.
+    SCAFFOLD ONLY: executed phase-by-phase with the robot. Not expected to run as-is.
+  </description>
+  <maintainer email="fachin.enrico05@gmail.com">Enrico</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Runtime deps available on this robot (ROS 2 Foxy, Nav2 core installed). -->
+  <exec_depend>rclpy</exec_depend>
+  <!-- nav2_bringup is NOT installed and NOT used: bringup.launch.py brings the
+       servers up directly rather than including navigation_launch.py. Declaring
+       it would make `rosdep install` fail (cannot resolve on this robot), so it
+       is intentionally omitted. -->
+  <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_planner</exec_depend>
+  <!-- These two are launched directly by bringup.launch.py (Foxy names). -->
+  <exec_depend>nav2_recoveries</exec_depend>
+  <exec_depend>nav2_bt_navigator</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <!-- Foxy has NO MPPI/RPP controller -> use DWB configured holonomic (vx, vy, vyaw). -->
+  <exec_depend>nav2_dwb_controller</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <!-- livox_to_pc2 imports livox_ros_driver2.msg.CustomMsg (in g1_mapping_ws). -->
+  <exec_depend>livox_ros_driver2</exec_depend>
+
+  <!-- =====================================================================
+       EXTERNAL / SOURCE DEPENDENCIES (NOT installed on this robot).
+       These are NOT declared as exec_depend because rosdep cannot resolve
+       them on Foxy; they must be built from source into a workspace overlay.
+         * spatio_temporal_voxel_layer (STVL): fused local costmap layer.
+             Only nav2_voxel_grid is present; STVL must be source-built (Foxy
+             branch) and overlaid before bringup.launch.py will load it.
+         * patchwork-plusplus-ros (Patchwork++): ground/non-ground seg.
+             Provides /patchwork/ground + /patchwork/nonground. Source-build.
+       See check_prereqs.sh: it WARNS (does not fail) when these are missing.
+       ===================================================================== -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

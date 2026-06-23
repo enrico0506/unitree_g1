@@ -213,6 +213,16 @@ mode_combos:
     observed: true
     fsm_id: 503           # captured 2026-06-23: 802 (main_control) -> 503 -> back to 802
     notes: "Built-in dance routine. Plays, then returns to main_control on its own. Enter from walk."
+  sit:
+    combo: ""
+    observed: false
+    fsm_id: null          # capture with scripts/capture_combo_fsm.py, then the Setup button enables
+    notes: "Sit posture (Setup tab). Part of the safe power-down / posture sequence."
+  lay:
+    combo: ""
+    observed: false
+    fsm_id: null          # capture with scripts/capture_combo_fsm.py, then the Setup button enables
+    notes: "Lie-down posture (Setup tab). Part of the safe power-down / posture sequence."
 
 
 # ----------------------------------------------------------------------------

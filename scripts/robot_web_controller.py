@@ -38,6 +38,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscri
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.g1.loco.g1_loco_api import ROBOT_API_ID_LOCO_SET_VELOCITY
 from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
+from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient as H2LocoClient
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_
 
@@ -52,6 +53,31 @@ from map_builder import MapBuilder
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 CONFIG_PATH = BASE_DIR / "config" / "robot.yaml"
+
+# Obstacle feature lives in the top-level 'obstacle' package. Only scripts/ is on
+# sys.path when this file runs directly, so add BASE_DIR for the package import.
+sys.path.insert(0, str(BASE_DIR))   # so the top-level 'obstacle' package imports
+from obstacle.guard import ObstacleGuard
+from obstacle.manager import ObstacleManager
+
+OBSTACLE_CFG_PATH = BASE_DIR / "obstacle" / "obstacle.yaml"
+
+# Which backend feeds the ObstacleGuard. Both write /dev/shm/g1_obstacle.json with
+# the same contract, so the guard/UI/voice/overlay are reused unchanged -- only the
+# spawned process differs. Selected by obstacle.yaml's 'source' key:
+#   lidar       -> obstacle/run_obstacle.sh     (raw-LiDAR obstacle node)
+#   nav2costmap -> g1_nav/teleop_guard.sh       (Nav2 local-costmap teleop guard)
+# Default to 'lidar' so a missing/unknown key keeps the existing behaviour.
+try:
+    with open(OBSTACLE_CFG_PATH) as _f:
+        OBSTACLE_SOURCE = (yaml.safe_load(_f) or {}).get("source", "lidar")
+except FileNotFoundError:
+    OBSTACLE_SOURCE = "lidar"
+if OBSTACLE_SOURCE == "nav2costmap":
+    OBSTACLE_RUN_CMD = BASE_DIR / "g1_nav" / "teleop_guard.sh"
+else:
+    OBSTACLE_RUN_CMD = BASE_DIR / "obstacle" / "run_obstacle.sh"
+print(f"Obstacle source: {OBSTACLE_SOURCE} -> {OBSTACLE_RUN_CMD}", flush=True)
 CAMERA_SHM = "/dev/shm/g1_camera.jpg"   # frames written here by camera_service.py
 
 # Pose lane (people skeletons). Produced by the separate pose container
@@ -254,6 +280,10 @@ detect: CameraSource = None
 lidar: LidarSource = None
 odom: OdomReader = None
 mapper: MapBuilder = None
+
+guard: ObstacleGuard = None
+obstacle_mgr: ObstacleManager = None
+audio = None
 
 _mode_lock = threading.Lock()
 _arm_lock = threading.Lock()   # serialize arm-action RPCs (and the hands_up toggle)
@@ -660,6 +690,11 @@ def command_loop():
         else:
             desired = (0.0, 0.0, 0.0)
 
+        # Obstacle guard: scales/stops forward motion (+ optional gap steering). Pure
+        # pass-through when disabled; the hard safety stop lives inside guard.apply().
+        if guard is not None:
+            desired = guard.apply(desired)
+
         moving = desired != (0.0, 0.0, 0.0)
         changed = any(abs(desired[i] - last_sent[i]) > DEADZONE for i in range(3))
         in_walk = state.mode == "walk" and not state.transitioning
@@ -716,6 +751,11 @@ async def broadcast_loop():
             last_broadcast_fsm = state.fsm_id
             last_transitioning = state.transitioning
 
+        # Stream obstacle telemetry at ~10 Hz, but only while the guard is active
+        # (enabled or showing a fault/auto-disabled banner) to keep traffic minimal.
+        if guard is not None and guard.is_active_ui():
+            await broadcast(guard.telemetry())
+
         await asyncio.sleep(0.1)
 
 
@@ -726,6 +766,7 @@ async def broadcast_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper
+    global guard, obstacle_mgr, audio
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -797,6 +838,19 @@ async def lifespan(app: FastAPI):
                         odom=odom, mapper=mapper)
     lidar.start()
 
+    # Obstacle feature: AudioClient for TTS warnings (optional), the perception-node
+    # manager (subprocess, started on toggle), and the guard that scales/steers the
+    # commanded velocity. Guard starts disabled -- pure pass-through until toggled.
+    try:
+        audio = AudioClient(); audio.SetTimeout(3.0); audio.Init()
+        print("G1 AudioClient ready (TTS).", flush=True)
+    except Exception as e:
+        audio = None; print(f"AudioClient init failed ({e}); voice disabled.", flush=True)
+    obstacle_mgr = ObstacleManager(run_cmd=str(OBSTACLE_RUN_CMD))
+    guard = ObstacleGuard(cfg_path=str(OBSTACLE_CFG_PATH), audio=audio, limits=(MAX_VX, MAX_VY, MAX_VYAW))
+    guard.start()
+    print("Obstacle guard ready (disabled until toggled).", flush=True)
+
     # Blocking robot RPCs run in their own thread; the event loop only streams.
     cmd_thread = threading.Thread(target=command_loop, daemon=True)
     cmd_thread.start()
@@ -822,6 +876,16 @@ async def lifespan(app: FastAPI):
         lidar.stop()
     if odom is not None:
         odom.stop()
+    if guard is not None:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+    if obstacle_mgr is not None:
+        try:
+            obstacle_mgr.stop()
+        except Exception:
+            pass
     print("Shutdown -- robot left in current posture.", flush=True)
 
 
@@ -1065,6 +1129,8 @@ async def ws_endpoint(ws: WebSocket):
         "slow_scale": SLOW_SCALE,
         # which whole-body combos have a captured FSM id (-> button enabled)
         "mode_combos": {name: (fsm is not None) for name, fsm in MODE_COMBOS.items()},
+        # initial obstacle-guard UI flags (enabled / gap_follow / recovery)
+        "obstacle": (guard.ui_config() if guard is not None else {}),
     }))
     await ws.send_text(json.dumps(make_state_msg()))
     if mapper is not None:
@@ -1104,7 +1170,11 @@ async def ws_endpoint(ws: WebSocket):
             elif mtype == "map" and mapper is not None:
                 action = msg.get("action", "")
                 if action == "start":
-                    mapper.start()
+                    if guard is not None and guard.enabled:
+                        await broadcast({"type": "map_status",
+                                         "error": "Disable obstacle guard first (shared LiDAR)."})
+                    else:
+                        mapper.start()
                 elif action == "stop":
                     mapper.stop()
                 elif action == "clear":
@@ -1114,6 +1184,23 @@ async def ws_endpoint(ws: WebSocket):
                 elif action == "load":
                     mapper.load(msg.get("name", ""))
                 await broadcast(mapper.status())
+
+            elif mtype == "obstacle":
+                action = msg.get("action", "")
+                if action == "enable":
+                    if mapper is not None and mapper.active:
+                        await broadcast({"type": "obstacle",
+                                         "error": "Stop mapping first (shared LiDAR)."})
+                    elif guard is not None:
+                        obstacle_mgr.start(); guard.set_enabled(True)
+                elif action == "disable":
+                    if guard is not None: guard.set_enabled(False)
+                    if obstacle_mgr is not None: obstacle_mgr.stop()
+                elif action == "gap_follow" and guard is not None:
+                    guard.set_gap_follow(bool(msg.get("on")))
+                elif action == "recovery" and guard is not None:
+                    guard.set_recovery(bool(msg.get("on")))
+                if guard is not None: await broadcast(guard.telemetry())
 
     except WebSocketDisconnect:
         print("[ws] client disconnected", flush=True)

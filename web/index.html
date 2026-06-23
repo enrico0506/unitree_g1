@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-  <title>G1 Dashboard</title>
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>G1 Console</title>
+  <link rel="stylesheet" href="/static/style.css?v=11">
   <script type="importmap">
   {
     "imports": {
@@ -14,13 +14,43 @@
   }
   </script>
 </head>
-<body>
+<body data-mode="damp">
   <header>
-    <h1>G1 Dashboard</h1>
+    <div class="wordmark">
+      <span class="mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="5" r="2.4"/><path d="M12 7.4V14"/><path d="M7 10h10"/>
+          <path d="M12 14l-3.5 7"/><path d="M12 14l3.5 7"/>
+        </svg>
+      </span>
+      <span><h1>G1 Console<span class="sub">Unitree · teleop</span></h1></span>
+    </div>
+
     <nav class="tabs">
       <button class="tab current" data-tab="drive">Drive</button>
+      <button class="tab" data-tab="setup">Setup</button>
       <button class="tab" data-tab="info">Logs &amp; Info</button>
     </nav>
+
+    <!-- Live mode + the controls that change it, docked in the header bar -->
+    <div class="modebar">
+      <div class="mode-readout">
+        <span class="eyebrow">Mode</span>
+        <span class="word" id="infoMode">damp</span>
+        <span class="transit-flag"><span class="tf-dot"></span>transitioning…</span>
+        <span class="live-flag"><span class="lf-dot"></span>LIVE</span>
+      </div>
+      <div class="mode-buttons">
+        <button data-mode="walk" class="mode-btn">Walk <small>802</small></button>
+        <span class="mode-sep" aria-hidden="true"></span>
+        <button data-cmd="dance" data-combo="dance" data-arm="1" class="mode-btn behaviour" disabled title="dance: whole-body routine (R1+B)">Dance</button>
+        <button data-cmd="climb" data-combo="climb" data-arm="1" class="mode-btn behaviour" disabled title="climb: whole-body routine (R2+B)">Climb</button>
+      </div>
+    </div>
+
+    <div class="header-spacer"></div>
+
     <div id="status" class="status">
       <span class="dot"></span>
       <span id="statusText">Connecting...</span>
@@ -33,6 +63,8 @@
 
   <!-- ========================= DRIVE TAB ========================= -->
   <div id="tab-drive" class="tab-panel current">
+
+    <!-- The feeds — the operator's primary view -->
     <section class="windows">
       <div class="media-window">
         <div class="window-title">Camera <span id="camBadge" class="badge">…</span></div>
@@ -63,9 +95,10 @@
           <button id="navZoomIn"  class="n-zin"  title="Zoom in">+</button>
           <button id="navZoomOut" class="n-zout" title="Zoom out">−</button>
         </div>
-        <div class="orient-legend"><b style="color:#4ea1ff">↑ Z up</b> · X fwd · Y left</div>
+        <div class="orient-legend"><b style="color:#5C8DF2">↑ Z up</b> · X fwd · Y left</div>
         <div class="view-bar">
           <button id="viewHome" title="Reset orientation — Z up, cloud framed">⌂ Reset</button>
+          <button id="viewBot" title="Robot first-person driving view (auto-selected when the obstacle guard is on)">🤖 Bot view</button>
           <button id="viewTop" title="Top-down (floor-plan) view">Top</button>
           <button id="view3d" title="3D oblique view">3D</button>
           <button id="viewFit" title="Frame the whole cloud">Fit</button>
@@ -85,23 +118,10 @@
       </div>
     </section>
 
-    <main>
-      <section class="panel modes">
-        <h2>Mode</h2>
-        <div class="mode-buttons">
-          <button data-mode="zero_torque" class="mode-btn">Zero Torque<br><small>FSM 0</small></button>
-          <button data-mode="damp" class="mode-btn current">Damp<br><small>FSM 1</small></button>
-          <button data-mode="stand" class="mode-btn">Stand<br><small>FSM 4</small></button>
-          <button data-mode="walk" class="mode-btn">Walk<br><small>FSM 802</small></button>
-        </div>
-        <p class="mode-hint" id="modeHint">
-          Mode "damp" (FSM 1): joints relaxed. Robot will not respond to movement.
-          Select "Stand" then "Walk" to enable WASD / arrow control.
-        </p>
-      </section>
-
+    <main class="controls">
+      <!-- Drive -->
       <section class="panel buttons">
-        <h2>Touch</h2>
+        <h2>Drive</h2>
         <div class="dpad">
           <button data-hold="w" class="up">▲<br><small>W</small></button>
           <button data-hold="a" class="left">◄<br><small>A</small></button>
@@ -113,23 +133,52 @@
           <button data-hold="rotL" class="go">⟲ rotate L</button>
           <button data-hold="rotR" class="go">rotate R ⟳</button>
         </div>
+      </section>
+
+      <!-- Obstacle avoidance — LiDAR proximity guard (mounts via obstacle.js) -->
+      <section class="panel span-all">
+        <h2>Obstacle Avoidance</h2>
+        <div id="obstacle-panel"></div>
+      </section>
+
+      <!-- 4) Gestures -->
+      <section class="panel buttons">
+        <h2>Gestures</h2>
         <div class="posture">
-          <button data-cmd="low_stand">Low Stand</button>
-          <button data-cmd="high_stand">High Stand</button>
-          <button data-cmd="wave">Wave</button>
-          <button data-cmd="shake">Shake</button>
+          <button data-cmd="clap" data-arm="1">Clap</button>
+          <button data-cmd="high_wave" data-arm="1">Wave</button>
+          <button data-cmd="kiss" data-arm="1">Kiss</button>
+          <button data-cmd="hands_up" data-arm="1" data-toggle="1">Hands Up</button>
+          <button data-cmd="high_five" data-arm="1">High Five</button>
+          <button data-cmd="hug" data-arm="1">Hug</button>
+          <button data-cmd="heart" data-arm="1">Heart</button>
+          <button data-cmd="wave">Wave Hand</button>
+          <button data-cmd="shake">Shake Hand</button>
+          <button data-cmd="release_arm" data-arm="1">Release Arms</button>
         </div>
       </section>
 
-      <section class="panel keys">
-        <h2>Keyboard</h2>
-        <p class="hint">
-          <b>W / S</b> forward / back &middot;
-          <b>A / D</b> strafe &middot;
-          <b>← / →</b> rotate<br>
-          <b>SPACE</b> stop &middot;
-          <b>1-4</b> mode (zero / damp / stand / walk)<br>
-          <b>9 / 0</b> wave / shake
+    </main>
+  </div>
+
+  <!-- ========================= SETUP TAB ========================= -->
+  <div id="tab-setup" class="tab-panel">
+    <main class="setup">
+      <section class="panel modes span-all">
+        <h2>Power &amp; posture</h2>
+        <div class="mode-buttons">
+          <button data-mode="zero_torque" class="mode-btn">Zero Torque <small>0</small></button>
+          <button data-mode="damp" class="mode-btn current">Damp <small>1</small></button>
+          <button data-mode="stand" class="mode-btn">Stand <small>4</small></button>
+          <span class="mode-sep" aria-hidden="true"></span>
+          <button data-cmd="sit" data-combo="sit" class="mode-btn behaviour" disabled title="sit: capture FSM id with scripts/capture_combo_fsm.py">Sit</button>
+          <button data-cmd="lay" data-combo="lay" class="mode-btn behaviour" disabled title="lay: capture FSM id with scripts/capture_combo_fsm.py">Lay</button>
+          <button data-cmd="low_stand" class="mode-btn behaviour">Low Stand</button>
+          <button data-cmd="high_stand" class="mode-btn behaviour">High Stand</button>
+        </div>
+        <p class="mode-hint" id="modeHint">
+          Mode "damp" (FSM 1): joints relaxed. Robot will not respond to movement.
+          Select "Stand" then "Walk" to enable WASD / arrow control.
         </p>
       </section>
     </main>
@@ -137,29 +186,12 @@
 
   <!-- ====================== LOGS & INFO TAB ====================== -->
   <div id="tab-info" class="tab-panel">
-    <main>
+    <main class="diag">
       <section class="panel">
         <h2>Robot</h2>
         <div class="vel-line"><span>connection</span><b id="infoConn">—</b></div>
         <div class="vel-line"><span>battery</span><b id="infoBattery">—</b></div>
-        <div class="vel-line"><span>FSM</span><b id="fsmVal">—</b></div>
-        <div class="vel-line"><span>mode</span><b id="infoMode">—</b></div>
         <p id="fsmMismatch" class="mode-hint"></p>
-      </section>
-
-      <section class="panel">
-        <h2>Velocity (commanded)</h2>
-        <div class="vel-line"><span>vx (fwd)</span><b id="vxVal">+0.00</b></div>
-        <div class="vel-line"><span>vy (strafe)</span><b id="vyVal">+0.00</b></div>
-        <div class="vel-line"><span>vyaw (rot)</span><b id="vyawVal">+0.00</b></div>
-        <div class="vel-line"><span>caps</span><b id="infoSpeeds">—</b></div>
-      </section>
-
-      <section class="panel">
-        <h2>Odometry / Pose</h2>
-        <div class="vel-line"><span>x (m)</span><b id="poseX">—</b></div>
-        <div class="vel-line"><span>y (m)</span><b id="poseY">—</b></div>
-        <div class="vel-line"><span>yaw (°)</span><b id="poseYaw">—</b></div>
       </section>
 
       <section class="panel">
@@ -169,18 +201,19 @@
         <div class="vel-line"><span>map</span><b id="infoMap">—</b></div>
       </section>
 
-      <section class="panel log">
+      <section class="panel log span-all">
         <h2>Event log <button id="logClear" class="log-clear">clear</button></h2>
         <div id="eventLog" class="event-log"></div>
       </section>
     </main>
   </div>
 
-  <script src="/static/controller.js?v=4"></script>
+  <script src="/static/obstacle.js?v=1"></script>
+  <script src="/static/controller.js?v=12"></script>
   <script src="/static/camera.js?v=4"></script>
   <script src="/static/cam-overlay.js?v=4"></script>
   <script src="/static/pose.js?v=4"></script>
   <script src="/static/detect.js?v=4"></script>
-  <script type="module" src="/static/lidar.js?v=4"></script>
+  <script type="module" src="/static/lidar.js?v=7"></script>
 </body>
 </html>

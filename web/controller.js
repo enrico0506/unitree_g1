@@ -21,6 +21,8 @@ const FSM_NAMES = {
   [FSM_DAMPING]:      "damping",
   [FSM_READY_STAND]:  "ready_stand",
   [FSM_MAIN_CONTROL]: "main_control",
+  812: "climb",   // whole-body combo targets (display only)
+  503: "dance",
 };
 
 const UI_TO_FSM = {
@@ -35,6 +37,8 @@ const MODE_HINTS = {
   damp:        'Mode "damp" (FSM 1): joints relaxed. Robot will not respond to movement.',
   stand:       'Mode "stand" (FSM 4 = ready_stand): robot stands rigidly. Press "Walk" to enable balanced locomotion.',
   walk:        'Mode "walk" (FSM 802 = main_control): hold WASD / arrows. Hold SHIFT for slow mode.',
+  dance:       'Dancing (FSM 503)… it returns to Walk on its own. To stop early press Stand (then Walk) — exit never damps.',
+  climb:       'Climb mode (FSM 812)… press Stand then Walk to exit — exit never damps.',
 };
 
 // --- Connection ---
@@ -54,6 +58,7 @@ function connect() {
     statusText.textContent = "Connected";
     setInfo("infoConn", "connected");
     logEvent("connected to robot", "ok");
+    if (window.Obstacle) window.Obstacle.init(send);
   };
 
   ws.onmessage = (event) => {
@@ -63,6 +68,10 @@ function connect() {
       else if (msg.type === "config") applyConfig(msg);
       else if (msg.type === "map_status") updateMapStatus(msg);
       else if (msg.type === "telemetry") updateTelemetry(msg);
+      else if (msg.type === "obstacle") {
+        window.Obstacle && window.Obstacle.handle(msg);
+        window.LidarOverlay && window.LidarOverlay.updateObstacle(msg);
+      }
     } catch (e) { /* ignore */ }
   };
 
@@ -100,6 +109,24 @@ function applyConfig(msg) {
   if (typeof msg.max_vyaw === "number") MAX_VYAW = msg.max_vyaw;
   if (typeof msg.slow_scale === "number") SLOW_SCALE = msg.slow_scale;
   setInfo("infoSpeeds", `vx≤${MAX_VX} · vy≤${MAX_VY} · vyaw≤${MAX_VYAW} m/s`);
+
+  // Whole-body combo buttons (dance/climb) only work once their FSM id has been
+  // captured into config/mapping.yaml; enable/disable them from the server flag.
+  if (msg.mode_combos && typeof msg.mode_combos === "object") {
+    for (const [name, ready] of Object.entries(msg.mode_combos)) {
+      document.querySelectorAll(`button[data-combo="${name}"]`).forEach(btn => {
+        btn.disabled = !ready;
+        btn.title = ready
+          ? `${name} — remote combo`
+          : `${name}: FSM id not captured yet — run scripts/capture_combo_fsm.py`;
+      });
+    }
+  }
+
+  // Forward the initial obstacle-guard flags to the obstacle panel.
+  if (window.Obstacle && msg.obstacle) {
+    window.Obstacle.handle(Object.assign({ type: "obstacle" }, msg.obstacle));
+  }
 }
 
 function fsmDisplay(id) {
@@ -112,6 +139,12 @@ function updateFsmState(msg) {
   uiMode = msg.ui_mode;
   fsmId  = msg.fsm_id;
   transitioning = !!msg.transitioning;
+
+  // Drive the console's accent temperature from the robot's actual mode: the UI
+  // stays cool/inert until "walk" (live), where it warms. Pure data attribute —
+  // all theming lives in CSS (body[data-mode=...]).
+  document.body.dataset.mode = uiMode || "";
+  document.body.dataset.transitioning = transitioning ? "1" : "";
 
   document.querySelectorAll(".mode-btn").forEach(btn => {
     const isCurrent = btn.dataset.mode === uiMode;
@@ -129,9 +162,7 @@ function updateFsmState(msg) {
     }
   }
 
-  const fsmEl = document.getElementById("fsmVal");
-  if (fsmEl) fsmEl.textContent = fsmDisplay(fsmId);
-  setInfo("infoMode", transitioning ? `${uiMode} (transitioning…)` : uiMode);
+  setInfo("infoMode", uiMode);   // transition state is shown by .transit-flag (CSS)
 
   const mismatchEl = document.getElementById("fsmMismatch");
   if (mismatchEl) {
@@ -232,9 +263,9 @@ function fmt(v) {
 
 setInterval(() => {
   const { vx, vy, vyaw } = computeVelocity();
-  vxEl.textContent   = fmt(vx);
-  vyEl.textContent   = fmt(vy);
-  vyawEl.textContent = fmt(vyaw);
+  if (vxEl)   vxEl.textContent   = fmt(vx);
+  if (vyEl)   vyEl.textContent   = fmt(vy);
+  if (vyawEl) vyawEl.textContent = fmt(vyaw);
 
   if (uiMode === "walk" && !transitioning) {
     send({ type: "move", vx, vy, vyaw });
@@ -346,7 +377,31 @@ document.querySelectorAll("button[data-hold]").forEach(btn => {
 
 document.querySelectorAll("button[data-cmd]").forEach(btn => {
   btn.addEventListener("click", () => {
-    send({ type: "cmd", name: btn.dataset.cmd });
+    const name = btn.dataset.cmd;
+    // Arm gestures (data-arm) only make sense once the robot is up: block them
+    // in zero_torque / damp so a press isn't a confusing no-op.
+    if (btn.dataset.arm && uiMode !== "stand" && uiMode !== "walk") {
+      logEvent(`"${name}" — Stand or Walk first`, "warn");
+      return;
+    }
+    // Whole-body behaviors (dance/climb) move the entire robot — confirm first.
+    if (btn.dataset.combo) {
+      const ok = confirm(
+        `This triggers the robot's ${name.toUpperCase()} behavior — the whole ` +
+        `body will move. Ensure clear space and keep the e-stop in reach.\n\n` +
+        `Press Stand or Walk afterwards to exit.\n\nContinue?`
+      );
+      if (!ok) return;
+    }
+    send({ type: "cmd", name });
+    logEvent(`gesture → ${name}`);
+    // hands_up is a toggle; reflect raise/lower state on the button.
+    if (btn.dataset.toggle) btn.classList.toggle("active");
+    // Releasing the arms clears any latched toggle (e.g. Hands Up).
+    if (name === "release_arm") {
+      document.querySelectorAll("button[data-cmd][data-toggle]")
+        .forEach(b => b.classList.remove("active"));
+    }
   });
 });
 

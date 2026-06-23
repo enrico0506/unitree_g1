@@ -132,6 +132,17 @@ function view3D() {
   fitView();
 }
 
+function robotView() {
+  // First-person "driving" view: look forward (+X) from just behind/above the
+  // robot origin, so the obstacle overlay (profile fan + planned-path arrow on
+  // the ground ahead) fills the view. You can still orbit and drive from here.
+  camera.up.set(0, 0, 1);
+  controls.target.set(4.0, 0, 0.3);
+  camera.position.set(-0.8, 0, 1.6);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
 function setPointSize(mult) {
   pointSize = Math.min(0.3, Math.max(0.01, pointSize * mult));
   material.size = pointSize;
@@ -142,6 +153,7 @@ function bind(id, fn) {
   if (el) el.addEventListener("click", fn);
 }
 bind("viewHome", view3D);   // view3D() sets camera.up=(0,0,1) then fitView()
+bind("viewBot", robotView); // first-person driving view (also the obstacle auto-view)
 bind("view3d", view3D);
 bind("viewTop", topView);
 bind("viewFit", fitView);
@@ -209,6 +221,11 @@ function animate() {
   requestAnimationFrame(animate);
   controls.update();
 
+  // Pulse the nearest-obstacle ring while in the STOP zone (set by the overlay).
+  if (typeof nearPulse !== "undefined" && nearPulse && nearMarker.visible) {
+    nearMat.opacity = 0.45 + 0.45 * (0.5 + 0.5 * Math.sin(performance.now() * 0.008));
+  }
+
   // Main scene fills the whole canvas.
   renderer.setViewport(0, 0, container.clientWidth, container.clientHeight);
   renderer.render(scene, camera);
@@ -226,7 +243,191 @@ function animate() {
   renderer.render(gizmoScene, gizmoCam);
   renderer.setScissorTest(false);
 }
-animate();
+
+// --- obstacle-guard overlay ----------------------------------------------
+// A visual aid layered on the existing point cloud: the live front depth
+// profile it "tracks" (B), a planned-path arrow toward the chosen gap (A),
+// and subtle side ticks (C). Only visible while the guard is enabled+live.
+// All drawn near the ground plane (z ~ 0.05), robot origin = (0,0). Frame:
+// angle 0 = straight ahead (+X), + = LEFT (+Y), - = RIGHT (-Y).
+const obstacleGroup = new THREE.Group();
+obstacleGroup.visible = false;
+scene.add(obstacleGroup);
+
+const OBS_Z = 0.05;                     // sit just above the grid
+const STOP_M = 0.7, SLOW_M = 2.0;       // distance thresholds for colour ramp
+const COL_STOP = 0xff3b30, COL_SLOW = 0xffb020, COL_CLEAR = 0x32d74b;
+const COL_SIDE = 0xff8c1a;
+
+// Reused materials (lines rebuild geometry each message; materials persist).
+const profileMatStop  = new THREE.LineBasicMaterial({ color: COL_STOP });
+const profileMatSlow  = new THREE.LineBasicMaterial({ color: COL_SLOW });
+const profileMatClear = new THREE.LineBasicMaterial({ color: COL_CLEAR });
+const sideMat = new THREE.LineBasicMaterial({ color: COL_SIDE });
+
+// Profile "fan": radial lines from origin to each sensed bin (B).
+const profileLines = new THREE.Group();
+obstacleGroup.add(profileLines);
+
+// Side / back ticks (C).
+const sideTicks = new THREE.Group();
+obstacleGroup.add(sideTicks);
+
+// Nearest-obstacle marker ring (B): a flat ring laid on the ground, recoloured
+// and pulsed by zone. Built once, repositioned per message.
+const nearGeo = new THREE.RingGeometry(0.14, 0.20, 28);
+const nearMat = new THREE.MeshBasicMaterial({ color: COL_STOP, transparent: true, opacity: 0.9, side: THREE.DoubleSide });
+const nearMarker = new THREE.Mesh(nearGeo, nearMat);
+nearMarker.visible = false;
+obstacleGroup.add(nearMarker);
+let nearPulse = false;                  // animate opacity when STOP
+
+// Planned-path arrow (A): a shaft (curved toward the turn) + a cone tip.
+const pathMat = new THREE.LineBasicMaterial({ color: COL_CLEAR, linewidth: 3 });
+const pathLine = new THREE.Line(new THREE.BufferGeometry(), pathMat);
+obstacleGroup.add(pathLine);
+const tipGeo = new THREE.ConeGeometry(0.09, 0.26, 16);
+const tipMat = new THREE.MeshBasicMaterial({ color: COL_CLEAR });
+const pathTip = new THREE.Mesh(tipGeo, tipMat);
+obstacleGroup.add(pathTip);
+
+function distMat(d) {
+  if (d == null || d >= SLOW_M) return profileMatClear;
+  return d < STOP_M ? profileMatStop : profileMatSlow;
+}
+
+// Dispose every child geometry of a Group and empty it (avoid GPU leaks).
+function emptyGroup(g) {
+  for (let i = g.children.length - 1; i >= 0; i--) {
+    const c = g.children[i];
+    if (c.geometry) c.geometry.dispose();
+    g.remove(c);
+  }
+}
+
+let _obsWasEnabled = false;             // for the enable-edge camera auto-switch
+
+function updateObstacle(msg) {
+  if (!msg) return;
+
+  // Auto-switch the camera to the bot's first-person driving view when the guard
+  // turns ON, and back to the 3D overview when it turns OFF -- only on the edge,
+  // so you can still freely orbit (and drive) while it stays on.
+  if (msg.enabled && !_obsWasEnabled) robotView();
+  else if (!msg.enabled && _obsWasEnabled) view3D();
+  _obsWasEnabled = !!msg.enabled;
+
+  const visible = !!(msg.enabled && msg.live) && !msg.fault && !msg.auto_disabled;
+  obstacleGroup.visible = visible;
+  if (!visible) { nearPulse = false; return; }
+
+  // --- (B) profile fan + nearest obstacle ---------------------------------
+  emptyGroup(profileLines);
+  const prof = Array.isArray(msg.profile) ? msg.profile : [];
+  const N = prof.length;
+  let near = null, nearAng = 0;         // nearest sensed bin (for the ring)
+  for (let i = 0; i < N; i++) {
+    const d = prof[i];
+    if (d == null) continue;
+    // Bin i CENTRE ANGLE (deg), LEFT -> RIGHT across +/- 60 deg:
+    //   angDeg = 60 - (i + 0.5) * (120 / N)
+    const a = (60 - (i + 0.5) * (120 / N)) * Math.PI / 180;
+    const ex = d * Math.cos(a), ey = d * Math.sin(a);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(
+      new Float32Array([0, 0, OBS_Z, ex, ey, OBS_Z]), 3));
+    profileLines.add(new THREE.Line(g, distMat(d)));
+    if (near == null || d < near) { near = d; nearAng = a; }
+  }
+
+  // Nearest-obstacle marker: closest profile point, else front_m straight ahead.
+  const zone = msg.zone || "CLEAR";
+  let markD = near, markA = nearAng;
+  if (markD == null && msg.front_m != null) { markD = msg.front_m; markA = 0; }
+  if (markD != null) {
+    nearMarker.visible = true;
+    nearMarker.position.set(markD * Math.cos(markA), markD * Math.sin(markA), OBS_Z + 0.005);
+    const zc = zone === "STOP" ? COL_STOP : zone === "SLOW" ? COL_SLOW : COL_CLEAR;
+    nearMat.color.setHex(zc);
+    nearPulse = zone === "STOP";
+    if (!nearPulse) nearMat.opacity = 0.9;
+  } else {
+    nearMarker.visible = false;
+    nearPulse = false;
+  }
+
+  // --- (A) planned-path arrow ---------------------------------------------
+  const gap = msg.gap || {};
+  const passable = gap.passable !== false && gap.state !== "BLOCKED";
+  const arrowCol = passable ? COL_CLEAR : COL_STOP;
+  pathMat.color.setHex(arrowCol);
+  tipMat.color.setHex(arrowCol);
+
+  const aimA = ((gap.center_deg || 0)) * Math.PI / 180;
+  const sScale = (typeof msg.speed_scale === "number") ? msg.speed_scale : 1;
+  const len = 2.0 * (0.4 + 0.6 * Math.max(0, Math.min(1, sScale)));  // shorten if slow
+  const dim = 0.35 + 0.65 * Math.max(0, Math.min(1, sScale));        // dim if slow
+
+  // Shallow quadratic bend toward gap.yaw_cmd (+ = turn left). Build the shaft
+  // as a polyline that curves off the straight aim heading by a small lateral
+  // offset that grows quadratically along its length.
+  const yaw = (typeof gap.yaw_cmd === "number") ? gap.yaw_cmd : 0;
+  const bend = Math.max(-0.5, Math.min(0.5, yaw * 0.4));   // metres of side-shift at tip
+  const fwd = new THREE.Vector2(Math.cos(aimA), Math.sin(aimA));     // aim direction
+  const lat = new THREE.Vector2(-fwd.y, fwd.x);                      // +90 deg = left
+  const STEPS = 12;
+  const pos = new Float32Array((STEPS + 1) * 3);
+  let tipX = 0, tipY = 0, tipPX = 0, tipPY = 0;
+  for (let i = 0; i <= STEPS; i++) {
+    const t = i / STEPS;
+    const off = bend * t * t;            // quadratic lateral bend
+    const px = fwd.x * (len * t) + lat.x * off;
+    const py = fwd.y * (len * t) + lat.y * off;
+    pos[i * 3] = px; pos[i * 3 + 1] = py; pos[i * 3 + 2] = OBS_Z;
+    if (i === STEPS) { tipX = px; tipY = py; }
+    if (i === STEPS - 1) { tipPX = px; tipPY = py; }
+  }
+  const oldPath = pathLine.geometry;
+  pathLine.geometry = new THREE.BufferGeometry();
+  pathLine.geometry.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  if (oldPath) oldPath.dispose();
+  pathMat.opacity = dim; pathMat.transparent = true;
+
+  // Cone tip: oriented along the last segment, pulled back half its height (0.13 m)
+  // so the apex lands exactly at the shaft end instead of overshooting it.
+  const tdx = tipX - tipPX, tdy = tipY - tipPY;
+  const tdLen = Math.hypot(tdx, tdy) || 1;
+  const ux = tdx / tdLen, uy = tdy / tdLen;
+  pathTip.position.set(tipX - ux * 0.13, tipY - uy * 0.13, OBS_Z);
+  // Cone default points +Y; rotate it to face the heading in the XY plane.
+  pathTip.rotation.set(0, 0, Math.atan2(tdy, tdx) - Math.PI / 2);
+  tipMat.opacity = dim; tipMat.transparent = true;
+
+  // --- (C) side ticks ------------------------------------------------------
+  emptyGroup(sideTicks);
+  const side = msg.side || {};
+  function sideTick(yVal) {
+    if (yVal == null) return;
+    const g = new THREE.BufferGeometry();
+    // a short cross tick at (0, yVal, z), oriented along forward (X).
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+      -0.12, yVal, OBS_Z,  0.12, yVal, OBS_Z,
+    ]), 3));
+    sideTicks.add(new THREE.Line(g, sideMat));
+  }
+  if (side.left && msg.left_m != null) sideTick(+msg.left_m);
+  if (side.right && msg.right_m != null) sideTick(-msg.right_m);
+}
+
+function clearObstacle() {
+  obstacleGroup.visible = false;
+  nearMarker.visible = false;
+  nearPulse = false;
+  emptyGroup(profileLines);
+  emptyGroup(sideTicks);
+}
+
+window.LidarOverlay = { updateObstacle, clear: clearObstacle };
 
 function setBadge(text, live) {
   if (!badge) return;
@@ -258,3 +459,8 @@ function connect() {
   ws.onerror = () => ws.close();
 }
 connect();
+
+// Start the render loop LAST: animate() references the obstacle-overlay objects
+// (nearPulse / nearMarker) defined above. Calling it before they are initialised
+// throws a TDZ ReferenceError that aborts the whole module -> blank LiDAR feed.
+animate();

@@ -1,0 +1,362 @@
+# =============================================================================
+# Nav2 params  --  THROWAWAY SMOKE-TEST  --  Unitree G1  --  ROS 2 FOXY
+# =============================================================================
+# THIS IS NOT THE REAL PARAMS FILE. It is a DEGRADED, STATIONARY smoke-test copy
+# of config/nav2_params.yaml whose ONLY purpose is to validate the plumbing:
+#
+#   Mid-360 (Livox CustomMsg) -- livox_to_pc2 --> /livox/points (PointCloud2)
+#     -- Nav2 local costmap (built-in VoxelLayer) --> DWB (holonomic) --> /cmd_vel
+#
+#   ... and "see a pole in the local costmap in RViz" using ONLY the already-
+#   installed nav2 + the now-built g1_nav. The robot STANDS STILL (the bridge is
+#   OFF; nothing publishes to LocoClient), so a STATIC odom->base_link TF replaces
+#   FAST-LIO for this test.
+#
+# WHAT DIFFERS FROM nav2_params.yaml (the ONLY changes):
+#   * local_costmap plugins:  stvl_layer -> obstacle_layer (built-in VoxelLayer).
+#     NO STVL (not installed), so NO temporal / blind-spot memory. Smoke-test only.
+#   * obstacle source for BOTH costmaps is the RAW cloud /livox/points (NOT
+#     /patchwork/nonground -- Patchwork++ is NOT running, that topic won't exist).
+#   * Because we feed the RAW (un-segmented) cloud, the floor would mark every
+#     cell. We drop it with a THROWAWAY min_obstacle_height of 0.10 m (the static
+#     base_link->livox_frame z=1.27 puts the LiDAR 1.27 m above the odom floor,
+#     so a floor return lands at odom z ~= 0, a pole at odom z > 0). See the
+#     DO-NOT-RAISE note on the real pipeline below.
+#   * footprint / inflation_radius set from the G1 body spec (see EXTRINSICS_RESEARCH.md).
+#
+# EVERYTHING ELSE -- DWB controller, planner, bt_navigator, recoveries, lifecycle
+# -- is BYTE-FOR-BYTE IDENTICAL to nav2_params.yaml. Do not tune here; tune there.
+#
+# Frames (PINNED for this smoke test -- see smoketest.launch.py / tf.launch.py):
+#   odom         global fixed frame; STATIC identity odom->base_link (robot still)
+#   base_link    robot base = FLOOR projection (z=0)
+#   livox_frame  Mid-360 lidar; STATIC base_link->livox_frame z=1.27 (floor->LiDAR)
+#
+# Run env: source /home/unitree/g1_mapping_ws/env.sh  (ROS_DOMAIN_ID=99, CycloneDDS)
+# Bring up with: bash /home/unitree/projects/g1/g1_nav/smoketest.sh
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# LOCAL COSTMAP  --  the only costmap that matters in map-free mode
+# -----------------------------------------------------------------------------
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 5.0          # Hz; costmap refresh
+      publish_frequency: 2.0         # Hz; for RViz / debugging
+      global_frame: odom             # PINNED: odom frame (STATIC here, not FAST-LIO)
+      robot_base_frame: base_link    # PINNED
+      rolling_window: true           # window follows the robot (map-free)
+      width: 6                       # m
+      height: 6                      # m
+      resolution: 0.05               # m/cell
+      # transform_tolerance generous: FAST-LIO TF on a swaying humanoid can lag.
+      transform_tolerance: 0.5
+
+      # --- FOOTPRINT (top-down body outline polygon, base_link frame, metres) ---
+      # CCW points; (x fwd, y left). G1 body ~0.45 m wide x ~0.20 m deep (Unitree
+      # spec) -> half-depth 0.20 (x) x half-width 0.25 (y), incl. swing margin.
+      # Matches nav2_params.yaml. VERIFY swept width on the moving robot.
+      footprint: "[[0.20,0.25],[0.20,-0.25],[-0.20,-0.25],[-0.20,0.25]]"
+      footprint_padding: 0.0         # add margin here OR bake it into inflation_radius
+
+      # SMOKE-TEST: built-in VoxelLayer (NOT stvl_layer). No temporal memory.
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      # -----------------------------------------------------------------------
+      # OBSTACLE LAYER  --  built-in VoxelLayer fed the RAW Mid-360 cloud.
+      # SMOKE-TEST ONLY. The REAL pipeline uses STVL fed Patchwork++ nonground.
+      # NO temporal decay -> obstacles vanish the instant they leave the FOV.
+      # -----------------------------------------------------------------------
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: true
+        publish_voxel_map: false
+        origin_z: 0.0                # m; bottom of the voxel grid
+        z_resolution: 0.05           # m
+        z_voxels: 16
+        max_obstacle_height: 2.0     # m
+        mark_threshold: 0
+        combination_method: 1        # 1 = max (obstacle layer semantics)
+        observation_sources: "lidar_raw"
+
+        # --- RAW Mid-360 cloud (NOT Patchwork++ nonground) -------------------
+        lidar_raw:
+          topic: /livox/points          # RAW cloud (livox_to_pc2 output)
+          data_type: "PointCloud2"
+          marking: true
+          clearing: true
+          # --- min_obstacle_height: 0.10 m  --  SMOKE-TEST ONLY ---------------
+          # We feed the RAW (un-segmented) cloud, so the FLOOR is in it. The
+          # static base_link->livox_frame z=1.27 puts the LiDAR 1.27 m above the
+          # odom floor, so a floor return lands near odom z=0; this 0.10 m cut
+          # throws the floor away and keeps a pole.
+          # THE REAL PIPELINE uses Patchwork++ nonground at min_obstacle_height
+          # 0.03 -- 'DO NOT RAISE' -- because Patchwork has already removed the
+          # ground, so 0.03 catches real low trip hazards (curbs, cables, fallen
+          # items). 0.10 here is a THROWAWAY floor cut, NOT a value to copy back.
+          min_obstacle_height: 0.10     # SMOKE-TEST throwaway floor cut (see note)
+          max_obstacle_height: 2.0      # m
+          obstacle_range: 5.0           # m; mark obstacles within this
+          raytrace_range: 5.5           # m; clear along the beam to this far
+
+      # -----------------------------------------------------------------------
+      # INFLATION
+      # -----------------------------------------------------------------------
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        # inflation_radius = robot inscribed radius + safety margin.
+        inflation_radius: 0.40        # m  = footprint inscribed radius ~0.20 + ~0.20 margin. Matches nav2_params.yaml.
+        cost_scaling_factor: 3.0      # higher = costs fall off faster from obstacles
+
+  # Costmap nodes need their own clock alias under Foxy bringup:
+  local_costmap_client:
+    ros__parameters:
+      use_sim_time: false
+  local_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: false
+
+# -----------------------------------------------------------------------------
+# GLOBAL COSTMAP  --  UNUSED in map-free mode (kept minimal/rolling so NavFn,
+# which always instantiates a global costmap, has a valid one). It is a small
+# rolling window in odom with the SAME raw source, so a short "global" plan to a
+# nearby relative goal still avoids obstacles. There is NO static map layer.
+# -----------------------------------------------------------------------------
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: odom             # NOT "map" -- there is no map in this mode
+      robot_base_frame: base_link
+      rolling_window: true           # rolling, map-free
+      width: 12                      # m; a bit larger than local so plans have room
+      height: 12
+      resolution: 0.05
+      transform_tolerance: 0.5
+      # SAME footprint as local_costmap (G1 0.45 wide x 0.20 deep body + margin).
+      footprint: "[[0.20,0.25],[0.20,-0.25],[-0.20,-0.25],[-0.20,0.25]]"
+      footprint_padding: 0.0
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: lidar_raw
+        lidar_raw:
+          topic: /livox/points        # RAW cloud (NOT /patchwork/nonground -- it won't exist)
+          data_type: "PointCloud2"
+          marking: true
+          clearing: true
+          min_obstacle_height: 0.10   # SMOKE-TEST throwaway floor cut (REAL pipeline: 0.03 on Patchwork nonground, DO NOT RAISE)
+          max_obstacle_height: 2.0
+          obstacle_range: 5.0
+          raytrace_range: 5.5
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.40        # same as local_costmap (inscribed ~0.20 + margin)
+        cost_scaling_factor: 3.0
+  global_costmap_client:
+    ros__parameters:
+      use_sim_time: false
+  global_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: false
+
+# -----------------------------------------------------------------------------
+# CONTROLLER SERVER  --  DWB, configured HOLONOMIC
+# NOTE: Foxy has NO MPPI and NO Regulated Pure Pursuit (those arrived in Galactic+
+# / Humble). DWB (dwb_core::DWBLocalPlanner, pkg nav2_dwb_controller) is the
+# holonomic-capable choice here. The G1 commands vx, vy AND vyaw, so we sample
+# all three (vy_samples > 0) -- a differential-drive DWB setup would throw away
+# the strafe DOF.
+# -----------------------------------------------------------------------------
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 10.0       # Hz; control loop
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      movement_time_allowance: 10.0
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.25
+      stateful: true
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: true
+
+      # --- velocity / acceleration limits (HOLONOMIC) ----------------------
+      # Caps come from config/robot.yaml (max_vx 1.5, max_vy 0.7, max_vyaw 2.0).
+      # <ASK ENRICO: confirm these are the SAFE Nav2 maxima -- the dashboard caps
+      #  are for teleop; for autonomous nav you may want lower. Defaults below
+      #  use the full rated caps.>
+      min_vel_x: -1.5
+      max_vel_x: 1.5                  # m/s   (robot.yaml max_vx)
+      min_vel_y: -0.7
+      max_vel_y: 0.7                  # m/s   (robot.yaml max_vy)
+      min_vel_theta: -2.0
+      max_vel_theta: 2.0             # rad/s (robot.yaml max_vyaw); see min_speed_theta
+      max_speed_xy: 1.66             # m/s   sqrt(max_vx^2+max_vy^2); cap on combined translational speed
+      min_speed_xy: 0.0
+      min_speed_theta: 0.0
+
+      # acceleration limits  <ASK ENRICO: real comfortable accel/decel for the G1
+      # gait -- placeholders below; too high will command jerky gait, too low = sluggish>
+      acc_lim_x: 1.0
+      acc_lim_y: 0.6
+      acc_lim_theta: 2.0
+      decel_lim_x: -1.0
+      decel_lim_y: -0.6
+      decel_lim_theta: -2.0
+
+      # --- trajectory sampling (HOLONOMIC: ALL THREE > 0) ------------------
+      vx_samples: 20
+      vy_samples: 10                 # > 0  => holonomic strafe is sampled
+      vtheta_samples: 20
+      sim_time: 1.5                  # s; trajectory rollout horizon
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.5
+      discretize_by_time: false
+
+      # --- critics (holonomic-appropriate) ---------------------------------
+      # RotateToGoal/Oscillation can be over-eager for a holonomic base; the set
+      # below favors goal/path alignment + obstacle avoidance. Tune with the robot.
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign",
+                "PathAlign", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.02
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.1
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.1
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+      Oscillation.scale: 1.0
+
+# -----------------------------------------------------------------------------
+# PLANNER SERVER  --  GridBased / NavFn (fine for short LOCAL goals)
+# -----------------------------------------------------------------------------
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5                 # m; accept a plan ending within this of the goal
+      use_astar: false               # false = Dijkstra (NavFn default)
+      allow_unknown: true            # map-free: most of the rolling costmap is unknown
+
+# -----------------------------------------------------------------------------
+# BT NAVIGATOR  --  the navigate-to-pose behavior tree
+# -----------------------------------------------------------------------------
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: odom               # NOT map -- map-free mode
+    robot_base_frame: base_link
+    odom_topic: /Odometry            # PINNED: FAST-LIO odometry
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    enable_groot_monitoring: false
+    # Use Foxy's default navigate_to_pose BT. <ASK ENRICO: if you want a
+    # navigate_through_poses or a custom recovery BT, point default_bt_xml_filename
+    # at it; Foxy default is fine for single relative goals.>
+    # default_bt_xml_filename: "navigate_w_replanning_and_recovery.xml"
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_distance_traveled_condition_bt_node
+
+bt_navigator_rclcpp_node:
+  ros__parameters:
+    use_sim_time: false
+
+# -----------------------------------------------------------------------------
+# RECOVERY / BEHAVIOR SERVER
+# NOTE: on Foxy the package/node is called "recoveries_server" (it was renamed to
+# "behavior_server" in Galactic+). This block name MUST match the node name used
+# in bringup.launch.py and the lifecycle_manager node_names list below
+# (recoveries_server), or the param namespace won't resolve and the lifecycle
+# bond will fail.
+# Spin recovery makes sense for a holonomic base; BackUp + Wait are safe defaults.
+# -----------------------------------------------------------------------------
+recoveries_server:
+  ros__parameters:
+    use_sim_time: false
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    recovery_plugins: ["spin", "backup", "wait"]
+    spin:
+      plugin: "nav2_recoveries/Spin"
+    backup:
+      plugin: "nav2_recoveries/BackUp"
+    wait:
+      plugin: "nav2_recoveries/Wait"
+    global_frame: odom               # map-free
+    robot_base_frame: base_link
+    transform_tolerance: 0.5
+    simulate_ahead_time: 2.0
+    # <ASK ENRICO: safe recovery rotation/back-up speeds for the G1 gait>
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 2.0
+
+# -----------------------------------------------------------------------------
+# LIFECYCLE MANAGER  --  brings up & watches the nav servers (autostart)
+# NOTE the Foxy node names: planner_server, controller_server, recoveries_server
+# (NOT behavior_server), bt_navigator. The two costmaps are lifecycle-managed by
+# their parent servers, so they are NOT listed here.
+# These node_names MUST match the param block names above AND the Node names in
+# bringup.launch.py (the launch passes its own node_names list to the manager;
+# keep all three in sync).
+# -----------------------------------------------------------------------------
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+    node_names:
+      - controller_server
+      - planner_server
+      - recoveries_server
+      - bt_navigator
+    bond_timeout: 4.0
+    attempt_respawn_reconnection: true

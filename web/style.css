@@ -1,587 +1,347 @@
+/* =========================================================================
+   G1 Operator Console — "Tarmac"
+   A console for a walking machine: cool & inert by default, warming to a single
+   hazard amber only when the robot is LIVE (walk). Hue encodes the FSM mode; the
+   interface speaks in two voices — sans for human chrome, mono for telemetry.
+   ========================================================================= */
+
 :root {
-  --bg: #0e0f15;
-  --panel: #181a24;
-  --panel2: #20232f;
-  --fg: #e6e6f0;
-  --dim: #7a7f95;
-  --accent: #ffb74d;
-  --ok: #4caf50;
-  --warn: #f44336;
-  --border: #2a2e3d;
+  /* Surfaces — deep cool graphite, not pure black (engineered metal) */
+  --ink:        #0A0D13;
+  --surface:    #10141E;
+  --surface-2:  #161C2A;
+  --inset:      #0C1019;
+  --line:       #232C3E;
+  --line-soft:  #1A2030;
+
+  /* Text */
+  --chalk:      #E9EDF6;   /* primary           */
+  --steel:      #8A93A6;   /* secondary / labels (AA on surface) */
+  --steel-dim:  #7E879B;   /* tertiary (kept >=4.5:1 for small text) */
+
+  /* Semantic color language */
+  --focus:      #5C8DF2;   /* interaction: hover / press / focus (cool) */
+  --live:       #3FD39B;   /* streaming / online liveness               */
+  --caution:    #FF8636;   /* warnings: battery low, unsaved map, log warn */
+  --stop:       #FF4747;   /* e-stop / destructive / recording          */
+
+  /* Robot state ramp (escalating aliveness) */
+  --st-off:     #6E788C;   /* zero_torque — inert */
+  --st-damp:    #34B7D0;   /* damp — calm         */
+  --st-stand:   #5C8DF2;   /* stand — ready       */
+  --st-walk:    #FF8636;   /* walk — LIVE (the one warm hue) */
+
+  /* Mode color resolved from body[data-mode]; defaults to inert */
+  --mode: var(--st-off);
+
+  --radius:     12px;
+  --radius-sm:  8px;
+  --pad:        16px;
+
+  --font-ui:    "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-data:  "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --shadow:     0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 24px rgba(0,0,0,0.35);
 }
 
+/* Mode → accent hue (set by controller.js: body.dataset.mode) */
+body[data-mode="zero_torque"] { --mode: var(--st-off); }
+body[data-mode="damp"]        { --mode: var(--st-damp); }
+body[data-mode="stand"]       { --mode: var(--st-stand); }
+body[data-mode="walk"]        { --mode: var(--st-walk); }
+
 * { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0;
-  padding: 16px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  background: var(--bg);
-  color: var(--fg);
+  padding: 18px clamp(14px, 3vw, 30px) 40px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  background:
+    radial-gradient(1200px 480px at 78% -8%, rgba(92,141,242,0.06), transparent 60%),
+    var(--ink);
+  color: var(--chalk);
   -webkit-tap-highlight-color: transparent;
   overscroll-behavior: none;
 }
 
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-
-h1 { margin: 0; font-size: 22px; }
+/* ---------------------------------------------------------------- typography */
+h1 { margin: 0; }
 h2 {
-  margin: 0 0 10px 0;
-  font-size: 14px;
-  color: var(--dim);
-  font-weight: normal;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  margin: 0 0 12px;
+  font-size: 11px; font-weight: 600;
+  color: var(--steel); text-transform: uppercase; letter-spacing: 0.16em;
+}
+b { font-weight: 600; }
+.mono, .vel-line b, #batteryText {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
 }
 
-/* Status indicator */
-.status {
-  display: flex;
-  align-items: center;
-  font-size: 14px;
-  color: var(--dim);
+/* ---------------------------------------------------------------------- header */
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 16px; }
+.wordmark { display: flex; align-items: center; gap: 11px; margin-right: 4px; }
+.wordmark .mark {
+  width: 30px; height: 30px; display: grid; place-items: center;
+  border: 1px solid var(--line); border-radius: 9px;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  color: var(--mode); font-size: 16px; line-height: 1;
+  transition: color .4s;
 }
-.status .dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  margin-right: 6px;
-  background: var(--warn);
-  transition: background 0.2s;
+.wordmark h1 { font-size: 16px; font-weight: 600; letter-spacing: .01em; }
+.wordmark .sub {
+  font-family: var(--font-data);
+  font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+  color: var(--steel-dim); display: block; margin-top: 1px;
 }
-.status.connected .dot { background: var(--ok); }
-.status.connected { color: var(--fg); }
+.header-spacer { flex: 1; }
 
-/* Battery pill (header) — colour follows charge level via currentColor */
-.battery {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 16px;
-  font-size: 14px;
-  color: var(--dim);          /* unknown / not reporting */
-}
-.battery .batt-icon {
-  position: relative;
-  width: 26px;
-  height: 13px;
-  padding: 1.5px;
-  border: 1.5px solid currentColor;
-  border-radius: 3px;
-}
-.battery .batt-icon::after {  /* + terminal nub */
-  content: "";
-  position: absolute;
-  right: -4px;
-  top: 3px;
-  width: 2.5px;
-  height: 5px;
-  background: currentColor;
-  border-radius: 0 1px 1px 0;
-}
-.battery .batt-fill {
-  display: block;
-  height: 100%;
-  width: 0%;
-  background: currentColor;
-  border-radius: 1px;
-  transition: width 0.4s ease;
-}
-.battery.ok   { color: var(--ok); }
-.battery.warn { color: var(--accent); }
-.battery.crit { color: var(--warn); }
-.battery.crit .batt-icon { animation: battpulse 1.2s ease-in-out infinite; }
-@keyframes battpulse { 50% { opacity: 0.35; } }
+.status { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--steel); }
+.status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--stop); transition: background .25s, box-shadow .25s; }
+.status.connected { color: var(--chalk); }
+.status.connected .dot { background: var(--live); box-shadow: 0 0 10px rgba(63,211,155,0.6); }
 
-/* Overlay canvas: skeletons + detection boxes drawn over the raw camera feed */
-#camCanvas {
-  position: absolute;
-  pointer-events: none;
-  z-index: 3;
-}
+.battery { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--steel); }
+.battery .batt-icon { position: relative; width: 28px; height: 14px; padding: 2px; border: 1.5px solid currentColor; border-radius: 3px; }
+.battery .batt-icon::after { content: ""; position: absolute; right: -4px; top: 3.5px; width: 2.5px; height: 5px; background: currentColor; border-radius: 0 1px 1px 0; }
+.battery .batt-fill { display: block; height: 100%; width: 0%; background: currentColor; border-radius: 1px; transition: width .4s ease; }
+.battery.ok   { color: var(--live); }
+.battery.warn { color: var(--caution); }
+.battery.crit { color: var(--stop); }
+.battery.crit .batt-icon { animation: pulse 1.2s ease-in-out infinite; }
 
-/* Tabs */
-.tabs {
-  display: flex;
-  gap: 6px;
-}
-.tab {
-  background: var(--panel);
-  color: var(--dim);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 16px;
-  font-size: 14px;
-  font-family: inherit;
-  cursor: pointer;
-}
-.tab.current {
-  background: var(--panel2);
-  color: var(--fg);
-  border-color: var(--accent);
-}
+/* ----------------------------------------------------------------------- tabs */
+.tabs { display: flex; gap: 4px; padding: 3px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+.tab { background: transparent; color: var(--steel); border: 1px solid transparent; border-radius: 7px; padding: 7px 16px; font-size: 13px; font-family: inherit; font-weight: 500; cursor: pointer; transition: color .15s, background .15s; }
+.tab:hover { color: var(--chalk); }
+.tab.current { background: var(--surface-2); color: var(--chalk); border-color: var(--line); }
 .tab-panel { display: none; }
 .tab-panel.current { display: block; }
 
-/* Event log */
-.panel.log h2 { display: flex; align-items: center; justify-content: space-between; }
-.log-clear {
-  font-size: 11px;
-  padding: 2px 8px;
-  background: var(--panel2);
-  color: var(--dim);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+/* =====================================================================
+   MODE BAR — live mode + the controls that change it, docked in the header
+   between the tabs and the connection status. The mode hue rides the left
+   edge, so the console's "warming to amber in walk" identity stays visible.
+   ===================================================================== */
+.modebar {
+  position: relative; display: flex; align-items: center; gap: 11px;
+  padding: 4px 6px 4px 13px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  overflow: hidden;
 }
-.event-log {
-  max-height: 320px;
-  overflow-y: auto;
-  font-size: 12px;
-  line-height: 1.6;
-}
-.log-line { color: var(--dim); white-space: pre-wrap; }
-.log-line.ok { color: var(--ok); }
-.log-line.warn { color: var(--accent); }
+.modebar::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--mode); transition: background .4s; }
 
-/* Two-window layout (camera | lidar) */
-.windows {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: 1fr;
-  margin-bottom: 12px;
+.mode-readout { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.mode-readout .eyebrow { font-size: 10px; letter-spacing: .18em; text-transform: uppercase; color: var(--steel-dim); }
+.mode-readout .word { font-size: 15px; font-weight: 700; letter-spacing: .01em; color: var(--mode); text-transform: capitalize; line-height: 1.1; transition: color .4s; }
+
+/* transitioning… — surfaced only mid-transition (body[data-transitioning="1"]) */
+.transit-flag { display: none; align-items: center; gap: 6px; font-family: var(--font-data); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--focus); }
+.transit-flag .tf-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--focus); animation: pulse 1s ease-in-out infinite; }
+body[data-transitioning="1"] .transit-flag { display: inline-flex; }
+body[data-transitioning="1"] .mode-readout .word { color: var(--focus); }
+
+/* LIVE — steady-state walk only; hidden while a transition is in flight */
+.live-flag { display: none; align-items: center; gap: 6px; font-family: var(--font-data); font-size: 10px; letter-spacing: .16em; color: var(--st-walk); }
+.live-flag .lf-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--st-walk); animation: pulse 1.1s ease-in-out infinite; }
+body[data-mode="walk"] .live-flag { display: inline-flex; }
+body[data-transitioning="1"] .live-flag { display: none; }
+
+/* Mode buttons sized down to the header scale */
+.modebar .mode-buttons { gap: 5px; }
+.modebar .mode-btn { padding: 6px 11px; font-size: 12px; }
+/* Only Walk (a real locomotion mode) lights up to show it's active. Dance and
+   Climb just fire a one-shot behaviour, so don't let them latch the lit fill on
+   press — the generic 1px press-down nudge stays as click feedback. */
+.modebar .mode-btn.behaviour:active,
+.modebar .mode-btn.behaviour.active,
+.modebar .mode-btn.behaviour.current {
+  background: var(--surface-2); color: var(--chalk); border-color: var(--line); box-shadow: none;
 }
-@media (min-width: 720px) {
-  .windows { grid-template-columns: 1fr 1fr; }
-}
+
+/* ============================================================ media windows */
+.windows { display: grid; gap: 12px; grid-template-columns: 1fr; margin-bottom: 14px; }
+@media (min-width: 860px) { .windows { grid-template-columns: 1fr 1fr; } }
 
 .media-window {
-  position: relative;
-  background: #000;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-  aspect-ratio: 16 / 9;
-  min-height: 240px;
+  position: relative; background: #000; border: 1px solid var(--line);
+  border-radius: var(--radius); overflow: hidden; aspect-ratio: 16 / 9; min-height: 240px;
+  box-shadow: var(--shadow);
 }
 .window-title {
-  position: absolute;
-  top: 8px;
-  left: 10px;
-  z-index: 2;
-  font-size: 12px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--dim);
-  background: rgba(14, 15, 21, 0.6);
-  padding: 3px 8px;
-  border-radius: 6px;
-  pointer-events: none;
+  position: absolute; top: 9px; left: 11px; z-index: 2;
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase; font-weight: 600; color: var(--steel);
+  background: rgba(10,13,19,0.66); backdrop-filter: blur(6px);
+  padding: 4px 9px; border-radius: 7px; border: 1px solid var(--line-soft); pointer-events: none;
 }
-.badge {
-  color: var(--warn);
-  font-size: 11px;
-  margin-left: 4px;
-}
-.badge.live { color: var(--ok); }
+.badge { font-family: var(--font-data); color: var(--stop); font-size: 10px; margin-left: 5px; }
+.badge.live { color: var(--live); }
 
-#camFeed {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  display: block;
-}
-#camFeed.offline { opacity: 0.85; }
+#camFeed { width: 100%; height: 100%; object-fit: contain; display: block; }
+#camFeed.offline { opacity: 0.55; filter: grayscale(0.4); }
 
-.lidar-canvas {
-  width: 100%;
-  height: 100%;
-  cursor: grab;
-}
-.orient-legend {
-  position: absolute;
-  left: 110px;          /* sits just right of the 92px gizmo */
-  bottom: 12px;
-  z-index: 2;
-  font-size: 11px;
-  color: var(--dim);
-  background: rgba(14, 15, 21, 0.6);
-  padding: 2px 6px;
-  border-radius: 6px;
-  pointer-events: none;
-}
+/* Overlay canvas: skeletons + detection boxes (JS-sized over #camFeed) */
+#camCanvas { position: absolute; pointer-events: none; z-index: 3; }
+
+.lidar-canvas { width: 100%; height: 100%; cursor: grab; }
 .lidar-canvas:active { cursor: grabbing; }
 .lidar-canvas canvas { display: block; }
+.orient-legend { position: absolute; left: 110px; bottom: 13px; z-index: 2; font-family: var(--font-data); font-size: 10px; color: var(--steel); background: rgba(10,13,19,0.66); backdrop-filter: blur(6px); padding: 3px 7px; border-radius: 6px; pointer-events: none; }
 
-/* On-screen navigation pad (laptop-friendly orbit/tilt/zoom), bottom-right */
-.nav-pad {
-  position: absolute;
-  right: 8px;
-  bottom: 58px;
-  z-index: 2;
-  display: grid;
-  gap: 4px;
-  grid-template-columns: 34px 34px 34px;
-  grid-template-areas:
-    ".    up    ."
-    "left .     right"
-    ".    down  ."
-    "zout .     zin";
-  background: rgba(14, 15, 21, 0.72);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 4px;
+/* Floating control clusters over the windows */
+.nav-pad, .view-bar, .map-bar, .cam-bar {
+  position: absolute; z-index: 2; background: rgba(10,13,19,0.72); backdrop-filter: blur(8px);
+  border: 1px solid var(--line); border-radius: 10px; padding: 5px;
 }
-.nav-pad button {
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  font-size: 14px;
-  font-family: inherit;
-  background: var(--panel2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-}
-.nav-pad button:active { background: var(--accent); color: #1a1a1a; }
-.n-up { grid-area: up; } .n-left { grid-area: left; }
-.n-right { grid-area: right; } .n-down { grid-area: down; }
-.n-zin { grid-area: zin; } .n-zout { grid-area: zout; }
+.nav-pad { right: 9px; bottom: 60px; display: grid; gap: 4px; grid-template-columns: repeat(3, 34px); grid-template-areas: ".    up    ." "left .     right" ".    down  ." "zout .     zin"; }
+.nav-pad button { width: 34px; height: 34px; padding: 0; font-size: 14px; background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; touch-action: none; user-select: none; -webkit-user-select: none; }
+.nav-pad button:active { background: var(--focus); color: #fff; border-color: var(--focus); }
+.n-up { grid-area: up; } .n-left { grid-area: left; } .n-right { grid-area: right; }
+.n-down { grid-area: down; } .n-zin { grid-area: zin; } .n-zout { grid-area: zout; }
 
-/* View/analysis toolbar overlaid top-right of the lidar window */
-.view-bar {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 2;
-  display: flex;
-  gap: 4px;
-  background: rgba(14, 15, 21, 0.72);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 4px;
-}
-.view-bar button {
-  padding: 5px 8px;
-  font-size: 12px;
-  font-family: inherit;
-  background: var(--panel2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  min-width: 30px;
-}
-.view-bar button:hover { border-color: var(--accent); }
+.view-bar { top: 9px; right: 9px; display: flex; gap: 4px; }
+.view-bar button { padding: 6px 9px; font-size: 12px; min-width: 30px; background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
+.view-bar button:hover { border-color: var(--focus); color: #fff; }
 
-/* Map control bar overlaid at the bottom of the lidar window */
-.map-bar {
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 8px;
-  z-index: 2;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 6px;
-  background: rgba(14, 15, 21, 0.72);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-.map-bar button,
-.map-bar input,
-.map-bar select {
-  padding: 6px 8px;
-  font-size: 12px;
-  font-family: inherit;
-  background: var(--panel2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-}
-.map-bar input { width: 96px; }
-.map-bar #mapToggle.active {
-  background: var(--warn);
-  color: #fff;
-  border-color: var(--warn);
-}
-.map-status {
-  margin-left: auto;
-  font-size: 12px;
-  color: var(--dim);
-}
-.map-status.unsaved { color: var(--accent); }
+.cam-bar { top: 9px; right: 9px; display: flex; gap: 4px; }
+.cam-bar button { padding: 6px 11px; font-size: 12px; background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
+.cam-bar button:hover { border-color: var(--focus); color: #fff; }
+.cam-bar button.active { background: var(--focus); color: #fff; border-color: var(--focus); font-weight: 600; }
 
-/* Layout */
-main {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: 1fr;
-}
-@media (min-width: 720px) {
-  main {
-    grid-template-columns: 1fr 1fr;
-  }
-  .panel.modes,
-  .panel.buttons,
-  .panel.log {
-    grid-column: 1 / -1;
-  }
-}
+.map-bar { left: 9px; right: 9px; bottom: 9px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.map-bar button, .map-bar input, .map-bar select { padding: 6px 9px; font-size: 12px; font-family: var(--font-ui); background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
+.map-bar input { width: 100px; font-family: var(--font-data); }
+.map-bar #mapToggle.active { background: var(--stop); color: #fff; border-color: var(--stop); font-weight: 600; }
+.map-status { margin-left: auto; font-family: var(--font-data); font-size: 11px; color: var(--steel); }
+.map-status.unsaved { color: var(--caution); }
 
-/* Panels */
-.panel {
-  background: var(--panel);
-  border-radius: 10px;
-  padding: 14px;
-}
-
-/* Mode selector */
-.mode-buttons {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
-  margin-bottom: 10px;
-}
-.mode-btn {
-  background: var(--panel2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 14px 8px;
-  font-size: 14px;
-  font-family: inherit;
-  cursor: pointer;
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: manipulation;
-  transition: background 0.15s, border-color 0.15s;
-}
-.mode-btn small {
-  display: block;
-  font-size: 10px;
-  color: var(--dim);
-  margin-top: 2px;
-}
-.mode-btn:hover { border-color: var(--accent); }
-.mode-btn.current {
-  background: var(--ok);
-  color: white;
-  border-color: var(--ok);
-}
-.mode-btn.current small { color: rgba(255, 255, 255, 0.8); }
-
-/* Pulse while transitioning */
-.mode-btn.transitioning {
-  background: var(--accent);
-  color: #1a1a1a;
-  border-color: var(--accent);
-  animation: pulse 1s ease-in-out infinite;
-}
-.mode-btn.transitioning small { color: rgba(0, 0, 0, 0.6); }
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.55; }
-}
-
-.mode-hint {
-  margin: 0;
-  font-size: 13px;
-  color: var(--dim);
-  line-height: 1.5;
-}
-.mode-hint.warn { color: var(--warn); }
-
-/* Velocity / FSM readout */
-.vel-line {
-  display: flex;
-  justify-content: space-between;
-  padding: 4px 0;
-  color: var(--dim);
-}
-.vel-line b { color: var(--fg); }
-
-.hint {
-  color: var(--dim);
-  font-size: 13px;
-  line-height: 1.7;
-  margin: 0;
-}
-
-/* Buttons (general) */
-button {
-  background: var(--panel2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 10px;
-  font-size: 14px;
-  font-family: inherit;
-  cursor: pointer;
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: manipulation;
-  transition: background 0.1s, opacity 0.15s;
-}
-button:active,
-button.active {
-  background: var(--accent);
-  color: #1a1a1a;
-}
-button.stop {
-  border-color: var(--warn);
-  color: var(--warn);
-}
-button.stop:active,
-button.stop.active {
-  background: var(--warn);
-  color: white;
-}
-button.go {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-/* Disabled state — used for movement buttons outside walk mode */
-button[disabled],
-button.disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-button[disabled]:active,
-button.disabled:active {
-  background: var(--panel2);
-  color: var(--fg);
-}
-
-/* D-pad layout */
-.dpad {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: repeat(3, 60px);
-  gap: 6px;
-  max-width: 260px;
-  margin: 0 auto 14px auto;
-}
-.dpad .up    { grid-column: 2; grid-row: 1; }
-.dpad .left  { grid-column: 1; grid-row: 2; }
-.dpad .center{ grid-column: 2; grid-row: 2; }
-.dpad .right { grid-column: 3; grid-row: 2; }
-.dpad .down  { grid-column: 2; grid-row: 3; }
-.dpad button small { display: block; font-size: 10px; color: var(--dim); }
-
-/* Rotation row */
-.rot {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  max-width: 260px;
-  margin: 0 auto 14px auto;
-}
-
-/* Posture row */
-.posture {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 8px;
-}
-
-/* Pose/skeleton toggle — overlaid top-right of the camera window (like view-bar) */
-.cam-bar {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 2;
-  display: flex;
-  gap: 4px;
-  background: rgba(14, 15, 21, 0.72);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 4px;
-}
-.cam-bar button {
-  padding: 5px 10px;
-  font-size: 12px;
-  font-family: inherit;
-  background: var(--panel2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-}
-.cam-bar button:hover { border-color: var(--accent); }
-.cam-bar button.active {
-  background: var(--accent);
-  color: #1a1a1a;
-  border-color: var(--accent);
-}
-
-/* People label bar — overlaid at the bottom of the camera window (like map-bar) */
-.people-bar {
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 8px;
-  z-index: 2;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  background: rgba(14, 15, 21, 0.72);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
+/* People / object label bars (overlay, bottom of camera window) */
+.people-bar { position: absolute; left: 9px; right: 9px; bottom: 9px; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 7px 9px; background: rgba(10,13,19,0.72); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 10px; }
 .people-bar[hidden] { display: none; }
-.people-label {
-  font-size: 11px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--dim);
+.people-label { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--steel); font-weight: 600; }
+.people-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.people-empty { font-size: 12px; color: var(--steel-dim); }
+.people-row { display: flex; align-items: center; gap: 5px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 7px; padding: 3px 7px; }
+.people-id { font-family: var(--font-data); font-size: 12px; color: var(--focus); }
+.obj-chip { font-family: var(--font-data); font-size: 12px; padding: 3px 9px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 7px; color: var(--chalk); }
+.people-row input { width: 86px; padding: 4px 7px; font-size: 12px; font-family: var(--font-ui); background: var(--inset); color: var(--chalk); border: 1px solid var(--line); border-radius: 6px; }
+.people-row input:focus { outline: none; border-color: var(--focus); }
+
+/* ========================================================= control layout */
+main { display: grid; gap: 12px; grid-template-columns: 1fr; }
+main.controls { grid-template-columns: 1fr; }
+@media (min-width: 760px) {
+  main.controls { grid-template-columns: 1.15fr 1fr; align-items: start; }
+  main.controls .span-all { grid-column: 1 / -1; }
 }
-.people-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
+main.diag { grid-template-columns: 1fr; }
+@media (min-width: 760px) {
+  main.diag { grid-template-columns: 1fr 1fr; }
+  main.diag .span-all { grid-column: 1 / -1; }
 }
-.people-empty { font-size: 12px; color: var(--dim); }
-.people-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  background: var(--panel2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px 6px;
+
+/* -------------------------------------------------------------------- panels */
+.panel { background: linear-gradient(180deg, var(--surface), var(--surface-2)); border: 1px solid var(--line); border-radius: var(--radius); padding: var(--pad); box-shadow: var(--shadow); }
+
+/* Mode ladder — four locomotion states + whole-body behaviours */
+.mode-buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mode-sep { width: 1px; align-self: stretch; min-height: 22px; background: var(--line); margin: 0 4px; }
+.mode-btn {
+  position: relative; flex: 0 0 auto; background: var(--surface-2); color: var(--chalk);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 8px 13px; font-size: 12.5px; font-weight: 600; font-family: inherit;
+  cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  transition: background .15s, border-color .15s, color .15s, box-shadow .15s;
 }
-.people-id { font-size: 12px; color: var(--accent); }
-/* Object-detection count chips (e.g. "door ×2") in the Objects bar */
-.obj-chip {
-  font-size: 12px;
-  padding: 2px 8px;
-  background: var(--panel2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--fg);
+.mode-btn small { font-family: var(--font-data); font-size: 9px; font-weight: 500; color: var(--steel); margin-left: 5px; letter-spacing: .04em; }
+.mode-btn:hover { border-color: var(--focus); }
+.mode-btn.current { color: #fff; }
+.mode-btn[data-mode="zero_torque"].current { background: color-mix(in srgb, var(--st-off) 26%, var(--surface-2)); border-color: var(--st-off); box-shadow: 0 0 0 1px var(--st-off); }
+.mode-btn[data-mode="damp"].current        { background: color-mix(in srgb, var(--st-damp) 22%, var(--surface-2)); border-color: var(--st-damp); box-shadow: 0 0 0 1px var(--st-damp); }
+.mode-btn[data-mode="stand"].current        { background: color-mix(in srgb, var(--st-stand) 24%, var(--surface-2)); border-color: var(--st-stand); box-shadow: 0 0 0 1px var(--st-stand); }
+.mode-btn[data-mode="walk"].current          { background: color-mix(in srgb, var(--st-walk) 26%, var(--surface-2)); border-color: var(--st-walk); box-shadow: 0 0 0 1px var(--st-walk), 0 0 18px rgba(255,134,54,0.28); }
+.mode-btn.current small { color: rgba(255,255,255,0.85); }
+.mode-btn.transitioning { background: var(--surface-2); border-color: var(--focus); color: var(--focus); animation: pulse 1s ease-in-out infinite; }
+.mode-btn.transitioning small { color: var(--focus); }
+
+.mode-hint { margin: 12px 0 0; font-size: 12.5px; color: var(--steel); line-height: 1.55; }
+.mode-hint.warn { color: var(--caution); }
+
+/* Drive pad */
+.dpad { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 58px); gap: 7px; max-width: 280px; margin: 0 auto 14px; }
+.dpad .up { grid-column: 2; grid-row: 1; } .dpad .left { grid-column: 1; grid-row: 2; }
+.dpad .center { grid-column: 2; grid-row: 2; } .dpad .right { grid-column: 3; grid-row: 2; }
+.dpad .down { grid-column: 2; grid-row: 3; }
+.dpad button small { display: block; font-family: var(--font-data); font-size: 9px; color: var(--steel); margin-top: 1px; }
+.rot { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-width: 280px; margin: 0 auto; }
+.stance { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-width: 280px; margin: 12px auto 0; }
+.posture { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 8px; }
+
+/* ------------------------------------------------------------- generic button */
+button {
+  background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 12px 12px; font-size: 13px; font-weight: 500; font-family: var(--font-ui);
+  cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  transition: background .12s, border-color .12s, color .12s, opacity .15s, transform .04s;
 }
-.people-row input {
-  width: 84px;
-  padding: 4px 6px;
-  font-size: 12px;
-  font-family: inherit;
-  background: var(--panel);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 5px;
+button:hover { border-color: var(--focus); }
+button:active { transform: translateY(1px); }
+button:active, button.active { background: var(--focus); color: #fff; border-color: var(--focus); }
+
+button.stop { border-color: var(--stop); color: var(--stop); font-weight: 700; letter-spacing: .08em; }
+button.stop:hover { border-color: var(--stop); }
+button.stop:active, button.stop.active { background: var(--stop); color: #fff; }
+
+button.go { border-color: var(--line); color: var(--chalk); }
+button.go:hover { border-color: var(--focus); }
+button.go.active { color: #fff; border-color: var(--focus); }   /* active beats .go */
+
+button[disabled], button.disabled { opacity: 0.38; cursor: not-allowed; }
+button[disabled]:hover, button.disabled:hover { border-color: var(--line); }
+button[disabled]:active, button.disabled:active { background: var(--surface-2); color: var(--chalk); transform: none; }
+
+/* --------------------------------------------------- diagnostics / readouts */
+.vel-line { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line-soft); color: var(--steel); font-size: 13px; }
+.vel-line:last-child { border-bottom: 0; }
+.vel-line b { color: var(--chalk); font-size: 14px; }
+
+/* Event log */
+.panel.log h2 { display: flex; align-items: center; justify-content: space-between; }
+.log-clear { font-size: 10px; font-weight: 500; padding: 3px 9px; background: var(--surface-2); color: var(--steel); border: 1px solid var(--line); border-radius: 6px; letter-spacing: .04em; }
+.event-log { max-height: 340px; overflow-y: auto; font-family: var(--font-data); font-size: 12px; line-height: 1.65; }
+.log-line { color: var(--steel); white-space: pre-wrap; }
+.log-line.ok { color: var(--live); }
+.log-line.warn { color: var(--caution); }
+
+/* --------------------------------------------------------------- a11y / focus */
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 5px; }
+input:focus-visible { outline-offset: 0; }
+.event-log::-webkit-scrollbar { width: 9px; }
+.event-log::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* Bigger hit areas on touch devices (keeps the tight desktop look on mouse) */
+@media (pointer: coarse) {
+  .nav-pad { bottom: 66px; grid-template-columns: repeat(3, 44px); }
+  .nav-pad button { width: 44px; height: 44px; font-size: 16px; }
+  .view-bar button, .cam-bar button, .map-bar button, .map-bar select, .map-bar input { min-height: 44px; }
+  .tab { padding: 11px 18px; }
+  .modebar .mode-btn { min-height: 44px; padding: 8px 13px; }
 }
-.people-row input:focus { outline: none; border-color: var(--accent); }
+
+/* Narrow screens: let the mode bar drop onto its own full-width header row */
+@media (max-width: 720px) {
+  .modebar { order: 1; flex: 1 1 100%; }
+}
+@media (max-width: 380px) {
+  .mode-btn { padding: 7px 10px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+@media (min-width: 1500px) { body { max-width: 1480px; margin: 0 auto; } }
