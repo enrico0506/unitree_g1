@@ -154,6 +154,68 @@ remote_combos:
 
 
 # ----------------------------------------------------------------------------
+# ARM GESTURES — SDK action ids (G1ArmActionClient, service "arm")
+# ----------------------------------------------------------------------------
+# Canonical full action catalog (mirrors action_map in the SDK at
+# unitree_sdk2py/g1/arm/g1_arm_action_client.py). The dashboard wires only a
+# subset (scripts/robot_web_controller.py ARM_GESTURES); this is the reference.
+# Call via: c = G1ArmActionClient(); c.SetTimeout(3.0); c.Init(); c.ExecuteAction(<id>)
+# Hold-poses (hands_up, hug, heart, high_five, …) must be returned to neutral
+# with release_arm (99); the dashboard auto-releases them after a few seconds
+# (and toggles hands_up on a second press). Verified on Enrico's G1 2026-06-23.
+# ----------------------------------------------------------------------------
+arm_gestures:
+  release_arm:    99   # return arms to neutral (clears any held pose)
+  two_hand_kiss:  11
+  left_kiss:      12
+  right_kiss:     13
+  hands_up:       15   # palm-up raise; dashboard toggles it with release_arm
+  clap:           17
+  high_five:      18
+  hug:            19
+  heart:          20
+  right_heart:    21
+  reject:         22
+  right_hand_up:  23
+  x_ray:          24
+  face_wave:      25
+  high_wave:      26
+  shake_hand:     27
+
+# Which remote double-tap maps to which gesture (observed on the remote).
+remote_gestures:
+  double_A: clap            # bit 8  — "press A twice fast -> claps"
+  double_Y: high_wave       # bit 11 — "double Y -> waves hand"
+  double_X: two_hand_kiss   # bit 10 — "double X -> blows a kiss"
+  double_B: hands_up        # bit 9  — "double B -> hand up, palm up; press again to lower"
+
+
+# ----------------------------------------------------------------------------
+# WHOLE-BODY MODE COMBOS
+# ----------------------------------------------------------------------------
+# These combos switch the robot into a whole-body behavior mode (NOT an arm
+# animation), so they are driven by an FSM id, not the arm service. The
+# dashboard mode button is a one-liner: client.SetFsmId(<fsm_id>).
+# fsm_ids below were captured on the real robot (scripts/capture_combo_fsm.py).
+# ----------------------------------------------------------------------------
+mode_combos:
+  climb:
+    combo: R2+B
+    bits: [4, 9]
+    hex: 0x0210
+    observed: true
+    fsm_id: 812           # captured 2026-06-23: 802 (main_control) -> 812 -> back to 802
+    notes: "Stair / obstacle climb mode. 8xx = locomotion family (next to 802). Enter from walk."
+  dance:
+    combo: R1+B
+    bits: [0, 9]
+    hex: 0x0201
+    observed: true
+    fsm_id: 503           # captured 2026-06-23: 802 (main_control) -> 503 -> back to 802
+    notes: "Built-in dance routine. Plays, then returns to main_control on its own. Enter from walk."
+
+
+# ----------------------------------------------------------------------------
 # NETWORK
 # ----------------------------------------------------------------------------
 network:

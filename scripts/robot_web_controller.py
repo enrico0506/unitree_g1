@@ -37,6 +37,7 @@ import uvicorn
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.g1.loco.g1_loco_api import ROBOT_API_ID_LOCO_SET_VELOCITY
+from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient as H2LocoClient
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_
 
@@ -134,6 +135,37 @@ MAP_MAX_RANGE = CFG["map"]["max_range_m"]
 MAP_YAW_SIGN = CFG["map"]["yaw_sign"]
 MAPPING_RUN_CMD = CFG["mapping"]["run_cmd"]   # on-demand FAST-LIO launch wrapper
 
+# --- Whole-body mode combos (climb/dance), sourced from config/mapping.yaml ---
+MAPPING_PATH = BASE_DIR / "config" / "mapping.yaml"
+
+
+def load_mode_combos(path=MAPPING_PATH):
+    """Read mode_combos {name: fsm_id|None} from config/mapping.yaml.
+
+    Whole-body behaviors (climb, dance) we replay with SetFsmId once the id has
+    been captured (scripts/capture_combo_fsm.py). Missing/unparseable file -> {}.
+    """
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        combos = data.get("mode_combos", {}) or {}
+        out = {}
+        for name, spec in combos.items():
+            fsm = spec.get("fsm_id") if isinstance(spec, dict) else None
+            out[str(name).lower()] = int(fsm) if fsm is not None else None
+        return out
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+MODE_COMBOS = load_mode_combos()   # {"climb": <id|None>, "dance": <id|None>}
+# Reverse lookup for the whole-body FSMs (dance/climb). From these the robot
+# ONLY accepts a transition back to main_control (802), not ready_stand -- which
+# is why Stand/Walk got stuck mid-dance.
+MODE_COMBO_FSM_TO_NAME = {fsm: name for name, fsm in MODE_COMBOS.items()
+                          if fsm is not None}
+MODE_COMBO_FSMS = set(MODE_COMBO_FSM_TO_NAME)
+
 VALID_MODES = {"zero_torque", "damp", "stand", "walk"}
 INITIAL_MODE = "damp"
 
@@ -148,6 +180,10 @@ FSM_NAMES = {
     FSM_DAMPING:      "damping",
     FSM_READY_STAND:  "ready_stand",
     FSM_MAIN_CONTROL: "main_control",
+    # Whole-body combo targets (captured 2026-06-23) -- display only; these are
+    # NOT in UI_TO_FSM, so they never become a selectable "mode".
+    812: "climb",
+    503: "dance",
 }
 
 UI_TO_FSM = {
@@ -161,6 +197,26 @@ UI_TO_FSM = {
 # the robot's ACTUAL state (read by the FSM poller) so the dashboard reflects
 # reality after a page reload or a dashboard restart -- not just the last command.
 FSM_TO_UI = {fsm: ui for ui, fsm in UI_TO_FSM.items()}
+
+
+# --- Arm-action gestures (G1ArmActionClient, service "arm") ---
+# Run through the separate "arm" service, NOT LocoClient, so they only animate
+# the arms (full action_map catalog in config/mapping.yaml).
+ARM_RELEASE_ID = 99    # "release arm" -> return arms to neutral
+ARM_HANDS_UP_ID = 15   # "hands up" (palm up); dashboard toggles it with release
+
+# cmd name (from the browser) -> (action_id, auto_release_after_s | None).
+# Hold-poses auto-release to neutral so the robot never gets stuck; self-
+# completing gestures use None. Only the UI-exposed gestures are kept here;
+# hands_up / release_arm are handled specially (toggle) in apply_cmd.
+ARM_GESTURES = {
+    "clap":      (17, None),   # remote: double-tap A
+    "high_wave": (26, None),   # remote: double-tap Y
+    "kiss":      (11, None),   # remote: double-tap X ("blow kiss")
+    "high_five": (18, 4.0),
+    "hug":       (19, 4.0),
+    "heart":     (20, 4.0),
+}
 
 
 # --- Shared state ---
@@ -178,6 +234,8 @@ class ControlState:
         self.transitioning = False
         # True once we've enabled continuous gait in the current walk session
         self.gait_enabled = False
+        # True while an arm gesture is holding the arms raised (hands_up toggle)
+        self.arm_raised = False
         # Battery (from rt/lf/bmsstate; None until the first BMS message arrives)
         self.battery_soc = None      # % state-of-charge
         self.battery_v = None        # pack volts
@@ -187,6 +245,7 @@ class ControlState:
 state = ControlState()
 client: LocoClient = None
 reader: H2LocoClient = None
+arm_client: G1ArmActionClient = None   # gesture/arm-action service ("arm")
 clients: set = set()
 
 camera: CameraSource = None
@@ -197,6 +256,7 @@ odom: OdomReader = None
 mapper: MapBuilder = None
 
 _mode_lock = threading.Lock()
+_arm_lock = threading.Lock()   # serialize arm-action RPCs (and the hands_up toggle)
 
 
 def clamp(value, low, high):
@@ -334,6 +394,20 @@ def enter_mode(new_mode):
     try:
         ok = False
 
+        # Leaving a routine (dance 503 / climb 812) only works back to
+        # main_control (802), never ready_stand -- so exit to 802 first, then let
+        # the normal handling below take over (walk = done; stand goes on to damp).
+        if state.fsm_id in MODE_COMBO_FSMS and new_mode in ("stand", "walk"):
+            routine = MODE_COMBO_FSM_TO_NAME.get(state.fsm_id, "routine")
+            print(f"[MODE] leaving {routine} (FSM {state.fsm_id}) -> main_control",
+                  flush=True)
+            client.SetFsmId(FSM_MAIN_CONTROL)
+            if not wait_for_fsm(FSM_MAIN_CONTROL, timeout=15.0):
+                print(f"[MODE] {routine} exit failed, FSM stuck at "
+                      f"{state.fsm_id}", flush=True)
+                state.mode = routine   # reflect reality; don't pretend we're walking
+                return
+
         if new_mode == "zero_torque":
             client.ZeroTorque()
             ok = wait_for_fsm(FSM_ZERO_TORQUE, timeout=5.0)
@@ -343,6 +417,9 @@ def enter_mode(new_mode):
             ok = wait_for_fsm(FSM_DAMPING, timeout=5.0)
 
         elif new_mode == "stand":
+            # main_control -> ready_stand drops the robot to Damp, so Damp FIRST
+            # then ready_stand. (Reaching ready_stand needs the harness -- expected
+            # on this robot, and only Stand needs it.)
             if state.fsm_id == FSM_MAIN_CONTROL:
                 client.Damp()
                 wait_for_fsm(FSM_DAMPING, timeout=5.0)
@@ -350,45 +427,53 @@ def enter_mode(new_mode):
             ok = wait_for_fsm(FSM_READY_STAND, timeout=15.0)
 
         elif new_mode == "walk":
-            # Must be in ready_stand (FSM 4) first
-            if state.fsm_id != FSM_READY_STAND:
-                if state.fsm_id != FSM_DAMPING:
-                    client.Damp()
-                    if not wait_for_fsm(FSM_DAMPING, timeout=5.0):
-                        print("[MODE] walk: damp step failed", flush=True)
-                        return
-                client.SetFsmId(FSM_READY_STAND)
-                if not wait_for_fsm(FSM_READY_STAND, timeout=15.0):
-                    print(f"[MODE] walk: ready_stand failed, "
-                          f"FSM stuck at {state.fsm_id}", flush=True)
-                    return
-
-            # First attempt: often accepted but doesn't transition
-            ret1 = client.SetFsmId(FSM_MAIN_CONTROL)
-            print(f"[MODE] SetFsmId({FSM_MAIN_CONTROL}) #1 returned {ret1}",
-                  flush=True)
-
-            if wait_for_fsm(FSM_MAIN_CONTROL, timeout=3.0):
+            if state.fsm_id == FSM_MAIN_CONTROL:
+                # Already walk-capable (a dance/climb routine just returned here,
+                # or walk was re-pressed). Just (re)assert stepping -- do NOT
+                # damp / re-sequence, which would needlessly drop the robot down
+                # through the unstable states and was the old fall hazard.
+                enable_continuous_gait()
                 ok = True
             else:
-                print("[MODE] walk: first attempt didn't transition, "
-                      "priming via ready_stand and retrying...", flush=True)
-                client.SetFsmId(FSM_READY_STAND)
-                wait_for_fsm(FSM_READY_STAND, timeout=10.0)
-                time.sleep(0.5)
+                # Coming from damp/ready_stand: reach ready_stand, settle, then
+                # step up to main_control. Walk never routes through Damp, so it
+                # stays harness-free (unlike Stand).
+                if state.fsm_id != FSM_READY_STAND:
+                    client.SetFsmId(FSM_READY_STAND)
+                    if not wait_for_fsm(FSM_READY_STAND, timeout=15.0):
+                        print(f"[MODE] walk: ready_stand failed, "
+                              f"FSM stuck at {state.fsm_id}", flush=True)
+                        return
 
-                ret2 = client.SetFsmId(FSM_MAIN_CONTROL)
-                print(f"[MODE] SetFsmId({FSM_MAIN_CONTROL}) #2 "
-                      f"returned {ret2}", flush=True)
-                ok = wait_for_fsm(FSM_MAIN_CONTROL, timeout=15.0)
+                # Let the stand SETTLE before asking for main_control. Issuing it
+                # the instant ready_stand is reached is exactly the transition that
+                # silently failed and left the robot stuck at "stand"; a short
+                # settle makes 802 take on the first try.
+                time.sleep(1.0)
 
-            # If we reached main_control, enable continuous gait so that
-            # strafe and yaw actually engage stepping (not just leaning).
-            if ok:
-                time.sleep(0.5)
-                enable_continuous_gait()
+                ret1 = client.SetFsmId(FSM_MAIN_CONTROL)
+                print(f"[MODE] SetFsmId({FSM_MAIN_CONTROL}) #1 returned {ret1}",
+                      flush=True)
 
-            
+                if wait_for_fsm(FSM_MAIN_CONTROL, timeout=3.0):
+                    ok = True
+                else:
+                    print("[MODE] walk: first attempt didn't transition, "
+                          "priming via ready_stand and retrying...", flush=True)
+                    client.SetFsmId(FSM_READY_STAND)
+                    wait_for_fsm(FSM_READY_STAND, timeout=10.0)
+                    time.sleep(1.0)
+
+                    ret2 = client.SetFsmId(FSM_MAIN_CONTROL)
+                    print(f"[MODE] SetFsmId({FSM_MAIN_CONTROL}) #2 "
+                          f"returned {ret2}", flush=True)
+                    ok = wait_for_fsm(FSM_MAIN_CONTROL, timeout=15.0)
+
+                # If we reached main_control, enable continuous gait so that
+                # strafe and yaw actually engage stepping (not just leaning).
+                if ok:
+                    time.sleep(0.5)
+                    enable_continuous_gait()
 
         if ok:
             pass   # walk reached; speed is governed by the velocity we send
@@ -397,6 +482,18 @@ def enter_mode(new_mode):
                   flush=True)
     finally:
         state.transitioning = False
+
+
+def _arm_execute(action_id):
+    """Send one arm-action RPC. No-op (logged) if the arm service isn't up."""
+    if arm_client is None:
+        print(f"[CMD] arm action {action_id} skipped -- arm client not ready",
+              flush=True)
+        return
+    try:
+        arm_client.ExecuteAction(action_id)
+    except Exception as e:
+        print(f"[arm action error: {e}]", flush=True)
 
 
 def apply_cmd(name):
@@ -413,6 +510,58 @@ def apply_cmd(name):
     elif name == "shake":
         client.ShakeHand()
         print("[CMD] shake", flush=True)
+
+    # --- Arm gestures (separate "arm" service) ---
+    elif name == "hands_up":
+        # Toggle: first press raises the arms (palm up), next press lowers them.
+        with _arm_lock:
+            if state.arm_raised:
+                _arm_execute(ARM_RELEASE_ID)
+                state.arm_raised = False
+                print("[CMD] hands_up -> lower", flush=True)
+            else:
+                _arm_execute(ARM_HANDS_UP_ID)
+                state.arm_raised = True
+                print("[CMD] hands_up -> raise", flush=True)
+    elif name == "release_arm":
+        with _arm_lock:
+            _arm_execute(ARM_RELEASE_ID)
+            state.arm_raised = False
+        print("[CMD] release_arm", flush=True)
+    elif name in ARM_GESTURES:
+        action_id, auto_release = ARM_GESTURES[name]
+        with _arm_lock:
+            _arm_execute(action_id)
+        print(f"[CMD] gesture {name} (arm action {action_id})", flush=True)
+        if auto_release:
+            # This runs in apply_cmd's own daemon thread, so the sleep never
+            # stalls the command/velocity loop.
+            time.sleep(auto_release)
+            with _arm_lock:
+                _arm_execute(ARM_RELEASE_ID)
+                state.arm_raised = False
+
+    # --- Whole-body mode combos (climb / dance) ---
+    elif name in MODE_COMBOS:
+        fsm = MODE_COMBOS[name]
+        if fsm is None:
+            print(f"[CMD] {name}: fsm_id not captured -- run "
+                  f"scripts/capture_combo_fsm.py, then set mode_combos.{name}."
+                  f"fsm_id in config/mapping.yaml", flush=True)
+        else:
+            # Hand the whole body to this behavior: stop driving so the velocity
+            # keepalive can't fight the routine. mode != "walk" makes the command
+            # loop go quiet; the FSM poller leaves it (no FSM_TO_UI entry).
+            state.vx = state.vy = state.vyaw = 0.0
+            state.is_moving = False
+            state.gait_enabled = False
+            state.mode = name
+            print(f"[CMD] {name} -> SetFsmId({fsm})", flush=True)
+            try:
+                client.SetFsmId(fsm)
+            except Exception as e:
+                print(f"[mode combo error: {e}]", flush=True)
+
     else:
         print(f"[cmd error: unknown '{name}']", flush=True)
 
@@ -576,7 +725,7 @@ async def broadcast_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, reader, camera, pose, detect, lidar, odom, mapper
+    global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -589,6 +738,18 @@ async def lifespan(app: FastAPI):
     reader.SetTimeout(1.0)
     reader.Init()
     print("H2 LocoClient ready (FSM read-back).", flush=True)
+
+    # Arm-action service ("arm") drives the gesture buttons; independent of
+    # locomotion. If it isn't running, arm_client stays None so the dashboard
+    # still starts and gestures just no-op.
+    try:
+        arm_client = G1ArmActionClient()
+        arm_client.SetTimeout(3.0)
+        arm_client.Init()
+        print("G1 ArmActionClient ready (gestures).", flush=True)
+    except Exception as e:
+        arm_client = None
+        print(f"ArmActionClient init failed ({e}); gestures disabled.", flush=True)
 
     fsm_thread = threading.Thread(target=fsm_poll_loop, daemon=True)
     fsm_thread.start()
@@ -902,6 +1063,8 @@ async def ws_endpoint(ws: WebSocket):
         "type": "config",
         "max_vx": MAX_VX, "max_vy": MAX_VY, "max_vyaw": MAX_VYAW,
         "slow_scale": SLOW_SCALE,
+        # which whole-body combos have a captured FSM id (-> button enabled)
+        "mode_combos": {name: (fsm is not None) for name, fsm in MODE_COMBOS.items()},
     }))
     await ws.send_text(json.dumps(make_state_msg()))
     if mapper is not None:
@@ -974,4 +1137,11 @@ if __name__ == "__main__":
     else:
         print("No TTY (systemd service) -- starting without interactive confirmation.",
               flush=True)
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    # timeout_graceful_shutdown: the camera/pose/detect MJPEG streams and the
+    # lidar WebSocket are infinite `while True` generators, so on SIGTERM uvicorn
+    # would wait forever for them to finish -> systemd's 90s stop-timeout fires
+    # -> SIGKILL of the whole cgroup. That hard kill churns the DDS/camera
+    # pipeline (spikes videohub_pc4, freezes the feed) on every restart. Capping
+    # the graceful wait lets the service stop cleanly in a few seconds instead.
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+                timeout_graceful_shutdown=5)
