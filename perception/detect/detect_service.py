@@ -16,13 +16,16 @@ Data flow (all via /dev/shm, bind-mounted into the container):
     read   DETECT_DEMAND  heartbeat touched by the objects poll  -> only infer while watched
 
 Config via environment variables (see run_detect.sh):
-    DETECTOR_IMPL  which detector ("yoloworld" | "passthrough"; default yoloworld)
-    MODEL          model file passed to the detector (default yolov8s-worldv2.pt)
-    MODELS_DIR     working dir for weights (default /models, a mounted volume)
+    DETECTOR_IMPL  which detector ("yoloworld" | "nanoowlsam" | "passthrough"; default yoloworld)
+    MODEL          model passed to the detector (default yolov8s-worldv2.pt; for
+                   nanoowlsam this is the OWL-ViT HF id, e.g. google/owlvit-base-patch32)
+    MODELS_DIR     working dir for weights/engines (default /models, a mounted volume)
     DETECT_PROMPTS open-vocab class prompt (e.g. "door . person . chair")
     INFER_HZ       max inference rate (default 10) -- caps GPU load vs. the control loop
-    CONF           detection confidence threshold (default 0.35)
-    IMGSZ          inference image size (default 640)
+    CONF           detection confidence threshold (default 0.35; YOLO-World only)
+    OWL_THRESHOLD  NanoOWL score threshold (default 0.1; OWL scores run lower than YOLO's)
+    SEG_EVERYTHING "1" to add a costly class-agnostic mask pass (nanoowlsam only; default 0)
+    IMGSZ          inference image size (default 640; YOLO-World only)
     ALWAYS_ON      "1" to ignore demand-gating (use for manual testing)
 """
 
@@ -53,6 +56,8 @@ DETECT_PROMPTS = os.environ.get(
     "person . door . chair . table . monitor . laptop . keyboard . bottle . cup . backpack")
 INFER_HZ = float(os.environ.get("INFER_HZ", "10"))
 CONF = float(os.environ.get("CONF", "0.35"))
+OWL_THRESHOLD = float(os.environ.get("OWL_THRESHOLD", "0.1"))
+SEG_EVERYTHING = os.environ.get("SEG_EVERYTHING", "0") == "1"
 IMGSZ = int(os.environ.get("IMGSZ", "640"))
 ALWAYS_ON = os.environ.get("ALWAYS_ON", "0") == "1"
 
@@ -97,9 +102,12 @@ def main():
     os.chdir(MODELS_DIR)   # weights/exports live here (persisted volume)
 
     from detector import make_detector
-    detector = make_detector(DETECTOR_IMPL, MODEL, CONF, IMGSZ, DETECT_PROMPTS)
+    detector = make_detector(DETECTOR_IMPL, MODEL, CONF, IMGSZ, DETECT_PROMPTS,
+                             models_dir=MODELS_DIR, owl_threshold=OWL_THRESHOLD,
+                             seg_everything=SEG_EVERYTHING)
     print(f"[detect_service] impl={DETECTOR_IMPL} model={MODEL} infer_hz={INFER_HZ} "
-          f"conf={CONF} imgsz={IMGSZ} prompts={DETECT_PROMPTS!r} always_on={ALWAYS_ON}",
+          f"conf={CONF} owl_threshold={OWL_THRESHOLD} seg_everything={SEG_EVERYTHING} "
+          f"imgsz={IMGSZ} prompts={DETECT_PROMPTS!r} always_on={ALWAYS_ON}",
           flush=True)
 
     # Warm up now: the first inference does slow CUDA/JIT init (tens of seconds on

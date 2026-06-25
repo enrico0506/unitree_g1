@@ -1,0 +1,29 @@
+# NanoOWL + NanoSAM object-detection image for the G1 dashboard (JetPack 5 / L4T r35.3.1).
+#
+# Strategy A (see BUILD_NANOOWLSAM.md): base on dustynv/nanosam:r35.3.1 -- it already
+# carries a known-good torch + torch2trt + TensorRT 8.5 stack built for THIS exact L4T,
+# plus the NanoSAM package and its prebuilt SAM engines -- then layer NanoOWL on top so
+# both predictors share ONE process / ONE CUDA context (important for memory on Orin).
+#
+# TensorRT engines are DEVICE/TRT-specific and are NOT baked here: they are mounted from
+# perception/detect/models/data at runtime (mirroring how the YOLO-World CLIP weight is
+# mounted today). See prepare_nanoowlsam_engines.sh to populate that folder.
+#
+# Build (run from this directory -- perception/detect -- so the context has these files):
+#   sudo docker build -f Dockerfile.nanoowlsam -t g1-detect-nanoowlsam:latest .
+FROM dustynv/nanosam:r35.3.1
+
+# NanoOWL on top of the nanosam stack. transformers is pinned < 4.42 because 4.42+
+# dropped Python 3.8 (the JetPack-5 interpreter); adjust if OWL-ViT fails to load.
+RUN git clone --depth 1 https://github.com/NVIDIA-AI-IOT/nanoowl /opt/nanoowl \
+ && cd /opt/nanoowl \
+ && pip3 install --no-cache-dir "transformers==4.41.2" "Pillow" \
+ && pip3 install --no-cache-dir -e .
+
+# Pre-cache the OWL-ViT HuggingFace weights into the image so the robot runs OFFLINE
+# (no HF download at runtime). The TRT image-encoder engine replaces the vision tower
+# at inference; these weights supply the text encoder + processor.
+RUN python3 -c "from transformers import OwlViTProcessor, OwlViTForObjectDetection; \
+OwlViTProcessor.from_pretrained('google/owlvit-base-patch32'); \
+OwlViTForObjectDetection.from_pretrained('google/owlvit-base-patch32'); \
+print('OWL-ViT weights cached')"
