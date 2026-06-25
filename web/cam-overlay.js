@@ -45,11 +45,38 @@
   function drawDetect(data, cw, ch) {
     const P = projector(data, cw, ch);
     if (!P) return;
+    const items = data.items || [];
+
+    // Pass 1: translucent filled segmentation masks UNDER the boxes. Each mask is
+    // a list of polygons; each polygon is a flat [x0,y0,x1,y1,...] in source-frame
+    // pixels — the SAME space as the box — so it maps through the identical
+    // projector P. Detectors without masks (YOLO-World) simply omit the field.
+    ctx.fillStyle = "rgba(255,183,77,0.22)";
+    ctx.strokeStyle = "rgba(255,183,77,0.7)";
+    ctx.lineWidth = 1.5;
+    for (const d of items) {
+      if (!d.mask) continue;
+      for (const poly of d.mask) {
+        if (!poly || poly.length < 6 || poly.length % 2) continue;   // need >= 3 (x,y) points
+        ctx.beginPath();
+        const [sx, sy] = P(poly[0], poly[1]);
+        ctx.moveTo(sx, sy);
+        for (let i = 2; i < poly.length; i += 2) {
+          const [px, py] = P(poly[i], poly[i + 1]);
+          ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    // Pass 2: boxes + labels on top, so they stay legible over the fills.
     ctx.lineWidth = 2;
     ctx.strokeStyle = DETECT_COLOR;
     ctx.font = "13px ui-monospace, Menlo, monospace";
     ctx.textBaseline = "bottom";
-    for (const d of data.items || []) {
+    for (const d of items) {
       if (!d.box) continue;
       const [ax, ay] = P(d.box[0], d.box[1]);
       const [bx, by] = P(d.box[2], d.box[3]);

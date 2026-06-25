@@ -15,14 +15,15 @@ Data flow (all via /dev/shm, bind-mounted into the container):
                           (the browser draws boxes on a canvas over the raw feed)
     read   DETECT_DEMAND  heartbeat touched by the objects poll  -> only infer while watched
 
-Config via environment variables (see run_detect.sh):
-    DETECTOR_IMPL  which detector ("yoloworld" | "passthrough"; default yoloworld)
-    MODEL          model file passed to the detector (default yolov8s-worldv2.pt)
-    MODELS_DIR     working dir for weights (default /models, a mounted volume)
+Config via environment variables (see run_detect_nanoowlsam.sh):
+    DETECTOR_IMPL  which detector ("nanoowlsam" | "passthrough"; default nanoowlsam)
+    MODEL          OWL-ViT HF id passed to the detector (default google/owlvit-base-patch32)
+    MODELS_DIR     working dir for the TensorRT engines (default /models, a mounted volume)
     DETECT_PROMPTS open-vocab class prompt (e.g. "door . person . chair")
     INFER_HZ       max inference rate (default 10) -- caps GPU load vs. the control loop
-    CONF           detection confidence threshold (default 0.35)
-    IMGSZ          inference image size (default 640)
+    OWL_THRESHOLD  NanoOWL score threshold (default 0.12; OWL scores run low, ~0.1-0.4)
+    OWL_NMS_IOU    class-agnostic NMS IoU to dedupe OWL's overlapping boxes (default 0.5)
+    SEG_EVERYTHING "1" to add a costly class-agnostic mask pass (default 0)
     ALWAYS_ON      "1" to ignore demand-gating (use for manual testing)
 """
 
@@ -45,14 +46,17 @@ DETECT_TRACKS = os.environ.get("DETECT_TRACKS", "/dev/shm/g1_detect_tracks.json"
 DETECT_DEMAND = os.environ.get("DETECT_DEMAND", "/dev/shm/g1_detect_demand")
 
 # --- Tunables ---
-DETECTOR_IMPL = os.environ.get("DETECTOR_IMPL", "yoloworld")
-MODEL = os.environ.get("MODEL", "yolov8s-worldv2.pt")
+DETECTOR_IMPL = os.environ.get("DETECTOR_IMPL", "nanoowlsam")
+MODEL = os.environ.get("MODEL", "google/owlvit-base-patch32")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/models")
 DETECT_PROMPTS = os.environ.get(
     "DETECT_PROMPTS",
     "person . door . chair . table . monitor . laptop . keyboard . bottle . cup . backpack")
 INFER_HZ = float(os.environ.get("INFER_HZ", "10"))
 CONF = float(os.environ.get("CONF", "0.35"))
+OWL_THRESHOLD = float(os.environ.get("OWL_THRESHOLD", "0.12"))
+OWL_NMS_IOU = float(os.environ.get("OWL_NMS_IOU", "0.5"))
+SEG_EVERYTHING = os.environ.get("SEG_EVERYTHING", "0") == "1"
 IMGSZ = int(os.environ.get("IMGSZ", "640"))
 ALWAYS_ON = os.environ.get("ALWAYS_ON", "0") == "1"
 
@@ -97,9 +101,12 @@ def main():
     os.chdir(MODELS_DIR)   # weights/exports live here (persisted volume)
 
     from detector import make_detector
-    detector = make_detector(DETECTOR_IMPL, MODEL, CONF, IMGSZ, DETECT_PROMPTS)
+    detector = make_detector(DETECTOR_IMPL, MODEL, CONF, IMGSZ, DETECT_PROMPTS,
+                             models_dir=MODELS_DIR, owl_threshold=OWL_THRESHOLD,
+                             seg_everything=SEG_EVERYTHING, nms_iou=OWL_NMS_IOU)
     print(f"[detect_service] impl={DETECTOR_IMPL} model={MODEL} infer_hz={INFER_HZ} "
-          f"conf={CONF} imgsz={IMGSZ} prompts={DETECT_PROMPTS!r} always_on={ALWAYS_ON}",
+          f"owl_threshold={OWL_THRESHOLD} nms_iou={OWL_NMS_IOU} "
+          f"seg_everything={SEG_EVERYTHING} prompts={DETECT_PROMPTS!r} always_on={ALWAYS_ON}",
           flush=True)
 
     # Warm up now: the first inference does slow CUDA/JIT init (tens of seconds on

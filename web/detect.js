@@ -1,4 +1,4 @@
-// Object-detection overlay toggle (YOLO-World, open-vocabulary).
+// Object-detection overlay toggle (NanoOWL open-vocab labels + NanoSAM masks).
 //
 // "Object Detection" turns the box overlay on/off INDEPENDENTLY of the skeleton
 // overlay — both can be on at once. We don't touch the camera <img>; we poll the

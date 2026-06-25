@@ -5,11 +5,12 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now g1-detect     # enable only once validated
 #
-# Runs the detect container; reads /dev/shm/g1_camera.jpg, writes /dev/shm/g1_detect.jpg.
-# Independent of g1-web: if this is stopped, the raw camera feed/dashboard are unaffected.
+# Runs the detect container; reads /dev/shm/g1_camera.jpg, writes detection geometry to
+# /dev/shm/g1_detect_tracks.json. Independent of g1-web: if this is stopped, the raw
+# camera feed/dashboard are unaffected.
 
 [Unit]
-Description=G1 object-detection (YOLO-World) annotator
+Description=G1 object-detection (NanoOWL + NanoSAM) annotator
 After=docker.service g1-web.service
 Requires=docker.service
 
@@ -17,7 +18,7 @@ Requires=docker.service
 Type=simple
 # Clear any stale container, then run in the foreground so systemd tracks it.
 ExecStartPre=-/usr/bin/docker rm -f g1-detect
-ExecStart=/home/unitree/projects/g1/perception/detect/run_detect.sh
+ExecStart=/home/unitree/projects/g1/perception/detect/run_detect_nanoowlsam.sh
 ExecStop=-/usr/bin/docker stop g1-detect
 Restart=on-failure
 RestartSec=5
