@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>G1 Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=11">
+  <link rel="stylesheet" href="/static/style.css?v=19">
   <script type="importmap">
   {
     "imports": {
@@ -49,6 +49,35 @@
       </div>
     </div>
 
+    <!-- Gesture picker — docked in the header between the modes and the status.
+         Choosing an item runs it immediately (no Play button), then the control
+         snaps back to the "Gesture…" label so the same one can be repeated. It
+         clicks the matching hidden data-cmd button (.gesture-src) so all of
+         controller.js's arm-gating / Hands-Up toggle / logging is reused. -->
+    <select id="gestureSelect" class="gesture-select" aria-label="Run a gesture">
+      <option value="" selected disabled hidden>Gesture…</option>
+      <option value="clap">Clap</option>
+      <option value="high_wave">Wave</option>
+      <option value="kiss">Kiss</option>
+      <option value="hands_up">Hands Up (toggle)</option>
+      <option value="high_five">High Five</option>
+      <option value="hug">Hug</option>
+      <option value="heart">Heart</option>
+      <option value="shake">Shake Hand</option>
+      <option value="release_arm">Release Arms</option>
+    </select>
+    <div class="gesture-src" hidden>
+      <button data-cmd="clap" data-arm="1">Clap</button>
+      <button data-cmd="high_wave" data-arm="1">Wave</button>
+      <button data-cmd="kiss" data-arm="1">Kiss</button>
+      <button data-cmd="hands_up" data-arm="1" data-toggle="1">Hands Up</button>
+      <button data-cmd="high_five" data-arm="1">High Five</button>
+      <button data-cmd="hug" data-arm="1">Hug</button>
+      <button data-cmd="heart" data-arm="1">Heart</button>
+      <button data-cmd="shake">Shake Hand</button>
+      <button data-cmd="release_arm" data-arm="1">Release Arms</button>
+    </div>
+
     <div class="header-spacer"></div>
 
     <div id="status" class="status">
@@ -69,8 +98,8 @@
       <div class="media-window">
         <div class="window-title">Camera <span id="camBadge" class="badge">…</span></div>
         <div class="cam-bar">
-          <button id="poseToggle" title="Overlay people skeletons (YOLO11-pose)">Skeleton</button>
-          <button id="detectToggle" title="Overlay object-detection boxes (YOLO-World, open-vocab)">Object Detection</button>
+          <button id="poseToggle" title="Overlay people skeletons (YOLO11-pose) + hand landmarks (MediaPipe)">Skeleton</button>
+          <button id="detectToggle" title="Overlay object detection + segmentation masks (NanoOWL + NanoSAM, open-vocab)">Object Detection</button>
         </div>
         <img id="camFeed" src="/camera/stream" alt="camera feed">
         <canvas id="camCanvas"></canvas>
@@ -84,30 +113,19 @@
         </div>
       </div>
 
-      <div class="media-window">
-        <div class="window-title">LiDAR 3D — drag or use the pad <span id="lidarBadge" class="badge">…</span></div>
+      <div class="media-window lidar-window" data-feed="cloud">
+        <div class="window-title">
+          <span id="lidarTitleText">LiDAR 3D</span> <span id="lidarBadge" class="badge">…</span>
+        </div>
+        <div class="feed-toggle">
+          <button data-feed-btn="cloud" title="Live 3D LiDAR / mapping feed">Feed</button>
+          <button data-feed-btn="radar" title="2D obstacle ring (big)">2D ring</button>
+          <button data-feed-btn="sphere" title="3D obstacle sphere (big)">3D sphere</button>
+        </div>
         <div id="lidarView" class="lidar-canvas"></div>
-        <div class="nav-pad">
-          <button id="navUp"    class="n-up"    title="Tilt up">▲</button>
-          <button id="navLeft"  class="n-left"  title="Rotate left">◀</button>
-          <button id="navRight" class="n-right" title="Rotate right">▶</button>
-          <button id="navDown"  class="n-down"  title="Tilt down">▼</button>
-          <button id="navZoomIn"  class="n-zin"  title="Zoom in">+</button>
-          <button id="navZoomOut" class="n-zout" title="Zoom out">−</button>
-        </div>
-        <div class="orient-legend"><b style="color:#5C8DF2">↑ Z up</b> · X fwd · Y left</div>
-        <div class="view-bar">
-          <button id="viewHome" title="Reset orientation — Z up, cloud framed">⌂ Reset</button>
-          <button id="viewBot" title="Robot first-person driving view (auto-selected when the obstacle guard is on)">🤖 Bot view</button>
-          <button id="viewTop" title="Top-down (floor-plan) view">Top</button>
-          <button id="view3d" title="3D oblique view">3D</button>
-          <button id="viewFit" title="Frame the whole cloud">Fit</button>
-          <button id="ptMinus" title="Smaller points">−</button>
-          <button id="ptPlus" title="Bigger points">+</button>
-          <button id="viewColor" title="Toggle height colours / flat">Colour</button>
-          <button id="viewGrid" title="Toggle ground grid">Grid</button>
-        </div>
-        <div class="map-bar">
+        <canvas id="bigRadar" class="feed-layer"></canvas>
+        <div id="bigSphere" class="feed-layer"></div>
+        <div class="map-bar feed-cloud-only">
           <button id="mapToggle" data-map="start">● Start Mapping</button>
           <button id="mapSave" data-map="save">Save</button>
           <input id="mapName" type="text" placeholder="map name" maxlength="24" autocomplete="off">
@@ -121,41 +139,38 @@
     <main class="controls">
       <!-- Drive -->
       <section class="panel buttons">
-        <h2>Drive</h2>
-        <div class="dpad">
-          <button data-hold="w" class="up">▲<br><small>W</small></button>
-          <button data-hold="a" class="left">◄<br><small>A</small></button>
-          <button data-tap="stop" class="center stop">STOP</button>
-          <button data-hold="d" class="right">►<br><small>D</small></button>
-          <button data-hold="s" class="down">▼<br><small>S</small></button>
-        </div>
-        <div class="rot">
-          <button data-hold="rotL" class="go">⟲ rotate L</button>
-          <button data-hold="rotR" class="go">rotate R ⟳</button>
+        <h2>Drive <span id="drive-mode-toggle"></span></h2>
+        <div class="drive-body">
+          <!-- Mobile thumbsticks (filled by drive_mode.js); shown only when the
+               Drive toggle is set to "Mobile". Replaces the D-pad below. -->
+          <div id="joystick-panel"></div>
+          <div class="drive-main">
+            <div class="dpad">
+              <button data-hold="w" class="up">▲<br><small>W</small></button>
+              <button data-hold="a" class="left">◄<br><small>A</small></button>
+              <button data-tap="stop" class="center stop">STOP</button>
+              <button data-hold="d" class="right">►<br><small>D</small></button>
+              <button data-hold="s" class="down">▼<br><small>S</small></button>
+            </div>
+            <div class="rot">
+              <button data-hold="rotL" class="go">⟲ rotate L</button>
+              <button data-hold="rotR" class="go">rotate R ⟳</button>
+            </div>
+          </div>
+          <!-- Step size: Normal / Medium / Small discrete-step selector, stacked
+               vertically down the right edge of the box (mounts via step_mode.js).
+               Governs whichever arrow/WASD is held -- all six directions. -->
+          <div id="step-panel"></div>
         </div>
       </section>
 
-      <!-- Obstacle avoidance — LiDAR proximity guard (mounts via obstacle.js) -->
-      <section class="panel span-all">
+      <!-- Obstacle avoidance — LiDAR proximity guard (mounts via obstacle.js).
+           Sits in the right column, under the upper-right LiDAR window, next to
+           Drive. The 2D ring / 3D sphere live in that window's feed toggle, so the
+           panel itself only carries the guard toggles + readouts. -->
+      <section class="panel">
         <h2>Obstacle Avoidance</h2>
         <div id="obstacle-panel"></div>
-      </section>
-
-      <!-- 4) Gestures -->
-      <section class="panel buttons">
-        <h2>Gestures</h2>
-        <div class="posture">
-          <button data-cmd="clap" data-arm="1">Clap</button>
-          <button data-cmd="high_wave" data-arm="1">Wave</button>
-          <button data-cmd="kiss" data-arm="1">Kiss</button>
-          <button data-cmd="hands_up" data-arm="1" data-toggle="1">Hands Up</button>
-          <button data-cmd="high_five" data-arm="1">High Five</button>
-          <button data-cmd="hug" data-arm="1">Hug</button>
-          <button data-cmd="heart" data-arm="1">Heart</button>
-          <button data-cmd="wave">Wave Hand</button>
-          <button data-cmd="shake">Shake Hand</button>
-          <button data-cmd="release_arm" data-arm="1">Release Arms</button>
-        </div>
       </section>
 
     </main>
@@ -208,12 +223,17 @@
     </main>
   </div>
 
-  <script src="/static/obstacle.js?v=2"></script>
-  <script src="/static/controller.js?v=13"></script>
+  <script src="/static/obstacle.js?v=6"></script>
+  <script src="/static/step_mode.js?v=3"></script>
+  <script src="/static/drive_mode.js?v=4"></script>
+  <script src="/static/controller.js?v=20"></script>
   <script src="/static/camera.js?v=4"></script>
-  <script src="/static/cam-overlay.js?v=4"></script>
-  <script src="/static/pose.js?v=4"></script>
+  <script src="/static/cam-overlay.js?v=6"></script>
+  <script src="/static/hands.js?v=1"></script>
+  <script src="/static/pose.js?v=5"></script>
   <script src="/static/detect.js?v=4"></script>
-  <script type="module" src="/static/lidar.js?v=8"></script>
+  <script type="module" src="/static/lidar.js?v=13"></script>
+  <script type="module" src="/static/obstacle3d.js?v=6"></script>
+  <script src="/static/feedview.js?v=1"></script>
 </body>
 </html>

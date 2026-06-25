@@ -9,23 +9,39 @@ const container = document.getElementById("lidarView");
 const badge = document.getElementById("lidarBadge");
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0e0f15);
+// Vertical gradient backdrop + gentle exponential depth fog: the cloud reads as a
+// volume (near points crisp, far ones melting into the haze) instead of flat dots
+// on a slab. Fog colour matches the lower backdrop tone so the far edge is clean.
+const FOG_COLOR = 0x0b0d14;
+scene.background = makeGradientBackdrop("#171c28", "#0d1019", "#080910");
+scene.fog = new THREE.FogExp2(FOG_COLOR, 0.014);
 
-const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 500);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 500);  // FOV matches the 3D sphere
 camera.up.set(0, 0, 1);                 // Z is up
-camera.position.set(-4, -4, 3);
+camera.position.set(-3.4, -3.8, 3.0);   // match the 3D sphere's framing
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 container.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.target.set(2.0, 0, 0.8);
+// Sphere-like feel: locked onto the cloud (no pan, so you can't slide away and get
+// lost), crisp 1:1 orbit that STOPS the instant you release (no damping drift), and
+// bounded zoom. The camera only moves when YOU move it -- the data-driven auto-
+// switch that used to yank the view is removed (see updateObstacle below).
+controls.enableDamping = false;
+controls.enablePan = false;
+controls.minDistance = 0.5;
+controls.maxDistance = 80;
+controls.target.set(0, 0, 0.3);         // match the 3D sphere's target (robot-centric)
 controls.maxPolarAngle = Math.PI / 2;   // never orbit below the floor (Z-up frame)
 
-const grid = new THREE.GridHelper(20, 40, 0x2a2e3d, 0x1b1e29);
+// Larger, dimmer ground grid: the fog fades the far lines so it reads as an
+// endless floor rather than a hard 20 m square. 1 m spacing.
+const grid = new THREE.GridHelper(60, 60, 0x3a4156, 0x171b27);
 grid.rotation.x = Math.PI / 2;          // make it the XY (ground) plane
+grid.material.transparent = true;
+grid.material.opacity = 0.55;
 scene.add(grid);
 const axes = new THREE.AxesHelper(0.6);
 scene.add(axes);
@@ -43,7 +59,12 @@ let capacity = 0;
 geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
 geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
 let pointSize = 0.05;
-const material = new THREE.PointsMaterial({ size: pointSize, vertexColors: true, sizeAttenuation: true });
+const material = new THREE.PointsMaterial({
+  size: pointSize, vertexColors: true, sizeAttenuation: true,
+  map: makeDiscTexture(),     // round, soft points instead of hard squares
+  alphaTest: 0.45,            // cut the sprite's transparent corners -> depth-correct discs
+  transparent: true, depthWrite: true,
+});
 const points = new THREE.Points(geometry, material);
 scene.add(points);
 
@@ -51,17 +72,63 @@ scene.add(points);
 let center = new THREE.Vector3(2, 0, 0.8);
 let radius = 4;
 let didAutoFit = false;
+let mapView = false;             // live vs loaded-map view (drives the auto-framing)
 let colorByHeight = true;
 
 // Dynamic height range for the colour ramp (smoothed).
 let zLo = 0, zHi = 2.2;
 
+// Height -> colour. A refined cool->warm sweep (blue floor ... red overhead):
+// deeper and less neon than a raw turbo, but still reads height at a glance.
+const _RAMP = [
+  [0.00, 0x2b4cf0], [0.22, 0x1fb6c9], [0.45, 0x37d67a],
+  [0.68, 0xc9d62e], [0.85, 0xf7a93b], [1.00, 0xff5a4a],
+];
 function turbo(t) {
-  t = Math.min(1, Math.max(0, t));
-  const r = Math.max(0, Math.min(1, 1.5 - Math.abs(2 * t - 1.5) * 1.5));
-  const g = Math.max(0, Math.min(1, 1.5 - Math.abs(2 * t - 1.0) * 1.5));
-  const b = Math.max(0, Math.min(1, 1.5 - Math.abs(2 * t - 0.5) * 1.5));
-  return [r, g, b];
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  let i = 0;
+  while (i < _RAMP.length - 2 && t > _RAMP[i + 1][0]) i++;
+  const a = _RAMP[i], b = _RAMP[i + 1];
+  const f = (t - a[0]) / (b[0] - a[0] || 1);
+  const ca = a[1], cb = b[1];
+  return [
+    (((ca >> 16) & 255) + ((((cb >> 16) & 255) - ((ca >> 16) & 255)) * f)) / 255,
+    (((ca >> 8) & 255) + ((((cb >> 8) & 255) - ((ca >> 8) & 255)) * f)) / 255,
+    (((ca) & 255) + ((((cb) & 255) - ((ca) & 255)) * f)) / 255,
+  ];
+}
+
+// Round, soft point sprite (replaces the default hard square) — drawn once.
+function makeDiscTexture() {
+  const s = 64, c = document.createElement("canvas");
+  c.width = c.height = s;
+  const g = c.getContext("2d");
+  const grd = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  grd.addColorStop(0.0, "rgba(255,255,255,1)");
+  grd.addColorStop(0.55, "rgba(255,255,255,1)");
+  grd.addColorStop(0.80, "rgba(255,255,255,0.55)");
+  grd.addColorStop(1.0, "rgba(255,255,255,0)");
+  g.fillStyle = grd;
+  g.fillRect(0, 0, s, s);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// Vertical gradient backdrop texture (top -> mid -> bottom CSS colours).
+function makeGradientBackdrop(top, mid, bottom) {
+  const c = document.createElement("canvas");
+  c.width = 4; c.height = 256;
+  const g = c.getContext("2d");
+  const grd = g.createLinearGradient(0, 0, 0, 256);
+  grd.addColorStop(0, top);
+  grd.addColorStop(0.6, mid);
+  grd.addColorStop(1, bottom);
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 4, 256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
 function ensureCapacity(n) {
@@ -106,6 +173,8 @@ function updateCloud(buffer) {
 
   center.set((xMin + xMax) / 2, (yMin + yMax) / 2, (zMin + zMax) / 2);
   radius = Math.max(1, 0.5 * Math.hypot(xMax - xMin, yMax - yMin, zMax - zMin));
+  // First frame (and on a live<->map switch): a big map is framed to fit; the live
+  // cloud gets the 3D-sphere's robot-centric framing so the two views match.
   if (!didAutoFit) { fitView(); didAutoFit = true; }
 }
 
@@ -119,93 +188,8 @@ function fitView() {
   controls.update();
 }
 
-function topView() {
-  controls.target.copy(center);
-  camera.up.set(1, 0, 0);                 // robot-forward points up on screen
-  camera.position.set(center.x, center.y, center.z + radius * 2.4);
-  camera.updateProjectionMatrix();
-  controls.update();
-}
-
-function view3D() {
-  camera.up.set(0, 0, 1);
-  fitView();
-}
-
-function robotView() {
-  // First-person "driving" view: look forward (+X) from just behind/above the
-  // robot origin, so the obstacle overlay (profile fan + planned-path arrow on
-  // the ground ahead) fills the view. You can still orbit and drive from here.
-  camera.up.set(0, 0, 1);
-  controls.target.set(4.0, 0, 0.3);
-  camera.position.set(-0.8, 0, 1.6);
-  camera.updateProjectionMatrix();
-  controls.update();
-}
-
-function setPointSize(mult) {
-  pointSize = Math.min(0.3, Math.max(0.01, pointSize * mult));
-  material.size = pointSize;
-}
-
-function bind(id, fn) {
-  const el = document.getElementById(id);
-  if (el) el.addEventListener("click", fn);
-}
-bind("viewHome", view3D);   // view3D() sets camera.up=(0,0,1) then fitView()
-bind("viewBot", robotView); // first-person driving view (also the obstacle auto-view)
-bind("view3d", view3D);
-bind("viewTop", topView);
-bind("viewFit", fitView);
-bind("ptMinus", () => setPointSize(0.7));
-bind("ptPlus", () => setPointSize(1.4));
-bind("viewColor", () => { colorByHeight = !colorByHeight; });
-bind("viewGrid", () => { grid.visible = !grid.visible; });
-
-// --- on-screen navigation (laptop-friendly orbit/tilt/zoom) --------------
-
-const _off = new THREE.Vector3();
-function orbit(daz, del) {
-  _off.copy(camera.position).sub(controls.target);
-  const r = _off.length();
-  let theta = Math.atan2(_off.y, _off.x);                  // azimuth around Z
-  let phi = Math.acos(Math.min(1, Math.max(-1, _off.z / r)));// polar from +Z
-  theta += daz;
-  phi = Math.min(Math.PI - 0.05, Math.max(0.05, phi + del));
-  _off.set(r * Math.sin(phi) * Math.cos(theta),
-           r * Math.sin(phi) * Math.sin(theta),
-           r * Math.cos(phi));
-  camera.position.copy(controls.target).add(_off);
-  camera.up.set(0, 0, 1);
-  camera.lookAt(controls.target);
-  controls.update();
-}
-function dolly(factor) {
-  _off.copy(camera.position).sub(controls.target);
-  _off.setLength(Math.min(200, Math.max(0.4, _off.length() * factor)));
-  camera.position.copy(controls.target).add(_off);
-  controls.update();
-}
-
-// Press-and-hold: fire once on press, then repeat while held.
-function holdRepeat(id, fn) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  let timer = null;
-  const start = (e) => { e.preventDefault(); fn(); timer = setInterval(fn, 60); };
-  const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
-  el.addEventListener("pointerdown", start);
-  el.addEventListener("pointerup", stop);
-  el.addEventListener("pointerleave", stop);
-  el.addEventListener("pointercancel", stop);
-}
-const AZ = 0.05, EL = 0.05;
-holdRepeat("navLeft",  () => orbit(+AZ, 0));
-holdRepeat("navRight", () => orbit(-AZ, 0));
-holdRepeat("navUp",    () => orbit(0, -EL));
-holdRepeat("navDown",  () => orbit(0, +EL));
-holdRepeat("navZoomIn",  () => dolly(0.94));
-holdRepeat("navZoomOut", () => dolly(1.06));
+// No in-view buttons: the feed auto-frames the cloud (fitView) and is mouse/touch
+// orbit only. Height colours and the ground grid are always on.
 
 function resize() {
   const w = container.clientWidth, h = container.clientHeight;
@@ -305,17 +289,12 @@ function emptyGroup(g) {
   }
 }
 
-let _obsWasEnabled = false;             // for the enable-edge camera auto-switch
-
 function updateObstacle(msg) {
   if (!msg) return;
 
-  // Auto-switch the camera to the bot's first-person driving view when the guard
-  // turns ON, and back to the 3D overview when it turns OFF -- only on the edge,
-  // so you can still freely orbit (and drive) while it stays on.
-  if (msg.enabled && !_obsWasEnabled) robotView();
-  else if (!msg.enabled && _obsWasEnabled) view3D();
-  _obsWasEnabled = !!msg.enabled;
+  // The camera no longer auto-switches to the driving view when the guard turns on
+  // -- it was yanking the view out from under you while you were orbiting. Use the
+  // "Bot view" button to jump to the first-person driving view yourself.
 
   const visible = !!(msg.enabled && msg.live) && !msg.fault && !msg.auto_disabled;
   obstacleGroup.visible = visible;
@@ -449,10 +428,11 @@ function connect() {
       try {
         const m = JSON.parse(e.data);
         if (m.type === "lidar_meta") {
-          setBadge(m.view === "map" ? "MAP ●" : "LIVE ●", true);
+          mapView = (m.view === "map");
+          setBadge(mapView ? "MAP ●" : "LIVE ●", true);
           const info = document.getElementById("infoView");
-          if (info) info.textContent = m.view === "map" ? "map" : "live";
-          // Re-fit when switching between live and a (much larger) map view.
+          if (info) info.textContent = mapView ? "map" : "live";
+          // Re-frame when switching between live and a (much larger) map view.
           didAutoFit = false;
         }
       } catch (_) {}

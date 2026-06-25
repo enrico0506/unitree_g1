@@ -19,7 +19,7 @@
   camFeed.dataset.stream = "/camera/stream";
 
   let poseOn = false, detectOn = false;
-  let poseData = null, detectData = null;   // each: { w, h, items:[...] }
+  let poseData = null, detectData = null, handsData = null;   // each: { w, h, items:[...] }
 
   // COCO-17 skeleton bones (index pairs into the keypoint array).
   const BONES = [
@@ -31,6 +31,17 @@
   const KP_MIN = 0.3;
   const POSE_COLOR = "#39d98a";
   const DETECT_COLOR = "#ffb74d";
+  const HAND_COLOR = "#5ac8fa";   // fingers, a distinct blue vs. the green skeleton
+
+  // MediaPipe 21-landmark hand connections (index pairs into the 21-point list).
+  const HAND_BONES = [
+    [0, 1], [1, 2], [2, 3], [3, 4],            // thumb
+    [0, 5], [5, 6], [6, 7], [7, 8],            // index
+    [5, 9], [9, 10], [10, 11], [11, 12],       // middle
+    [9, 13], [13, 14], [14, 15], [15, 16],     // ring
+    [13, 17], [17, 18], [18, 19], [19, 20],    // pinky
+    [0, 17],                                   // palm base
+  ];
 
   // Map source-frame pixel (px,py) -> canvas CSS px, honouring the <img>'s
   // object-fit:contain letterboxing. Returns null if no frame size is known.
@@ -133,6 +144,35 @@
     }
   }
 
+  function drawHands(data, cw, ch) {
+    const P = projector(data, cw, ch);
+    if (!P) return;
+    ctx.strokeStyle = HAND_COLOR;
+    ctx.fillStyle = HAND_COLOR;
+    // MediaPipe always returns a full 21-point hand (occluded joints are
+    // estimated), so unlike the skeleton there is no per-point confidence gate —
+    // we draw every landmark of every detected hand.
+    for (const hand of data.items || []) {
+      const lm = hand.landmarks || [];
+      if (lm.length < 21) continue;
+      ctx.lineWidth = 2;
+      for (const [a, b] of HAND_BONES) {
+        const [ax, ay] = P(lm[a][0], lm[a][1]);
+        const [bx, by] = P(lm[b][0], lm[b][1]);
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+      }
+      for (const pt of lm) {
+        const [x, y] = P(pt[0], pt[1]);
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
   function frame() {
     requestAnimationFrame(frame);
     const cw = camFeed.clientWidth, ch = camFeed.clientHeight;
@@ -153,6 +193,7 @@
     ctx.clearRect(0, 0, cw, ch);
     if (detectOn && detectData) drawDetect(detectData, cw, ch);
     if (poseOn && poseData) drawPose(poseData, cw, ch);   // skeletons on top
+    if (poseOn && handsData) drawHands(handsData, cw, ch); // fingers ride the Skeleton toggle
 
     // On-canvas readout: proves the overlay layer is rendering and shows the live
     // count the browser is receiving (skeleton people / detected objects).
@@ -173,9 +214,11 @@
   requestAnimationFrame(frame);
 
   window.CamOverlay = {
-    setPose(on) { poseOn = !!on; if (!on) poseData = null; },
+    // Skeleton toggle owns BOTH the body skeleton and the hand landmarks.
+    setPose(on) { poseOn = !!on; if (!on) { poseData = null; handsData = null; } },
     setDetect(on) { detectOn = !!on; if (!on) detectData = null; },
     setPoseData(d) { poseData = d; },
     setDetectData(d) { detectData = d; },
+    setHandsData(d) { handsData = d; },
   };
 })();

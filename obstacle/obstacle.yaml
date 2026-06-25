@@ -12,24 +12,33 @@ source: lidar   # lidar = obstacle/ raw-LiDAR node (run_obstacle.sh); nav2costma
 topic: /livox/lidar          # Livox Mid-360 topic. Our driver runs xfer_format=1 (CustomMsg) --
                              # this build's PointCloud2 path stalls after one frame. The node
                              # auto-detects the type and parses CustomMsg (decimated).
-sensor_height_m: 1.10        # Mid-360 height above the floor -- MEASURE on your robot.
-                             # The published cloud is already x-fwd/y-left/z-up (the driver
-                             # applies the 180 deg mount roll), so the floor sits at z ~= -this.
+sensor_height_m: 1.20        # Mid-360 height above the floor the robot STANDS on (~10 cm below the
+                             # 1.27 m head). NOTE: the tilt-aware floor fit auto-finds the real floor each
+                             # frame, so this only sizes the ground-candidate band -- it does NOT need to be
+                             # exact. On the HARNESS the robot hangs ~0.3 m up, so the fit reads the floor at
+                             # ~-1.5 m (1.2 above the feet + 0.3 harness lift); on the ground it reads ~-1.2.
+                             # The published cloud is already x-fwd/y-left/z-up (the driver applies the 180 deg
+                             # mount roll), so the floor sits at z ~= -(this + any harness lift).
 
 # --- perception (Stages 2-4) ----------------------------------------------
 obstacle_range_m: 3.0        # farthest point we keep (horizontal). MUST be >= slow_at_m, else a
                              # fully-open direction relaxes only to this and never reaches CLEAR / full speed.
 slow_at_m: 1.6               # only slow within this -- keeps full speed when it has space (less sensitive)
 stop_at_m: 0.6               # hard stop at/under this distance (per direction)
-slow_min_scale: 0.5          # MIN speed in the slow zone: the robot KEEPS MOVING (>=50%) when it has
-                             # space and never crawls to a freeze. Only the hard stop (inside stop_at) = 0.
+slow_min_scale: 0.18         # MIN speed in the slow zone -> "little steps" when an obstacle is near. As a
+                             # direction closes from slow_at down to stop_at the speed eases toward this
+                             # floor (~0.18*max = a slow shuffle), so the robot keeps creeping in small
+                             # steps instead of stopping dead a metre out. Only the hard stop (inside
+                             # stop_at) = 0. Lower (~0.12) for even tinier steps; raise if it won't step.
 
 # --- safety bubble + blind-zone prediction --------------------------------
 # The Mid-360 sits ~1.1 m up and tilted ~12 deg UP, so it is BLIND to obstacles
 # closer than ~1.0 m straight ahead (MEASURED). Two mitigations:
-safety_bubble_m: 0.35        # extra clearance kept on ALL sides beyond the body so the ARMS don't clip
+safety_bubble_m: 0.15        # extra clearance kept on ALL sides beyond the body so the ARMS don't clip
                              # corners. ADDED to slow_at_m + stop_at_m (robot slows/stops this much earlier,
-                             # every direction). Raise for more margin; lower (~0.15) for tighter gaps.
+                             # every direction). Lowered 0.35 -> 0.15 so it can creep CLOSER with little
+                             # steps before the hard stop (effective stop = stop_at + this = ~0.75 m) instead
+                             # of freezing ~1 m out. Raise back toward 0.35 for more arm margin in tight gaps.
 front_blind_zone_m: 1.0      # MEASURED front blind distance. A wall approaching head-on VANISHES here;
                              # below this the sensor has no data straight ahead.
 predict_blind_zone: true     # dead-reckon a front wall THROUGH the blind cone: when it was last seen near
@@ -139,3 +148,33 @@ enabled_default: false       # obstacle guard OFF until the operator turns it on
 gap_follow_default: false    # autonomous yaw/strafe steering OFF until tuned
 recovery_default: false      # turn-in-place search OFF until tuned
 publish_hz: 10               # node processing / shm-write rate (matches LiDAR)
+
+# --- dashboard 3D obstacle sphere -----------------------------------------
+# The node exports the kept obstacle points (post ground/self/range filter) so the
+# 3D sphere can voxelise them into solid columns. These are EXACTLY what the guard
+# reacts to -- low things on the ground show as short blocks; blind spots show as
+# empty space (no returns). z is height ABOVE the fitted floor (floor = 0).
+viz_points: true             # false = stop exporting points (saves a little WLAN/CPU)
+viz_max_points: 3000         # cap on exported points (~2.5k kept/frame -> 3000 sends all).
+                             # Lower if the dashboard lags over WiFi; raise for max density.
+
+# --- D435i depth fusion (fills the Mid-360's near-GROUND blind zone) -------
+# The head RealSense D435i is tilted ~47 deg DOWN, so it sees the floor ~0.5-2 m
+# in front -- exactly where the up-looking Mid-360 is blind. DepthNearField
+# (scripts/depth_nearfield.py) reuses the dashboard's already-decoded depth cloud
+# (no second camera open), corrects the mount pitch, drops the floor, and reports
+# the nearest forward near-ground obstacle. The guard mixes it into the forward
+# distance (slow + stop). DEFAULT OFF: a wrong pitch/height would false-stop or
+# miss, so VALIDATE on the robot (watch depth.front_near in the telemetry) first.
+depth_fusion:
+  enabled: false             # turn ON only after validating the frame on the robot
+  pitch_deg: 47.6            # D435i downward mount tilt (URDF d435_joint = 0.83078 rad)
+  camera_height_m: 1.30      # real D435i height above the floor -- MEASURE (head ~1.27 m)
+  corridor_half_m: 0.35      # forward corridor half-width (robot half-width + margin)
+  min_range_m: 0.35          # ignore closer than the D435i min range (~0.3 m)
+  max_range_m: 2.5           # only fuse the NEAR band (beyond this the lidar is fine)
+  ground_clearance_m: 0.08   # keep points more than this above the floor (drop the floor)
+  max_height_m: 1.8          # drop overhead / ceiling returns
+  min_points: 8              # need >= this many near points before reporting (anti-noise)
+  kth: 4                     # report the k-th nearest forward distance (reject a lone flier)
+  poll_hz: 15                # depth sampling rate

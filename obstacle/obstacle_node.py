@@ -101,6 +101,14 @@ DEFAULTS = {
     "gap_follow_default": False,
     "recovery_default": False,
     "publish_hz": 10,
+    # --- obstacle-point export for the dashboard 3D sphere -------------------
+    # Ship the ACTUAL kept obstacle points (post ground/self/range filter) so the
+    # operator sees exactly what the guard perceives -- including low things on the
+    # ground -- and, by their absence, what it is blind to. viz frame: x fwd, y left,
+    # z = height ABOVE the fitted floor (floor = 0), so ground-level returns sit near 0.
+    "viz_points": True,            # write the "points" array into the shm contract
+    "viz_max_points": 3000,        # cap (strided decimation) -> bounded JSON/WS payload
+                                   #   (~2.5k kept/frame here, so 3000 sends them all = densest)
 }
 
 
@@ -197,6 +205,9 @@ class ObstacleNode(Node):
         self.tripwire_min = max(1, int(c.get("tripwire_min_points", 1)))
         self.ring_n = max(1, int(round(360.0 / self.ring_bin_deg)))
         self.ring_start_deg = -180.0   # bin 0 center = start + 0.5*bin_deg; shared by node + UI
+        # obstacle-point export for the dashboard 3D sphere
+        self.viz_points = bool(c.get("viz_points", True))
+        self.viz_max_points = max(0, int(c.get("viz_max_points", 1500)))
         self.half_w = float(c["robot_half_width_m"])
         self.margin = float(c["clearance_margin_m"])
         self.standoff = float(c["gap_standoff_m"])
@@ -220,6 +231,18 @@ class ObstacleNode(Node):
         self.yaw_filt = 0.0           # EMA of yaw_cmd
         self.first_frame = True       # gate the one-shot mount-frame sanity check
         self.floor_abc = None         # last fitted floor plane (a, b, c), for the sanity print
+
+        # --- front-cone diagnostic (opt-in; G1_OBS_FRONT_DIAG=1) ---------------
+        # Traces front-cone (|ang|<45 deg) points through each filter stage so we
+        # can see WHY the front reads clear: never arriving (blind), cut as
+        # overhead (up-tilt sees the wall above obstacle_max_above_m), cut as
+        # floor/self, or present-but-too-sparse for the k-point wedge. Off by
+        # default (zero hot-path cost); when on, a compact 'front_diag' is added to
+        # the SHM JSON AND logged ~1 Hz. Changes NO perception/safety logic.
+        self.front_diag = os.environ.get("G1_OBS_FRONT_DIAG", "0") \
+            not in ("0", "", "false", "False", "no")
+        self._front_diag_last = None
+        self._front_diag_log_seq = 0
 
         # --- bin geometry (precompute the bin edges once) ---------------------
         # Bins span [-sweep, +sweep]. We store edges low->high (right->left),
@@ -312,6 +335,12 @@ class ObstacleNode(Node):
                 & (z >= self.min_h) & (z <= self.max_h)
             )
 
+        # opt-in diagnostic: trace the front cone through each filter stage BEFORE
+        # the kept-subset reassignment below (needs the full arrays + the floor
+        # plane that _ground_mask just fitted into self.floor_abc).
+        if self.front_diag:
+            self._front_cone_diag(x, y, z, horiz, keep)
+
         x = x[keep]
         y = y[keep]
         z = z[keep]
@@ -397,6 +426,12 @@ class ObstacleNode(Node):
                 "dist": [_r(d) for d in ring_dist],
             },
         }
+        # Actual kept obstacle points (what the guard perceives) for the 3D sphere.
+        if self.viz_points:
+            out["points"] = self._viz_points(x, y, z)
+        # opt-in front-cone filter-stage trace (G1_OBS_FRONT_DIAG=1).
+        if self.front_diag and self._front_diag_last is not None:
+            out["front_diag"] = self._front_diag_last
         self._write_shm(out)
         self._print_status(n_raw, n_keep, front_m, left_m, right_m, back_m,
                            zone, speed_scale, tight_factor, gap)
@@ -553,7 +588,14 @@ class ObstacleNode(Node):
            height) so its legs/feet don't read as obstacles.
         Stores the fitted plane on self.floor_abc for the sanity print.
         """
-        in_range = (horiz >= 0.05) & (horiz <= self.range_m)
+        # blind_radius drops the robot's OWN body / harness self-returns at ANY
+        # height. The legacy band applied this (horiz >= self.blind); the ground
+        # path MUST too, or a harness post / gantry leg taller than
+        # self_mask_max_height_m sitting ~0.1 m away reads as a permanent
+        # side/back obstacle and pins strafe + reverse to zero forever. Anything
+        # within blind_radius of a body-mounted sensor is the robot itself; real
+        # obstacles are stopped far outside this (stop_at + bubble ~= 0.95 m).
+        in_range = (horiz >= self.blind) & (horiz <= self.range_m)
 
         # floor candidates: in range AND clearly low (below sensor + band).
         cand = in_range & (z < (-self.sensor_h + self.ground_band))
@@ -573,6 +615,72 @@ class ObstacleNode(Node):
             & (above < self.self_mask_max_h)
         )
         return in_range & keep_ground & (~in_self)
+
+    def _front_cone_diag(self, x, y, z, horiz, keep):
+        """DIAGNOSTIC (opt-in via G1_OBS_FRONT_DIAG=1) -- changes NO perception.
+
+        Trace front-cone (|ang| < 45 deg, same wedge as front_m) points through each
+        filter stage so we can see WHY the front reads clear. Mirrors the masks in
+        _ground_mask, recomputed on the cone subset only (cheap). Writes a compact
+        dict to self._front_diag_last (added to the SHM as 'front_diag') and logs it
+        ~1 Hz. Reads the floor plane _ground_mask just fitted into self.floor_abc.
+
+        Keys:
+          raw         points in the cone (finite, pre-spatial-filter)
+          in_range    of those, within [blind_radius, obstacle_range]
+          floor_cut   in-range but at/below ground_clearance (floor/legs dropped)
+          overhead_cut in-range but >= obstacle_max_above (CEILING cut -- the prime
+                       suspect: an up-tilted sensor sees a near wall HIGH)
+          self_cut    in-range but inside the footprint self-mask box (low)
+          kept        survive ALL stages (what front_m/the wedge actually sees)
+          wedge_k     points the wedge needs before it reports (min_cluster_points)
+          h_above     [p5, p50, p95] height-above-floor (m) of in-range cone points
+          near_horiz  nearest in-range horizontal distance (the wall, if present)
+        """
+        ang = np.degrees(np.arctan2(y, x))
+        cone = np.abs(ang) < 45.0
+        n_raw = int(cone.sum())
+        hc, zc, xc, yc = horiz[cone], z[cone], x[cone], y[cone]
+        a, b, c = self.floor_abc if self.floor_abc else (0.0, 0.0, -self.sensor_h)
+        above = zc - (a * xc + b * yc + c)
+        in_range = (hc >= self.blind) & (hc <= self.range_m)
+        overhead = in_range & (above >= self.max_above)
+        floorish = in_range & (above <= self.ground_clear)
+        self_box = (
+            in_range
+            & (xc > -self.self_back) & (xc < self.self_front)
+            & (np.abs(yc) < self.self_half_w) & (above < self.self_mask_max_h)
+        )
+        inr_h = above[in_range]
+
+        def _p(arr, p):
+            return round(float(np.percentile(arr, p)), 2) if len(arr) else None
+
+        near = hc[in_range]
+        self._front_diag_last = {
+            "cone_deg": 45,
+            "raw": n_raw,
+            "in_range": int(in_range.sum()),
+            "floor_cut": int(floorish.sum()),
+            "overhead_cut": int(overhead.sum()),
+            "self_cut": int(self_box.sum()),
+            "kept": int(keep[cone].sum()),
+            "wedge_k": self.k_cluster,
+            "max_above_m": round(self.max_above, 2),
+            "h_above": [_p(inr_h, 5), _p(inr_h, 50), _p(inr_h, 95)],
+            "near_horiz": round(float(near.min()), 2) if len(near) else None,
+        }
+        # throttle the log to ~1 Hz (lidar runs ~10 Hz) so the terminal stays usable.
+        if self.seq - self._front_diag_log_seq >= 10:
+            self._front_diag_log_seq = self.seq
+            d = self._front_diag_last
+            self.get_logger().info(
+                "FRONT-DIAG cone(+/-45): raw=%d in_range=%d -> kept=%d "
+                "(floor_cut=%d overhead_cut=%d self_cut=%d) | wedge needs k=%d | "
+                "h_above[p5,p50,p95]=%s (max_above=%.2f) | near=%s m"
+                % (d["raw"], d["in_range"], d["kept"], d["floor_cut"],
+                   d["overhead_cut"], d["self_cut"], d["wedge_k"],
+                   d["h_above"], d["max_above_m"], d["near_horiz"]))
 
     def _mount_sanity_check(self, z, horiz):
         """Floor returns near the robot should be BELOW the sensor (z<0). If the
@@ -715,6 +823,36 @@ class ObstacleNode(Node):
             "turn_factor": round(turn_factor, 3),
         }
         return profile, gap
+
+    def _viz_points(self, x, y, z):
+        """Decimated kept-obstacle points for the dashboard 3D sphere.
+
+        Returns a FLAT [x0,y0,z0, x1,y1,z1, ...] list in the viz frame: x forward,
+        y left, z = height ABOVE the fitted floor (so the floor sits at 0 and a low
+        box on the ground reads as a few cm, not ~-1.1 m). Strided to <= viz_max_points
+        for a bounded payload, rounded to 2 dp (cm). These are EXACTLY the points that
+        survived the ground/self/range filter -- i.e. what the guard actually reacts to.
+        """
+        n = len(x)
+        if n == 0:
+            return []
+        # height above the fitted tilted floor when we have it (ground_removal path);
+        # else fall back to sensor-relative z shifted by sensor_height (floor -> ~0).
+        if self.ground_removal and self.floor_abc is not None:
+            a, b, c = self.floor_abc
+            zf = z - (a * x + b * y + c)
+        else:
+            zf = z + self.sensor_h
+        step = 1 if (self.viz_max_points <= 0 or n <= self.viz_max_points) \
+            else (n // self.viz_max_points + 1)
+        xs = x[::step]
+        ys = y[::step]
+        zs = zf[::step]
+        out = np.empty(xs.size * 3, dtype=float)
+        out[0::3] = np.round(xs, 2)
+        out[1::3] = np.round(ys, 2)
+        out[2::3] = np.round(zs, 2)
+        return out.tolist()
 
     def _write_shm(self, obj):
         """Atomic write: tmp file then os.replace (guard never reads a partial)."""

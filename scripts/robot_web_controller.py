@@ -51,6 +51,7 @@ from camera_source import CameraSource
 from lidar_source import LidarSource, pack_cloud, OdomReader
 from map_builder import MapBuilder
 from cmd_shaper import CommandShaper
+from step_pacer import StepPacer
 
 
 # --- Paths ---
@@ -63,6 +64,7 @@ CONFIG_PATH = BASE_DIR / "config" / "robot.yaml"
 sys.path.insert(0, str(BASE_DIR))   # so the top-level 'obstacle' package imports
 from obstacle.guard import ObstacleGuard
 from obstacle.manager import ObstacleManager
+from depth_nearfield import DepthNearField   # D435i near-ground depth fusion (domain 0)
 
 OBSTACLE_CFG_PATH = BASE_DIR / "obstacle" / "obstacle.yaml"
 
@@ -96,6 +98,12 @@ POSE_DEMAND = "/dev/shm/g1_pose_demand"    # heartbeat: pose only infers while w
 DETECT_SHM    = "/dev/shm/g1_detect.jpg"          # annotated JPEG (boxes + labels)
 DETECT_TRACKS = "/dev/shm/g1_detect_tracks.json"  # {w,h,items:[{cls,conf,box}]} live detections
 DETECT_DEMAND = "/dev/shm/g1_detect_demand"       # heartbeat: detect only infers while watched
+
+# Hands lane (finger landmarks). Produced by the separate g1-hands container
+# (perception/hands/hands_service.py); we only read/write these shm files. Hands
+# ride the SAME Skeleton toggle as pose -- the browser polls both while it's on.
+HANDS_TRACKS = "/dev/shm/g1_hands_tracks.json"  # {w,h,items:[{hand,score,landmarks:[[x,y,z]x21]}]}
+HANDS_DEMAND = "/dev/shm/g1_hands_demand"        # heartbeat: hands only infer while watched
 
 # Battery: the G1 publishes BMS state (state-of-charge, pack voltage, current) on a
 # low-frequency DDS topic as unitree_hg.BmsState_. The hg LowState_ has no battery
@@ -157,6 +165,18 @@ MOTION_CFG = CFG.get("motion", {})
 GAIT_CFG = CFG.get("gait", {})
 GAIT_SWING_HEIGHT = GAIT_CFG.get("swing_height")   # None = leave controller default
 GAIT_STAND_HEIGHT = GAIT_CFG.get("stand_height")   # None = leave controller default
+
+# Discrete-step pacing (scripts/step_pacer.py): chops the held velocity intent into
+# short ON-burst / long OFF-settle pulses so the robot takes genuinely SMALL/MEDIUM
+# steps in every direction. STEP_ENABLED is the master kill-switch; default_mode is
+# 'continuous' (== today's analog walking) until the operator selects a step size.
+STEP_CFG = CFG.get("step", {})
+STEP_ENABLED = bool(STEP_CFG.get("enabled", True))
+# Per-mode swing height (foot lift): Small lowers it to a shuffle so a smaller step
+# completes cleanly; Normal/Medium restore this baseline. None = feature off (never
+# touch swing height). Clamped to a safe range when applied.
+STEP_SWING_NORMAL = STEP_CFG.get("swing_height_normal")
+_last_swing = None   # last value sent to SET_SWING_HEIGHT (dedupe the blocking RPC)
 
 FSM_POLL_HZ = 2.0          # GetFsmId is a blocking RPC; keep it light
 FSM_BROADCAST_HZ = 2.0
@@ -271,6 +291,8 @@ class ControlState:
         self.is_moving = False
         self.pending_cmd = None
         self.mode = INITIAL_MODE
+        # Discrete-step pacing mode: 'continuous' (analog, default), 'small', 'medium'.
+        self.step_mode = STEP_CFG.get("default_mode", "continuous")
         self.fsm_id = None
         self.fsm_name = "unknown"
         self.transitioning = False
@@ -299,7 +321,9 @@ mapper: MapBuilder = None
 
 guard: ObstacleGuard = None
 obstacle_mgr: ObstacleManager = None
+depth_nf: DepthNearField = None
 shaper: CommandShaper = None
+pacer: StepPacer = None
 audio = None
 
 _mode_lock = threading.Lock()
@@ -432,6 +456,46 @@ def enable_continuous_gait():
             print(f"[GAIT] SetSwingHeight failed: {e}", flush=True)
 
     state.gait_enabled = True
+    # Fresh walk session: re-assert the swing height for the active step mode (the
+    # controller may have reset it on exit), forcing past the dedupe.
+    apply_step_swing(state.step_mode, force=True)
+
+
+def apply_step_swing(mode, force=False):
+    """Set the locomotion swing height (foot lift) for the active step mode.
+
+    A LOWER swing = a shuffle = less weight transfer per step, so the robot can complete
+    a SMALLER clean step than the velocity floor allows. Small's swing_height overrides;
+    Normal/Medium restore swing_height_normal. No-op unless swing_height_normal is set.
+    Runs the blocking SET_SWING_HEIGHT RPC on a throwaway thread (never blocks the loop)
+    and dedupes so it only fires on an actual change. Clamped to a safe range -- the SDK
+    range is UNVERIFIED on this robot and too low = toe-scuff/trip."""
+    global _last_swing
+    if pacer is None or STEP_SWING_NORMAL is None:
+        return
+    val = pacer.swing_height.get(mode)        # small/medium per-mode override
+    if val is None:
+        val = STEP_SWING_NORMAL               # Normal (or a null-swing mode) -> baseline
+    try:
+        val = clamp(float(val), 0.02, 0.15)
+    except (TypeError, ValueError):
+        return
+    if not force and _last_swing is not None and abs(val - _last_swing) < 1e-4:
+        return                                 # already at this height -> skip the RPC
+    _last_swing = val
+
+    def _worker(v=val, m=mode):
+        # Verbose so we can tell on the robot whether SET_SWING_HEIGHT is supported:
+        # "calling" then "-> (code,data)" = works; "calling" with nothing after = the
+        # RPC hung (unsupported on this firmware); no "calling" = returned early.
+        print(f"[STEP] swing height: calling SET_SWING_HEIGHT({v:.3f}) for '{m}'...", flush=True)
+        try:
+            ret = client._Call(ROBOT_API_ID_LOCO_SET_SWING_HEIGHT, json.dumps({"data": v}))
+            print(f"[STEP] swing height SET {v:.3f} m '{m}' -> {ret}", flush=True)
+        except Exception as e:
+            print(f"[STEP] swing height FAILED: {e}", flush=True)
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +526,8 @@ def enter_mode(new_mode):
     state.gait_enabled = False
     if shaper is not None:
         shaper.reset()   # fresh walk session starts the ramp from rest, never a stale value
+    if pacer is not None:
+        pacer.reset()    # never resume mid-pulse on a fresh walk session
 
     # Set transitioning BEFORE mode so the FSM poller's mode-sync can't briefly
     # overwrite our just-set intent in the gap between these two assignments.
@@ -683,7 +749,7 @@ def make_state_msg():
 
 def make_telemetry_msg():
     x, y, yaw = odom.get_pose() if odom else (0.0, 0.0, 0.0)
-    return {
+    msg = {
         "type": "telemetry",
         "x": round(x, 3),
         "y": round(y, 3),
@@ -697,6 +763,11 @@ def make_telemetry_msg():
         "cmd_vy": round(state.cmd_vy, 3),
         "cmd_vyaw": round(state.cmd_vyaw, 3),
     }
+    # Step-pacing state (authoritative server mode + optional measured/estimated chip)
+    # so the dashboard's Step Size selector reflects reality.
+    if pacer is not None:
+        msg.update(pacer.telemetry())
+    return msg
 
 
 def run_enter_mode(name):
@@ -725,6 +796,7 @@ def command_loop():
     last_send_time = 0.0
     last_rearm_time = 0.0
     last_gait_time = 0.0
+    last_desired = (0.0, 0.0, 0.0)   # previous tick's shaped velocity -> pacer settle gate
 
     while True:
         now = time.time()
@@ -746,6 +818,8 @@ def command_loop():
             state.vx = state.vy = state.vyaw = 0.0
             if shaper is not None:
                 shaper.reset()
+            if pacer is not None:
+                pacer.reset()   # comms loss: never resume mid-pulse on the next walk
 
         # Desired velocity (zero unless actively walking).
         #   operator intent (clamped)
@@ -765,7 +839,20 @@ def command_loop():
                       clamp(state.vyaw, -MAX_VYAW, MAX_VYAW))
             if shaper is not None:
                 intent = shaper.normalize(intent)
-            governed = guard.apply(intent) if guard is not None else intent
+            held = intent     # operator's true held intent, BEFORE the pacer pulses it
+            # Discrete-step pacing: chop the held intent into ON-burst/OFF-settle
+            # pulses (small/medium steps). Pure pass-through in 'continuous' mode, so
+            # this is a no-op unless the operator selected a step size. UPSTREAM of the
+            # guard so the obstacle hard-stop still wins; it never sets the shaper
+            # bypass, so each pulse edge stays jerk/accel-limited downstream. Fed a
+            # MONOTONIC clock (a wall-clock step must never wedge the pulse gate) and the
+            # PREVIOUS tick's shaped velocity so the OFF window holds until the foot
+            # actually settles (no merged steps).
+            if pacer is not None:
+                intent = pacer.modulate(intent, time.monotonic(), vel_fb=last_desired)
+            # held -> guard so the blind-zone predictor reads the operator's real forward
+            # intent, not the pulsed value (an OFF window is not a forward release).
+            governed = guard.apply(intent, held=held) if guard is not None else intent
             hard = guard.hard_stop_flags() if guard is not None else (False, False, False)
             desired = (shaper.shape(governed, DT, bypass=hard)
                        if shaper is not None else governed)
@@ -785,6 +872,7 @@ def command_loop():
             desired = (0.0, 0.0, 0.0)
 
         state.cmd_vx, state.cmd_vy, state.cmd_vyaw = desired   # for the UI readout
+        last_desired = desired   # feeds the pacer's settle gate on the next tick
 
         moving = desired != (0.0, 0.0, 0.0)
         changed = any(abs(desired[i] - last_sent[i]) > DEADZONE for i in range(3))
@@ -841,10 +929,16 @@ async def broadcast_loop():
             last_broadcast_fsm = state.fsm_id
             last_transitioning = state.transitioning
 
-        # Stream obstacle telemetry at ~10 Hz, but only while the guard is active
-        # (enabled or showing a fault/auto-disabled banner) to keep traffic minimal.
-        if guard is not None and guard.is_active_ui():
-            await broadcast(guard.telemetry())
+        # Stream obstacle telemetry at ~10 Hz whenever the perception node is alive
+        # (so the 2D/3D views are live even with the motion guard OFF), or while the
+        # guard is otherwise active (fault/auto-disabled banner).
+        if guard is not None and (
+                (obstacle_mgr is not None and obstacle_mgr.is_alive())
+                or guard.is_active_ui()):
+            tm = guard.telemetry()
+            if depth_nf is not None:
+                tm["depth"] = depth_nf.telemetry()
+            await broadcast(tm)
 
         await asyncio.sleep(0.1)
 
@@ -855,8 +949,8 @@ async def broadcast_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper
-    global guard, obstacle_mgr, shaper, audio
+    global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf
+    global guard, obstacle_mgr, shaper, pacer, audio
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -941,10 +1035,37 @@ async def lifespan(app: FastAPI):
     guard.start()
     print("Obstacle guard ready (disabled until toggled).", flush=True)
 
+    # Obstacle PERCEPTION runs always (independent of the motion guard) so the 2D/3D
+    # views are live from boot. The guard's enable flag governs MOTION only; the node
+    # is paused solely for mapping (shared Mid-360) and resumed afterwards.
+    if obstacle_mgr is not None and not (mapper is not None and mapper.active):
+        obstacle_mgr.start()
+        print("Obstacle perception node started (viz always-on).", flush=True)
+
+    # D435i near-ground depth fusion: reuses the dashboard's RealSense cloud (lidar)
+    # to fill the Mid-360's near-ground forward blind zone. DEFAULT OFF (validate the
+    # frame on the robot first); the guard mixes its distance into the forward stop.
+    depth_nf = DepthNearField(lidar_source=lidar, cfg_path=str(OBSTACLE_CFG_PATH),
+                              ls_mount_height=LIDAR_CAMERA_HEIGHT)
+    depth_nf.start()
+    guard.set_depth_source(depth_nf.front_near_m)
+    print(f"Depth near-field fusion ready ({'ON' if depth_nf.enabled else 'OFF'}; D435i).",
+          flush=True)
+
     # Velocity shaper: jerk/accel-limited smoothing of the teleop command (smooth walk).
     shaper = CommandShaper(cfg=MOTION_CFG, max_speeds=(MAX_VX, MAX_VY, MAX_VYAW))
     print(f"Command shaper ready (motion smoothing {'ON' if shaper.enabled else 'OFF'}).",
           flush=True)
+
+    # Discrete-step pacer: small/medium stutter-steps for tight spaces, all directions.
+    # Reads odom (pose/live) for the OPTIONAL distance-quantized refinement (OFF by
+    # default). default_mode = continuous = pure pass-through until the operator opts in.
+    pacer = StepPacer(cfg=STEP_CFG, max_speeds=(MAX_VX, MAX_VY, MAX_VYAW),
+                      pose_fn=(odom.get_pose if odom else None),
+                      live_fn=(odom.is_live if odom else None))
+    pacer.set_mode(state.step_mode)   # honour the State's startup mode (no-op if continuous)
+    print(f"Step pacer ready (step mode '{pacer.mode}', "
+          f"{'ON' if pacer.enabled else 'OFF'}).", flush=True)
 
     # Blocking robot RPCs run in their own thread; the event loop only streams.
     cmd_thread = threading.Thread(target=command_loop, daemon=True)
@@ -974,6 +1095,11 @@ async def lifespan(app: FastAPI):
     if guard is not None:
         try:
             guard.stop()
+        except Exception:
+            pass
+    if depth_nf is not None:
+        try:
+            depth_nf.stop()
         except Exception:
             pass
     if obstacle_mgr is not None:
@@ -1183,6 +1309,34 @@ async def detect_objects():
 
 
 # ---------------------------------------------------------------------------
+# Hands — finger landmarks. Same demand-gated geometry pattern as the pose lane;
+# the source frame is the shared camera JPEG, the producer is the g1-hands
+# container. Polling /camera/hands/tracks heartbeats HANDS_DEMAND so the GPU only
+# runs while the Skeleton overlay is on (the browser polls it alongside the pose
+# tracks while Skeleton is active).
+# ---------------------------------------------------------------------------
+
+@app.get("/camera/hands/status")
+async def hands_status():
+    return JSONResponse({"live": _fresh(HANDS_TRACKS), "backend": "hands"})
+
+
+@app.get("/camera/hands/tracks")
+async def hands_tracks():
+    """Hand geometry {w, h, items:[{hand, score, landmarks:[[x,y,z]x21]}]}."""
+    try:
+        with open(HANDS_DEMAND, "wb") as f:
+            f.write(b"1")
+    except OSError:
+        pass
+    try:
+        with open(HANDS_TRACKS) as f:
+            return JSONResponse(json.load(f))
+    except (OSError, ValueError):
+        return JSONResponse({"w": 0, "h": 0, "items": []})
+
+
+# ---------------------------------------------------------------------------
 # LiDAR — 3D point cloud (Z-up) over a dedicated binary WebSocket
 # ---------------------------------------------------------------------------
 
@@ -1224,8 +1378,13 @@ async def ws_endpoint(ws: WebSocket):
         "slow_scale": SLOW_SCALE,
         # which whole-body combos have a captured FSM id (-> button enabled)
         "mode_combos": {name: (fsm is not None) for name, fsm in MODE_COMBOS.items()},
-        # initial obstacle-guard UI flags (enabled / gap_follow / recovery)
-        "obstacle": (guard.ui_config() if guard is not None else {}),
+        # initial obstacle-guard UI flags (enabled / gap_follow / recovery [+ depth])
+        "obstacle": (dict(guard.ui_config(), depth=depth_nf.telemetry())
+                     if guard is not None and depth_nf is not None
+                     else (guard.ui_config() if guard is not None else {})),
+        # initial discrete-step selector state ('continuous' default -> 'Normal' on load)
+        "step": {"mode": state.step_mode, "enabled": STEP_ENABLED,
+                 "modes": ["continuous", "medium", "small"]},
     }))
     await ws.send_text(json.dumps(make_state_msg()))
     if mapper is not None:
@@ -1257,6 +1416,22 @@ async def ws_endpoint(ws: WebSocket):
                 state.vx = state.vy = state.vyaw = 0.0
                 state.is_moving = False
 
+            elif mtype == "step_mode":
+                # Discrete-step size selector (continuous = analog; small/medium = pulses).
+                # set_mode() resets the pacer so a switch never resumes mid-pulse; the
+                # next held key starts a clean burst. Selecting 'continuous' is an
+                # instant return to pass-through (an effective calm-down control).
+                name = msg.get("name", "")
+                if name in ("continuous", "small", "medium"):
+                    state.step_mode = name
+                    if pacer is not None:
+                        pacer.set_mode(name)
+                    # Apply this mode's foot-lift (Small shuffles lower; Normal/Medium
+                    # restore the baseline) -- off-thread, so it never blocks the WS loop.
+                    apply_step_swing(name)
+                    # Confirm to all clients so connected dashboards stay in sync.
+                    await broadcast({"type": "step_mode", "name": state.step_mode})
+
             elif mtype == "mode":
                 requested = msg.get("name", "")
                 threading.Thread(target=run_enter_mode, args=(requested,),
@@ -1268,13 +1443,15 @@ async def ws_endpoint(ws: WebSocket):
             elif mtype == "map" and mapper is not None:
                 action = msg.get("action", "")
                 if action == "start":
-                    if guard is not None and guard.enabled:
-                        await broadcast({"type": "map_status",
-                                         "error": "Disable obstacle guard first (shared LiDAR)."})
-                    else:
-                        mapper.start()
+                    # Mapping needs the Mid-360 exclusively -> pause the always-on
+                    # obstacle node + motion guard, then start mapping.
+                    if guard is not None: guard.set_enabled(False)
+                    if obstacle_mgr is not None: obstacle_mgr.stop()
+                    mapper.start()
                 elif action == "stop":
                     mapper.stop()
+                    if obstacle_mgr is not None:
+                        obstacle_mgr.start()      # resume the always-on obstacle viz
                 elif action == "clear":
                     mapper.clear()
                 elif action == "save":
@@ -1292,13 +1469,20 @@ async def ws_endpoint(ws: WebSocket):
                     elif guard is not None:
                         obstacle_mgr.start(); guard.set_enabled(True)
                 elif action == "disable":
+                    # Motion governing OFF only -- the perception node KEEPS running so
+                    # the 2D/3D views stay live (it is paused solely for mapping).
                     if guard is not None: guard.set_enabled(False)
-                    if obstacle_mgr is not None: obstacle_mgr.stop()
                 elif action == "gap_follow" and guard is not None:
                     guard.set_gap_follow(bool(msg.get("on")))
                 elif action == "recovery" and guard is not None:
                     guard.set_recovery(bool(msg.get("on")))
-                if guard is not None: await broadcast(guard.telemetry())
+                elif action == "depth_fusion" and depth_nf is not None:
+                    depth_nf.set_enabled(bool(msg.get("on")))
+                if guard is not None:
+                    tm = guard.telemetry()
+                    if depth_nf is not None:
+                        tm["depth"] = depth_nf.telemetry()
+                    await broadcast(tm)
 
     except WebSocketDisconnect:
         print("[ws] client disconnected", flush=True)

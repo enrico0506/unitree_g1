@@ -54,6 +54,76 @@ gait:
   swing_height: null     # foot swing height (m), LocoClient SET_SWING_HEIGHT (api 7103). null = default.
   stand_height: null     # stand height (m), LocoClient.SetStandHeight (api 7104). null = default.
 
+# Discrete-step pacing (scripts/step_pacer.py): genuinely SMALL/MEDIUM stutter-steps
+# for tight spaces, in EVERY direction (fwd/back/strafe/rotate). The SDK has NO
+# stride/cadence knob -- lowering vx only lowers the gait CADENCE, not the step SIZE.
+# The pacer chops the held velocity intent into a short ON burst + a long OFF settle
+# so the onboard planner takes ONE short, fully-settled step per burst.
+#
+# WHERE: command_loop runs  intent -> shaper.normalize -> pacer.modulate -> guard.apply
+#        -> shaper.shape. The pacer is UPSTREAM of the guard so the obstacle hard-stop
+#        always wins; it NEVER sets the shaper bypass, so each square pulse edge is
+#        jerk/accel-limited into an executable trapezoid.
+# STRIDE is the SHAPED distance integral (area under the trapezoid), NOT the commanded
+#        peak -- so mag_frac is only the commanded fraction; the realized step is
+#        smaller. TUNE on the gantry by MEASURED odom displacement per pulse.
+# off_s is the single most SAFETY-CRITICAL param: it is the foot-plant/settle window.
+#        Keep it LONG (>= one full plant, the robot must reach double-stance) and
+#        shorten ONLY after gantry validation shows no stumble. Combined motion
+#        (diagonal / translate+turn) uses the MAX on_s/off_s of the demanded axes.
+# DEFAULT mode is 'continuous' = today's analog walking, UNCHANGED, until the operator
+#        selects Small/Medium in the dashboard. distance_quantize and swing_height are
+#        OFF/null until validated on the real robot.
+step:
+  enabled: true            # master kill-switch: false = pacer is an unconditional no-op
+  default_mode: continuous # startup mode; MUST be 'continuous' (== pass-through, today's behaviour)
+  distance_quantize: false # OPTIONAL: terminate ON on MEASURED odom displacement (per-mode target).
+                           # OFF until gantry-validated; auto-falls-back to time when odom is stale.
+  drive_timeout_s: 1.5     # distance-mode backstop: the ON window can never hang open longer than this
+  idle_eps: 0.001          # |intent|>this on an axis == the operator is holding that direction
+  # SETTLE GATE: a burst only (re)starts once the SHAPER's realized velocity has fallen
+  # below these on every demanded axis (foot planted) -- off_s below is just the MINIMUM.
+  # This makes steps DISCRETE regardless of the shaper's accel/jerk gains and keeps a
+  # diagonal's axes phase-locked. off_max_s is the backstop so it can never hang.
+  settle_eps_lin: 0.03     # m/s   vx/vy "stopped" threshold for the settle gate
+  settle_eps_ang: 0.08     # rad/s vyaw "stopped" threshold
+  off_max_s: 2.0           # max OFF wait for settle before forcing the next burst
+  # Per-mode SWING HEIGHT (foot lift, m) via SET_SWING_HEIGHT.
+  # DISABLED (null): on THIS robot's firmware the SET_SWING_HEIGHT RPC HANGS (it logged
+  # nothing and never returned), and because the command client is shared a hung call
+  # disrupts the velocity RPCs -> the robot walks strangely / won't go straight or
+  # backward. So swing-height shuffle is OFF; the per-mode swing_height values below are
+  # ignored while this is null, and Normal/Medium use the robot's NATIVE foot lift
+  # (untouched). Re-enable (set a value) only if a firmware update makes api 7103 respond.
+  swing_height_normal: null  # null = feature OFF (api hangs on this robot)
+  # mag_frac = the BURST VELOCITY (fraction of the axis cap). It MUST exceed the robot's
+  # minimum stepping speed or the controller just sways in place = a STALL, not a small
+  # step. THIS is the knob to RAISE if a mode stalls. on_s lets the jerk-limited shaper
+  # ramp into the stepping range; lower on_s -> smaller (but slower-moving) step. The
+  # smallest reliable velocity-pulsed step is ~0.2 m (V_min_step * one step period), so
+  # "small" is ~0.2 m, not 0.1. Strafe (vy) is slower so it needs a HIGHER frac. off_s is
+  # only the settle minimum (the gate extends it). TUNE on the gantry; these are starting
+  # points biased toward "actually steps", not toward a tiny stride.
+  small:                   # smallest discrete steps for tight maneuvering
+    # The realized burst peak is ACCEL-limited by on_s (mag is above the cap), so on_s sets
+    # the step speed. on_s 0.44 (~0.34 m/s) was TOO SLOW -> half-step + rock back to
+    # rebalance. on_s 0.50 (~0.44 m/s) completes the weight transfer CLEANLY (confirmed).
+    # That is about the floor for a clean velocity-pulsed step. To go FASTER raise on_s a
+    # touch (0.52-0.55); if it ever half-steps again, raise on_s, do NOT lower it.
+    vx:   { mag_frac: 0.48, on_s: 0.54, off_s: 0.45, target: 0.22 }  # fwd/back ~0.50 m/s (faster+snappier so the step completes; low swing keeps it short)
+    vy:   { mag_frac: 0.62, on_s: 0.55, off_s: 0.50, target: 0.16 }  # strafe (slower axis -> higher frac)
+    vyaw: { mag_frac: 0.65, on_s: 0.42, off_s: 0.44, target: 0.22 }  # rotate: ~1.1 rad/s rate (clears the no-pivot threshold)
+    swing_height: 0.06     # SHUFFLE: lower foot lift than normal (0.10) so a smaller step
+                           # completes cleanly. Raise toward 0.10 if it toe-scuffs; this is
+                           # the lever for going below the ~0.29 m velocity floor.
+  medium:                  # discrete medium steps
+    vx:   { mag_frac: 0.55, on_s: 0.60, off_s: 0.45, target: 0.35 }  # ~0.6 m/s burst
+    vy:   { mag_frac: 0.75, on_s: 0.60, off_s: 0.50, target: 0.28 }
+    vyaw: { mag_frac: 0.95, on_s: 0.46, off_s: 0.42, target: 0.35 }  # rotate: ~1.5 rad/s rate
+    swing_height: null
+  # phase_sync: reserved future v3 toggle (gait-phase-synchronized bursts). GET_PHASE is
+  #             deprecated/unwrapped on G1 -> stays OFF; documented only, not wired in v1.
+
 camera:
   stream_hz: 25          # head-camera FPS (1080p ~121KB/frame). 30 = smoother but
                          # ~3.6 MB/s of WiFi; lower to 15 if the feed lags.

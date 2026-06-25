@@ -21,6 +21,7 @@
   let send = function () {};        // controller.js hands us the real one in init()
   let enabled = false;              // mirrors the guard's operator toggle
   let booted = false;               // panel built yet?
+  let lastMsg = null;               // last telemetry, for an on-demand radar redraw
 
   // --- elements we update from handle() (filled in by build()) -------------
   const el = {};
@@ -125,10 +126,6 @@
   .obs-gap .block { color: var(--stop, #FF4747); }
 
   .obs-muted { color: var(--steel-dim, #7E879B); }
-
-  .obs-radar-wrap { display: flex; justify-content: center; padding: 4px 0; }
-  .obs-radar { width: 180px; height: 180px; background: var(--inset, #0C1019);
-    border: 1px solid var(--line, #232C3E); border-radius: 10px; }
   `;
 
   function injectStyle() {
@@ -166,10 +163,16 @@
     el.recBtn = makeBtn("obs-btn sub", "Search recovery", () => {
       send({ type: "obstacle", action: "recovery", on: !btnOn(el.recBtn) });
     });
+    // Depth fusion is independent of the motion guard (toggle it to VALIDATE the D435i
+    // near-ground reading even with the guard off) -- so it is never greyed out.
+    el.depthBtn = makeBtn("obs-btn sub", "Depth fusion (D435i)", () => {
+      send({ type: "obstacle", action: "depth_fusion", on: !btnOn(el.depthBtn) });
+    });
 
     toggles.appendChild(el.primary);
     toggles.appendChild(el.gapBtn);
     toggles.appendChild(el.recBtn);
+    toggles.appendChild(el.depthBtn);
     root.appendChild(toggles);
 
     // Readouts.
@@ -178,6 +181,10 @@
 
     el.front = mkReadout(ro, "front", '<span class="obs-val obs-muted">--</span>');
     el.front = el.front.querySelector(".obs-val");
+
+    // Depth fusion (D435i) near-ground reading -- the validation readout.
+    el.depth = mkReadout(ro, "depth (D435i)", '<span class="obs-val obs-muted">off</span>');
+    el.depth = el.depth.querySelector(".obs-val");
 
     // Zone chip.
     const zoneRow = mkRow(ro, "zone");
@@ -219,18 +226,9 @@
     el.gap.textContent = "gap: --";
     root.appendChild(el.gap);
 
-    // 2D polar radar (full 360 deg ring). DPR-aware backing store, sized once.
-    const radarWrap = document.createElement("div");
-    radarWrap.className = "obs-radar-wrap";
-    el.radar = document.createElement("canvas");
-    el.radar.className = "obs-radar";
-    const DPR = Math.min(window.devicePixelRatio || 1, 2);
-    el.radar.width = 180 * DPR;
-    el.radar.height = 180 * DPR;
-    el.radarCtx = el.radar.getContext("2d");
-    el.radarCtx.scale(DPR, DPR);          // draw in CSS pixels thereafter
-    radarWrap.appendChild(el.radar);
-    root.appendChild(radarWrap);
+    // No in-panel visualizations: the 2D ring and 3D sphere live in the top-right
+    // LiDAR window's feed toggle (drawn big into #bigRadar / #bigSphere). The panel
+    // still feeds those big views via drawRadar() + Obstacle3D.update() in render().
 
     setEnabledVisual(false);
   }
@@ -296,23 +294,24 @@
     return RC.clear;
   }
 
-  function drawRadar(msg) {
-    const ctx = el.radarCtx;
-    if (!ctx) return;
-    const cx = RADAR_SIZE / 2, cy = RADAR_SIZE / 2;
-    ctx.clearRect(0, 0, RADAR_SIZE, RADAR_SIZE);
+  // Draw the polar radar into a 2D context, centred in a `size`-CSS-px square.
+  // Frame-agnostic so the same routine fills the small panel canvas AND the big
+  // top-right feed canvas (just a different size).
+  function drawRadarGeom(ctx, size, msg) {
+    const cx = size / 2, cy = size / 2, R = (size / 2) * 0.9;
+    ctx.clearRect(0, 0, size, size);
 
     // concentric range rings at stop / slow / max.
     ctx.strokeStyle = RC.grid; ctx.lineWidth = 1;
     [Z_STOP, Z_SLOW, RADAR_RANGE_M].forEach((rm) => {
       ctx.beginPath();
-      ctx.arc(cx, cy, RADAR_R * Math.min(1, rm / RADAR_RANGE_M), 0, Math.PI * 2);
+      ctx.arc(cx, cy, R * Math.min(1, rm / RADAR_RANGE_M), 0, Math.PI * 2);
       ctx.stroke();
     });
     // forward crosshair (up = +X forward).
-    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - RADAR_R); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - R); ctx.stroke();
 
-    const ring = msg.ring;
+    const ring = msg && msg.ring;
     if (ring && Array.isArray(ring.dist)) {
       const n = ring.dist.length;
       const binRad = (ring.bin_deg * Math.PI) / 180;
@@ -322,7 +321,7 @@
         if (!col) continue;                   // clear/empty sector
         const cDeg = ring.start_deg + (i + 0.5) * ring.bin_deg;
         const cRad = (cDeg * Math.PI) / 180;
-        const r = RADAR_R * Math.min(1, d / RADAR_RANGE_M);
+        const r = R * Math.min(1, d / RADAR_RANGE_M);
         const a0 = cRad - binRad / 2, a1 = cRad + binRad / 2;
         // robot frame (x fwd, y left) -> screen (canvas y is DOWN):
         //   screenX = cx - r*sin(angle)  (+left -> screen-left)
@@ -338,15 +337,41 @@
       ctx.globalAlpha = 1;
     } else {
       ctx.fillStyle = RC.dim;
-      ctx.font = "11px sans-serif";
+      ctx.font = Math.max(11, Math.round(size / 16)) + "px sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("no ring data", cx, cy);
     }
   }
 
+  // Size a canvas backing store to its CSS box (DPR-aware) and draw the radar,
+  // centred within a possibly-wide box. Skips hidden (display:none) canvases.
+  function drawRadarInto(canvas, msg) {
+    if (!canvas) return;
+    const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+    if (!cssW || !cssH) return;               // not laid out / hidden
+    const size = Math.min(cssW, cssH);
+    const DPR = Math.min(window.devicePixelRatio || 1, 2);
+    const needW = Math.round(cssW * DPR), needH = Math.round(cssH * DPR);
+    if (canvas.width !== needW || canvas.height !== needH) {
+      canvas.width = needW; canvas.height = needH;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(DPR, 0, 0, DPR,
+      ((cssW - size) / 2) * DPR, ((cssH - size) / 2) * DPR);
+    drawRadarGeom(ctx, size, msg);
+  }
+
+  function drawRadar(msg) {
+    // Small in-panel radar was removed; only the big top-right feed draws now (and
+    // only while it's the active feed — el.bigRadar is null otherwise).
+    if (el.bigRadar) drawRadarInto(el.bigRadar, msg);
+  }
+
   function render(msg) {
     if (!booted) build();
     if (!booted) return;   // panel container not in the DOM (shouldn't happen)
+
+    lastMsg = msg;         // remembered so a feed-toggle can redraw immediately
 
     const mode = msg.mode || "DISABLED";
     const live = msg.live === undefined ? true : !!msg.live;
@@ -361,6 +386,26 @@
     // Sub-toggle states.
     if (msg.gap_follow !== undefined) el.gapBtn.classList.toggle("on", !!msg.gap_follow);
     if (msg.recovery   !== undefined) el.recBtn.classList.toggle("on", !!msg.recovery);
+
+    // Depth fusion (D435i): toggle state + the validation readout (distance + pts).
+    const depth = msg.depth;
+    if (depth && el.depthBtn) {
+      el.depthBtn.classList.toggle("on", !!depth.enabled);
+      if (el.depth) {
+        if (!depth.enabled) {
+          el.depth.textContent = "off";
+          el.depth.classList.add("obs-muted");
+        } else if (num(depth.front_near_m)) {
+          el.depth.textContent = depth.front_near_m.toFixed(2) + " m ("
+            + (depth.n_near || 0) + " pts)";
+          el.depth.classList.remove("obs-muted");
+        } else {
+          el.depth.textContent = (depth.live ? "clear" : "no depth") + " ("
+            + (depth.n_near || 0) + " pts)";
+          el.depth.classList.add("obs-muted");
+        }
+      }
+    }
 
     // --- banner priority: FAULT > auto_disabled > no-data > starting > none ---
     const b = el.banner;
@@ -438,6 +483,13 @@
     handle: function (msg) {
       if (!msg || typeof msg !== "object") return;
       try { render(msg); } catch (e) { /* defensive: never break the WS loop */ }
+    },
+    // Register (or clear with null) a big radar canvas for the top-right feed view.
+    // The small panel radar always draws; this mirrors it onto the big canvas and
+    // redraws the last frame immediately so the toggle feels instant.
+    setBigRadar: function (canvas) {
+      el.bigRadar = canvas || null;
+      if (el.bigRadar) { try { drawRadarInto(el.bigRadar, lastMsg); } catch (e) {} }
     },
   };
 

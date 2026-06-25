@@ -128,6 +128,10 @@ class ObstacleGuard:
         self._pred_front = None        # dead-reckoned front distance while in the blind zone (None = inactive)
         self._pred_age = 0.0           # seconds we've been creeping forward on the estimate
         self._last_vx_cmd = 0.0        # forward speed actually applied last cycle (for dead-reckoning)
+        # Optional D435i near-ground depth fusion: a callable returning the nearest
+        # forward near-ground obstacle distance (m) or None. Set by the dashboard from
+        # DepthNearField; mixed into front_eff so low things the Mid-360 missed brake too.
+        self._depth_fn = None
         # After the guard auto-disables itself (perception fault), latch forward at 0
         # until the operator RELEASES the forward command -- so a held W doesn't lurch
         # the robot blind through whatever stopped it the instant control hands back.
@@ -332,6 +336,11 @@ class ObstacleGuard:
         self._pred_age = 0.0
         self._last_vx_cmd = 0.0
 
+    def set_depth_source(self, fn):
+        """Register a callable -> nearest forward near-ground depth distance (m) or
+        None (D435i fusion). apply() mixes it into front_eff. Pass None to clear."""
+        self._depth_fn = fn if callable(fn) else None
+
     def set_gap_follow(self, on):
         self.gap_follow = bool(on)
 
@@ -371,14 +380,24 @@ class ObstacleGuard:
     # CONTRACT 3: apply()
     # -----------------------------------------------------------------
 
-    def apply(self, desired):
+    def apply(self, desired, held=None):
         """Govern a commanded velocity. Non-blocking, thread-safe, ~30 Hz.
 
         desired = (vx, vy, vyaw): vx>0 forward, vy>0 left, vyaw>0 left/CCW.
-        Returns a possibly-modified (vx, vy, vyaw), re-clamped to the __init__
-        limits. See CONTRACT 3 for the full state machine + stage ordering.
+        held = the OPERATOR's pre-pacer held intent (or None == use desired). The
+        blind-zone predictor keys its "is the operator still pushing forward?" release
+        on held[0], NOT the (possibly step-pacer-pulsed) desired[0] -- otherwise a
+        step mode's OFF window looks like a forward release and the predictor drops the
+        phantom wall every pulse, defeating the blind-zone stop. Returns a possibly-
+        modified (vx, vy, vyaw), re-clamped to the __init__ limits.
         """
         vx, vy, vyaw = float(desired[0]), float(desired[1]), float(desired[2])
+        # Operator's true held-forward intent (pre-pacer); falls back to desired so a
+        # caller that does not pass held behaves exactly as before.
+        try:
+            held_fwd = float(held[0]) if held is not None else vx
+        except (TypeError, IndexError, ValueError):
+            held_fwd = vx
         self._hard = [False, False, False]   # reset; set True only on an emergency zero
 
         # --- Pass-through when disabled (but still keep the cache warm) ---
@@ -471,8 +490,20 @@ class ObstacleGuard:
         if self.predict_blind and self._pred_front is not None:
             front_eff = (self._pred_front if front_eff is None
                          else min(front_eff, self._pred_front))
-        if self.predict_blind and front_raw is None and self._pred_front is not None:
-            # ease forward speed down on the remembered wall as if we still saw it
+        # D435i near-ground depth fusion: nearest forward obstacle the up-looking
+        # Mid-360 missed (low things ~0.5-2 m ahead). Mixed in as another min so it
+        # eases + hard-stops exactly like a lidar return. None when OFF / too few pts.
+        if self._depth_fn is not None:
+            try:
+                dn = self._depth_fn()
+            except Exception:
+                dn = None
+            if dn is not None:
+                front_eff = dn if front_eff is None else min(front_eff, dn)
+        # Ease the forward scale on front_eff whenever it is closer than the live wedge
+        # reading drove scale_front -- i.e. the blind-zone predictor OR the depth fusion
+        # sees something nearer. (A no-op when front_eff == the live front reading.)
+        if front_eff is not None:
             scale_front = min(scale_front, self._front_scale(front_eff))
 
         # --- choose gating path: ring (360 travel-direction) or legacy 4-wedge ---
@@ -589,8 +620,15 @@ class ObstacleGuard:
                 # KEEP the stop (a grazing below-FOV obstacle may still be there -- safety
                 # over liveness). The instant they release, the phantom clears, so a
                 # crossed/departed obstacle resumes immediately on the next press -- no
-                # 4 s wait. A long-stale estimate is also dropped as a backstop.
-                if self._pred_front <= 0.0 or desired[0] <= 0.05:
+                # 4 s wait. A long-stale estimate is also dropped as a backstop:
+                # predict_timeout_s caps how long a phantom may freeze the robot even
+                # while forward is HELD. Without it, once the phantom dead-reckons below
+                # stop_at the robot stops, last_vx -> 0 so the estimate stops decreasing
+                # and never reaches 0 -- a permanent forward latch in an already-clear
+                # area. After the timeout we drop it and let the ring re-seed if the
+                # obstacle is genuinely still there.
+                if (self._pred_front <= 0.0 or held_fwd <= 0.05
+                        or self._pred_age > self.predict_timeout_s):
                     self._pred_front = None
                     self._pred_age = 0.0
 
@@ -791,6 +829,7 @@ class ObstacleGuard:
             }
             profile = []
             ring = None
+            points = []
         else:
             front_m = self._num(data.get("front_m"))
             front_filt_m = self._num(data.get("front_filt_m"))
@@ -802,6 +841,8 @@ class ObstacleGuard:
             right_filt_m = self._num(data.get("right_filt_m"))
             profile = data.get("profile") or []
             ring = data.get("ring")
+            pts = data.get("points")
+            points = pts if isinstance(pts, list) else []
             zone = data.get("zone", "CLEAR")
 
             def _tscale(key, fallback=None):
@@ -861,6 +902,7 @@ class ObstacleGuard:
             "gap": gap,
             "profile": profile,
             "ring": ring,
+            "points": points,
             "fault": self.mode == "FAULT",
             "auto_disabled": bool(self.auto_disabled),
             "live": bool(live),

@@ -98,9 +98,11 @@
       pollTracks(); pollStatus();
       tracksTimer = setInterval(pollTracks, 80);   // ~12 Hz, matches the pose service
       statusTimer = setInterval(pollStatus, 3000);
+      if (window.HandsOverlay) window.HandsOverlay.start();   // fingers ride the Skeleton toggle
     } else {
       clearInterval(tracksTimer); tracksTimer = null;
       clearInterval(statusTimer); statusTimer = null;
+      if (window.HandsOverlay) window.HandsOverlay.stop();
     }
   }
 

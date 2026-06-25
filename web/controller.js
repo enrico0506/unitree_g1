@@ -3,7 +3,7 @@
 // Velocity caps -- defaults; overwritten by the server's "config" message
 // (sourced from config/robot.yaml) as soon as the WebSocket connects.
 let MAX_VX = 1.5;
-let MAX_VY = 1;
+let MAX_VY = 0.7;   // match config/robot.yaml max_vy so the ellipse readout is right pre-config
 let MAX_VYAW = 2.0;
 let SLOW_SCALE = 0.4;
 
@@ -59,6 +59,8 @@ function connect() {
     setInfo("infoConn", "connected");
     logEvent("connected to robot", "ok");
     if (window.Obstacle) window.Obstacle.init(send);
+    if (window.StepMode) window.StepMode.init(send);
+    if (window.DriveMode) window.DriveMode.init();
   };
 
   ws.onmessage = (event) => {
@@ -67,16 +69,24 @@ function connect() {
       if (msg.type === "fsm_state") updateFsmState(msg);
       else if (msg.type === "config") applyConfig(msg);
       else if (msg.type === "map_status") updateMapStatus(msg);
-      else if (msg.type === "telemetry") updateTelemetry(msg);
+      else if (msg.type === "telemetry") {
+        updateTelemetry(msg);
+        window.StepMode && window.StepMode.handle(msg);   // step_mode / step_estimated chip
+      }
+      else if (msg.type === "step_mode") window.StepMode && window.StepMode.handle(msg);
       else if (msg.type === "obstacle") {
         window.Obstacle && window.Obstacle.handle(msg);
         window.LidarOverlay && window.LidarOverlay.updateObstacle(msg);
+        window.Obstacle3D && window.Obstacle3D.update(msg);
       }
     } catch (e) { /* ignore */ }
   };
 
   ws.onclose = () => {
     connected = false;
+    // Zero held keys + recentre the thumbsticks so a still-held input can't
+    // re-assert a stale velocity the instant the socket reconnects.
+    clearAllHeld();
     statusEl.classList.remove("connected");
     statusText.textContent = "Disconnected — retrying...";
     setInfo("infoConn", "disconnected");
@@ -127,6 +137,11 @@ function applyConfig(msg) {
   if (window.Obstacle && msg.obstacle) {
     window.Obstacle.handle(Object.assign({ type: "obstacle" }, msg.obstacle));
   }
+
+  // Forward the initial step-size selector state ('Normal' on load by default).
+  if (window.StepMode && msg.step) {
+    window.StepMode.handle(Object.assign({ type: "step_mode" }, msg.step));
+  }
 }
 
 function fsmDisplay(id) {
@@ -136,6 +151,7 @@ function fsmDisplay(id) {
 }
 
 function updateFsmState(msg) {
+  const prevUiMode = uiMode;          // for rising-edge detection into walk
   uiMode = msg.ui_mode;
   fsmId  = msg.fsm_id;
   transitioning = !!msg.transitioning;
@@ -183,7 +199,14 @@ function updateFsmState(msg) {
     btn.classList.toggle("disabled", moveDisabled);
   });
 
-  if (moveDisabled) clearAllHeld();
+  if (moveDisabled) {
+    clearAllHeld();
+  } else if (prevUiMode !== "walk" && window.DriveMode && window.DriveMode.reset) {
+    // Rising edge INTO live walk (even if the server skipped a transitioning
+    // message): zero any thumbstick deflected during the change so the first
+    // 30 Hz tick can't fire a stale full-speed command.
+    window.DriveMode.reset();
+  }
 }
 
 function requestMode(name) {
@@ -228,6 +251,9 @@ function clearAllHeld() {
   document.querySelectorAll("button[data-hold]").forEach(btn => {
     btn.classList.remove("active");
   });
+  // Also recentre the analog thumbsticks so a held stick can't latch velocity
+  // through a Stop / mode change / disconnect.
+  if (window.DriveMode && window.DriveMode.reset) window.DriveMode.reset();
 }
 
 function refreshButtonVisual(action) {
@@ -246,6 +272,20 @@ function computeVelocity() {
   if (isHeld("d"))    vy -= MAX_VY * scale;
   if (isHeld("rotL")) vyaw += MAX_VYAW * scale;
   if (isHeld("rotR")) vyaw -= MAX_VYAW * scale;
+  // Analog thumbsticks (mobile mode): each axis is a fraction in [-1, 1] of its cap.
+  // axes() returns null in laptop mode, so the keyboard/D-pad stay authoritative.
+  const ax = window.DriveMode && window.DriveMode.axes && window.DriveMode.axes();
+  if (ax) {
+    vx   += MAX_VX   * scale * ax.fwd;
+    vy   += MAX_VY   * scale * ax.strafe;
+    vyaw += MAX_VYAW * scale * ax.turn;
+  }
+  // Combining a stick with a key could overshoot a single cap -> clamp each axis
+  // back to its limit before normalizing (the server clamps too; this keeps the
+  // on-screen readout honest).
+  vx   = Math.max(-MAX_VX,   Math.min(MAX_VX,   vx));
+  vy   = Math.max(-MAX_VY,   Math.min(MAX_VY,   vy));
+  vyaw = Math.max(-MAX_VYAW, Math.min(MAX_VYAW, vyaw));
   // Normalize a diagonal onto the speed ELLIPSE so W+A isn't faster than a straight
   // axis (the server re-normalizes too; doing it here keeps the on-screen readout honest).
   if (MAX_VX > 0 && MAX_VY > 0) {
@@ -320,7 +360,7 @@ document.addEventListener("keydown", (e) => {
     case "Digit2": requestMode("damp"); break;
     case "Digit3": requestMode("stand"); break;
     case "Digit4": requestMode("walk"); break;
-    case "Digit9": send({ type: "cmd", name: "wave" });   break;
+    case "Digit9": send({ type: "cmd", name: "high_wave" }); break;  // working "Wave" (old "wave" did nothing)
     case "Digit0": send({ type: "cmd", name: "shake" });  break;
   }
 });
@@ -410,6 +450,21 @@ document.querySelectorAll("button[data-cmd]").forEach(btn => {
     }
   });
 });
+
+// Gesture dropdown (header): choosing an item runs it immediately by clicking the
+// matching hidden data-cmd button -- so the arm-gating / Hands-Up toggle / logging
+// above is reused. We then reset the select back to the "Gesture…" placeholder so
+// the SAME gesture can be picked again (a change event only fires on a new value).
+const _gestureSelect = document.getElementById("gestureSelect");
+if (_gestureSelect) {
+  _gestureSelect.addEventListener("change", () => {
+    const name = _gestureSelect.value;
+    _gestureSelect.value = "";            // snap back to the placeholder label
+    if (!name) return;
+    const btn = document.querySelector(`.gesture-src button[data-cmd="${name}"]`);
+    if (btn) btn.click();
+  });
+}
 
 // =========================================================================
 // TAP BUTTONS (stop)

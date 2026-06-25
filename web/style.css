@@ -188,6 +188,35 @@ body[data-transitioning="1"] .live-flag { display: none; }
 .lidar-canvas { width: 100%; height: 100%; cursor: grab; }
 .lidar-canvas:active { cursor: grabbing; }
 .lidar-canvas canvas { display: block; }
+
+/* Feed-mode switcher (top-right LiDAR window): live cloud / 2D ring / 3D sphere.
+   Layers overlap #lidarView; the active one shows via the window's data-feed. */
+/* Floating segmented control, top-CENTRE, above the bars (z 3) so it never hides
+   behind the view-bar like it did docked in the title. */
+.feed-toggle {
+  position: absolute; top: 9px; left: 50%; transform: translateX(-50%); z-index: 3;
+  display: inline-flex; gap: 3px; padding: 3px; border-radius: 9px;
+  background: rgba(10,13,19,0.72); backdrop-filter: blur(8px); border: 1px solid var(--line);
+}
+.feed-toggle button {
+  pointer-events: auto; font-family: inherit; font-size: 12px; font-weight: 600;
+  letter-spacing: .02em; text-transform: none; padding: 5px 12px;
+  background: transparent; color: var(--steel);
+  border: 1px solid transparent; border-radius: 6px; cursor: pointer;
+}
+.feed-toggle button:hover { color: #fff; border-color: var(--focus); }
+.feed-toggle button.active { background: var(--focus); color: #fff; border-color: var(--focus); }
+
+.feed-layer { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1;
+  display: none; background: var(--inset, #0C1019); }
+.lidar-window[data-feed="radar"] #bigRadar { display: block; }
+.lidar-window[data-feed="sphere"] #bigSphere { display: block; }
+.lidar-window[data-feed="sphere"] #bigSphere canvas { display: block; width: 100%; height: 100%; }
+/* keep the cloud renderer alive but hidden behind the active obstacle layer */
+.lidar-window[data-feed="radar"] #lidarView,
+.lidar-window[data-feed="sphere"] #lidarView { visibility: hidden; }
+/* cloud-only overlays (nav pad / view bar / map bar / legend) hide off-cloud */
+.lidar-window:not([data-feed="cloud"]) .feed-cloud-only { display: none; }
 .orient-legend { position: absolute; left: 110px; bottom: 13px; z-index: 2; font-family: var(--font-data); font-size: 10px; color: var(--steel); background: rgba(10,13,19,0.66); backdrop-filter: blur(6px); padding: 3px 7px; border-radius: 6px; pointer-events: none; }
 
 /* Floating control clusters over the windows */
@@ -210,11 +239,14 @@ body[data-transitioning="1"] .live-flag { display: none; }
 .cam-bar button:hover { border-color: var(--focus); color: #fff; }
 .cam-bar button.active { background: var(--focus); color: #fff; border-color: var(--focus); font-weight: 600; }
 
-.map-bar { left: 9px; right: 9px; bottom: 9px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.map-bar button, .map-bar input, .map-bar select { padding: 6px 9px; font-size: 12px; font-family: var(--font-ui); background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
-.map-bar input { width: 100px; font-family: var(--font-data); }
+/* Mapping controls stacked as a narrow column down the RIGHT edge of the feed,
+   so the bottom of the window stays clear and the ground/cloud is visible. */
+.map-bar { top: 40px; left: 9px; right: auto; bottom: auto; width: 150px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+.map-bar button, .map-bar input, .map-bar select { width: 100%; padding: 7px 9px; font-size: 12px; font-family: var(--font-ui); background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
+.map-bar input { font-family: var(--font-data); }
 .map-bar #mapToggle.active { background: var(--stop); color: #fff; border-color: var(--stop); font-weight: 600; }
-.map-status { margin-left: auto; font-family: var(--font-data); font-size: 11px; color: var(--steel); }
+.map-status { font-family: var(--font-data); font-size: 11px; color: var(--steel); text-align: center; }
 .map-status.unsaved { color: var(--caution); }
 
 /* People / object label bars (overlay, bottom of camera window) */
@@ -269,6 +301,12 @@ main.diag { grid-template-columns: 1fr; }
 .mode-hint { margin: 12px 0 0; font-size: 12.5px; color: var(--steel); line-height: 1.55; }
 .mode-hint.warn { color: var(--caution); }
 
+/* Drive panel body: WASD + rotate fill the main area; the step-size selector is
+   stacked vertically down the right edge, inside the box. Wraps below on narrow. */
+.drive-body { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.drive-main { flex: 1 1 240px; min-width: 0; }
+.drive-body #step-panel { flex: 0 0 auto; }
+
 /* Drive pad */
 .dpad { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 58px); gap: 7px; max-width: 280px; margin: 0 auto 14px; }
 .dpad .up { grid-column: 2; grid-row: 1; } .dpad .left { grid-column: 1; grid-row: 2; }
@@ -278,6 +316,24 @@ main.diag { grid-template-columns: 1fr; }
 .rot { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-width: 280px; margin: 0 auto; }
 .stance { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-width: 280px; margin: 12px auto 0; }
 .posture { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 8px; }
+
+/* Gesture picker — a dropdown docked in the header between the modes and status.
+   Sized to the modebar scale; selecting an option runs the gesture immediately. */
+.gesture-select {
+  font-family: var(--font-ui); font-size: 12.5px; font-weight: 600;
+  color: var(--chalk); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 30px 8px 12px; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238A93A6' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat; background-position: right 10px center;
+  transition: border-color .15s, color .15s;
+}
+.gesture-select:hover { border-color: var(--focus); color: #fff; }
+.gesture-select:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+/* native option list follows the OS theme; force readable colours where supported */
+.gesture-select option { background: var(--surface-2); color: var(--chalk); }
+@media (pointer: coarse) { .gesture-select { min-height: 44px; } }
 
 /* ------------------------------------------------------------- generic button */
 button {
