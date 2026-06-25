@@ -125,6 +125,10 @@
   .obs-gap .block { color: var(--stop, #FF4747); }
 
   .obs-muted { color: var(--steel-dim, #7E879B); }
+
+  .obs-radar-wrap { display: flex; justify-content: center; padding: 4px 0; }
+  .obs-radar { width: 180px; height: 180px; background: var(--inset, #0C1019);
+    border: 1px solid var(--line, #232C3E); border-radius: 10px; }
   `;
 
   function injectStyle() {
@@ -215,6 +219,19 @@
     el.gap.textContent = "gap: --";
     root.appendChild(el.gap);
 
+    // 2D polar radar (full 360 deg ring). DPR-aware backing store, sized once.
+    const radarWrap = document.createElement("div");
+    radarWrap.className = "obs-radar-wrap";
+    el.radar = document.createElement("canvas");
+    el.radar.className = "obs-radar";
+    const DPR = Math.min(window.devicePixelRatio || 1, 2);
+    el.radar.width = 180 * DPR;
+    el.radar.height = 180 * DPR;
+    el.radarCtx = el.radar.getContext("2d");
+    el.radarCtx.scale(DPR, DPR);          // draw in CSS pixels thereafter
+    radarWrap.appendChild(el.radar);
+    root.appendChild(radarWrap);
+
     setEnabledVisual(false);
   }
 
@@ -265,6 +282,67 @@
   function num(v) { return (typeof v === "number" && isFinite(v)); }
 
   function fmtDist(v) { return num(v) ? v.toFixed(2) + " m" : "--"; }
+
+  const RADAR_SIZE = 180, RADAR_R = 80;       // CSS px; R leaves a margin
+  const Z_STOP = 0.7, Z_SLOW = 2.0;           // thresholds (match lidar.js)
+  const RADAR_RANGE_M = 3.0;
+  const RC = { stop: "#FF4747", slow: "#FF8636", clear: "#3FD39B",
+               grid: "#232C3E", dim: "#7E879B" };
+
+  function radarZoneColor(d) {
+    if (d == null) return null;               // empty sector -> not drawn
+    if (d < Z_STOP) return RC.stop;
+    if (d < Z_SLOW) return RC.slow;
+    return RC.clear;
+  }
+
+  function drawRadar(msg) {
+    const ctx = el.radarCtx;
+    if (!ctx) return;
+    const cx = RADAR_SIZE / 2, cy = RADAR_SIZE / 2;
+    ctx.clearRect(0, 0, RADAR_SIZE, RADAR_SIZE);
+
+    // concentric range rings at stop / slow / max.
+    ctx.strokeStyle = RC.grid; ctx.lineWidth = 1;
+    [Z_STOP, Z_SLOW, RADAR_RANGE_M].forEach((rm) => {
+      ctx.beginPath();
+      ctx.arc(cx, cy, RADAR_R * Math.min(1, rm / RADAR_RANGE_M), 0, Math.PI * 2);
+      ctx.stroke();
+    });
+    // forward crosshair (up = +X forward).
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - RADAR_R); ctx.stroke();
+
+    const ring = msg.ring;
+    if (ring && Array.isArray(ring.dist)) {
+      const n = ring.dist.length;
+      const binRad = (ring.bin_deg * Math.PI) / 180;
+      for (let i = 0; i < n; i++) {
+        const d = ring.dist[i];
+        const col = radarZoneColor(d);
+        if (!col) continue;                   // clear/empty sector
+        const cDeg = ring.start_deg + (i + 0.5) * ring.bin_deg;
+        const cRad = (cDeg * Math.PI) / 180;
+        const r = RADAR_R * Math.min(1, d / RADAR_RANGE_M);
+        const a0 = cRad - binRad / 2, a1 = cRad + binRad / 2;
+        // robot frame (x fwd, y left) -> screen (canvas y is DOWN):
+        //   screenX = cx - r*sin(angle)  (+left -> screen-left)
+        //   screenY = cy - r*cos(angle)  (+fwd  -> screen-up)
+        ctx.fillStyle = col; ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx - r * Math.sin(a0), cy - r * Math.cos(a0));
+        ctx.lineTo(cx - r * Math.sin(a1), cy - r * Math.cos(a1));
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = RC.dim;
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("no ring data", cx, cy);
+    }
+  }
 
   function render(msg) {
     if (!booted) build();
@@ -347,6 +425,8 @@
       el.gap.classList.add("obs-muted");
       el.gap.textContent = "gap: --";
     }
+
+    drawRadar(msg);
   }
 
   // -------------------------------------------------------------- public API

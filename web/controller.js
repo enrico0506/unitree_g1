@@ -246,6 +246,12 @@ function computeVelocity() {
   if (isHeld("d"))    vy -= MAX_VY * scale;
   if (isHeld("rotL")) vyaw += MAX_VYAW * scale;
   if (isHeld("rotR")) vyaw -= MAX_VYAW * scale;
+  // Normalize a diagonal onto the speed ELLIPSE so W+A isn't faster than a straight
+  // axis (the server re-normalizes too; doing it here keeps the on-screen readout honest).
+  if (MAX_VX > 0 && MAX_VY > 0) {
+    const m = (vx / MAX_VX) ** 2 + (vy / MAX_VY) ** 2;
+    if (m > 1) { const s = 1 / Math.sqrt(m); vx *= s; vy *= s; }
+  }
   return { vx, vy, vyaw };
 }
 

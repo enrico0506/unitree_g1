@@ -57,10 +57,14 @@ DEFAULTS = {
     "ground_clearance_m": 0.08,    # keep points sticking up MORE than this above the fitted floor
     "ground_band_m": 0.5,          # floor-candidate points are below sensor_height+this (plane fit)
     "ground_min_points": 80,       # need >= this many candidates to fit a plane (else assume level)
+    "floor_seed_percentile": 25.0, # robust floor fit: seed plane offset from this z-percentile (low=floor)
+    "floor_inlier_band_m": 0.12,   # robust floor fit: refit inliers within +/- this of the current plane
+    "floor_fit_iters": 3,          # robust floor fit: number of seed-then-refit iterations
     "obstacle_max_above_m": 1.9,   # cut points higher than this above the floor (ceiling/overhead)
     "self_front_m": 0.35,          # footprint self-mask: forward extent (covers leg swing)
     "self_back_m": 0.35,           # footprint self-mask: rearward extent
     "self_half_width_m": 0.30,     # footprint self-mask: half-width (covers the leg stance)
+    "self_mask_max_height_m": 0.6, # self-mask ONLY below this height above floor (legs/feet); overhead kept
     "min_cluster_points": 10,
     "filter_alpha": 0.25,
     "ease_scale": True,
@@ -76,6 +80,11 @@ DEFAULTS = {
     "front_sweep_deg": 60,
     "bin_size_deg": 5,
     "min_bin_points": 3,
+    "ring_bin_deg": 5.0,           # full-circle ring: 360/this = sector count
+    "ring_min_points": 3,          # points needed before a ring sector reads a distance
+    "tripwire_range_m": 1.6,       # NEAR-FIELD tripwire: a sector with >=tripwire_min_points within
+                                   #   this range reports the nearest one even below ring_min_points
+    "tripwire_min_points": 2,      # min returns inside tripwire_range to fire the near-field tripwire
     "robot_half_width_m": 0.25,
     "clearance_margin_m": 0.10,
     "gap_standoff_m": 0.9,
@@ -165,10 +174,14 @@ class ObstacleNode(Node):
         self.ground_clear = float(c["ground_clearance_m"])
         self.ground_band = float(c["ground_band_m"])
         self.ground_min_pts = max(3, int(c["ground_min_points"]))
+        self.floor_seed_pct = float(c.get("floor_seed_percentile", 25.0))
+        self.floor_inlier_band = float(c.get("floor_inlier_band_m", 0.12))
+        self.floor_fit_iters = max(1, int(c.get("floor_fit_iters", 3)))
         self.max_above = float(c["obstacle_max_above_m"])
         self.self_front = float(c["self_front_m"])
         self.self_back = float(c["self_back_m"])
         self.self_half_w = float(c["self_half_width_m"])
+        self.self_mask_max_h = float(c.get("self_mask_max_height_m", 0.6))
         self.k_cluster = max(1, int(c["min_cluster_points"]))
         self.alpha = float(c["filter_alpha"])
         self.ease = bool(c["ease_scale"])
@@ -177,6 +190,13 @@ class ObstacleNode(Node):
         self.sweep = float(c["front_sweep_deg"])
         self.bin_deg = float(c["bin_size_deg"])
         self.min_bin = max(1, int(c["min_bin_points"]))
+        # full-circle ring geometry (360 deg sectors, separate from the front sweep)
+        self.ring_bin_deg = float(c["ring_bin_deg"])
+        self.ring_min = max(1, int(c["ring_min_points"]))
+        self.tripwire_range = float(c.get("tripwire_range_m", 1.6))
+        self.tripwire_min = max(1, int(c.get("tripwire_min_points", 1)))
+        self.ring_n = max(1, int(round(360.0 / self.ring_bin_deg)))
+        self.ring_start_deg = -180.0   # bin 0 center = start + 0.5*bin_deg; shared by node + UI
         self.half_w = float(c["robot_half_width_m"])
         self.margin = float(c["clearance_margin_m"])
         self.standoff = float(c["gap_standoff_m"])
@@ -344,6 +364,9 @@ class ObstacleNode(Node):
         # ---- 5. Stage 8: depth profile + gap -------------------------------
         profile, gap = self._gap_math(ang, horiz, left_m, right_m)
 
+        # ---- 5b. full-circle 360 deg ring (additive; same kept-point arrays) -
+        ring_dist = self._ring_distances(ang, horiz)
+
         # ---- 6. write the contract -----------------------------------------
         self.seq += 1
         out = {
@@ -367,6 +390,12 @@ class ObstacleNode(Node):
             "side": {"left": left_m is not None, "right": right_m is not None},
             "gap": gap,
             "profile": profile,
+            "ring": {
+                "n": self.ring_n,
+                "bin_deg": self.ring_bin_deg,
+                "start_deg": self.ring_start_deg,
+                "dist": [_r(d) for d in ring_dist],
+            },
         }
         self._write_shm(out)
         self._print_status(n_raw, n_keep, front_m, left_m, right_m, back_m,
@@ -418,14 +447,61 @@ class ObstacleNode(Node):
         # np.partition puts the k-th smallest at index k-1 in O(n)
         return float(np.partition(dists, self.k_cluster - 1)[self.k_cluster - 1])
 
+    def _ring_distances(self, ang, horiz):
+        """Robust-nearest horizontal distance per full-circle sector.
+
+        Bins ALL kept points into self.ring_n sectors over [-180, 180) and takes
+        the ring_min-th smallest hypot per sector (robust to one noisy near
+        return), reusing the same np.partition idiom as the wedges / _gap_math.
+        Returns a length-ring_n list, distance (m) or None per sector. Sector i
+        center angle = ring_start_deg + (i + 0.5) * ring_bin_deg, same sign
+        convention as everything else (atan2(y, x): 0=ahead, +=LEFT, -=RIGHT).
+        """
+        dist = [None] * self.ring_n
+        if len(ang) == 0:
+            return dist
+        idx = np.floor((ang - self.ring_start_deg) / self.ring_bin_deg).astype(np.int64)
+        idx %= self.ring_n                  # wrap the atan2 +180 edge (-> bin 0)
+        for b in range(self.ring_n):
+            d = horiz[idx == b]
+            val = None
+            if len(d) >= self.ring_min:
+                # robust k-th-smallest: rejects 1-2 lone noisy near returns.
+                val = float(np.partition(d, self.ring_min - 1)[self.ring_min - 1])
+            # NEAR-FIELD TRIPWIRE: ALWAYS also take the nearest of any cluster of
+            # >=tripwire_min returns within tripwire_range, and report the CLOSER of the
+            # two. This catches (a) a wide+sparse obstacle giving <ring_min returns
+            # (taut cable, barrier tape, thin railing) AND (b) a near hazard sharing a
+            # sector with a FARTHER dense surface -- the k-th-smallest would otherwise
+            # mask the near points behind the farther crowd (monotonicity bug). Range-
+            # gated to near-field so far noisy returns don't add false positives;
+            # tripwire_min=2 keeps lone floor-noise spikes from tripping it.
+            near = d[d <= self.tripwire_range]
+            if len(near) >= self.tripwire_min:
+                nm = float(near.min())
+                val = nm if val is None else min(val, nm)
+            dist[b] = val
+        return dist
+
     def _fit_floor(self, x, y, z):
         """Robustly fit a floor plane z = a*x + b*y + c to the candidate points.
 
-        Returns (a, b, c). Floor candidates are the points the caller already
-        selected (low z, in range). Fits once via least squares, then does ONE
-        light refit dropping points whose residual > 0.15 m. If the fit is
-        degenerate, NaN, or implausibly tilted/offset, falls back to a level
-        floor (a=b=0, c=-sensor_height_m) so a bad fit can never invent or hide
+        Returns (a, b, c). The floor is the LOWEST surface, so a plain (unweighted)
+        least-squares fit over all low candidates is dangerous: a dense flat surface
+        only just ABOVE the floor (a low overhang / table underside that slipped into
+        the candidate band) drags the fitted plane UP and tilts it, after which the
+        ground cut deletes the very surface that should have been flagged as a hazard
+        (BUG 1). We therefore fit ROBUSTLY toward the lowest points:
+
+          1) Seed the offset from a LOW percentile of z (the floor, not the overhang).
+          2) Iterate: keep only points within a thin band ABOVE the current plane and
+             at/below it (reject points clearly above -- those belong to the overhang
+             or to real obstacles, never to the floor), then refit. A competing
+             surface above the floor is rejected after the first iteration instead of
+             capturing the plane.
+
+        If the fit is degenerate, NaN, or implausibly tilted/offset, falls back to a
+        level floor (a=b=0, c=-sensor_height_m) so a bad fit can never invent or hide
         a floor that clips real obstacles.
         """
         level = (0.0, 0.0, -self.sensor_h)
@@ -438,11 +514,18 @@ class ObstacleNode(Node):
             return float(sol[0]), float(sol[1]), float(sol[2])
 
         try:
-            a, b, c = lstsq_fit(x, y, z)
-            # one robustification pass: drop big-residual candidates and refit
-            resid = np.abs(z - (a * x + b * y + c))
-            inl = resid <= 0.15
-            if int(inl.sum()) >= self.ground_min_pts:
+            # --- seed from the LOWEST points so an overhang can't own the plane ---
+            # Start level, anchored to a low percentile of z (robust floor height).
+            a, b, c = 0.0, 0.0, float(np.percentile(z, self.floor_seed_pct))
+            # Iteratively refit only over points near/below the current plane: keep
+            # residuals in (-band, +band) but ASYMMETRICALLY reject points clearly
+            # above (they are overhang/obstacle, not floor).
+            band = self.floor_inlier_band
+            for _ in range(self.floor_fit_iters):
+                resid = z - (a * x + b * y + c)
+                inl = (resid > -band) & (resid < band)
+                if int(inl.sum()) < self.ground_min_pts:
+                    break
                 a, b, c = lstsq_fit(x[inl], y[inl], z[inl])
         except (np.linalg.LinAlgError, ValueError):
             return level
@@ -480,10 +563,14 @@ class ObstacleNode(Node):
         above = z - (a * x + b * y + c)   # height of each point above the floor
         keep_ground = (above > self.ground_clear) & (above < self.max_above)
 
-        # robot footprint self-mask: a box around the base (NOT a height cut).
+        # robot footprint self-mask: a box around the base. HEIGHT-LIMITED so it only
+        # swallows LOW returns (the robot's own legs/feet) -- a real obstacle at
+        # chest/head height directly above the footprint column (height above floor
+        # >= self_mask_max_h) is a genuine overhead hazard and is KEPT (BUG 2).
         in_self = (
             (x > -self.self_back) & (x < self.self_front)
             & (np.abs(y) < self.self_half_w)
+            & (above < self.self_mask_max_h)
         )
         return in_range & keep_ground & (~in_self)
 
@@ -612,10 +699,12 @@ class ObstacleNode(Node):
         turn_factor = 1.0 + frac * (self.turn_min - 1.0)
 
         # centering strafe: a null side counts as the full range (open), so we
-        # drift away from the nearer wall. + = left.
+        # drift AWAY from the nearer wall. + = left. With left nearer (l_eff small),
+        # we want to move RIGHT (vy_cmd < 0) -> (l_eff - r_eff), NOT (r_eff - l_eff)
+        # which steered TOWARD the near wall.
         l_eff = left_m if left_m is not None else self.range_m
         r_eff = right_m if right_m is not None else self.range_m
-        vy_cmd = clamp(self.center_gain * (r_eff - l_eff), -self.max_vy, self.max_vy)
+        vy_cmd = clamp(self.center_gain * (l_eff - r_eff), -self.max_vy, self.max_vy)
 
         gap = {
             "state": state,

@@ -323,15 +323,20 @@ function updateObstacle(msg) {
 
   // --- (B) profile fan + nearest obstacle ---------------------------------
   emptyGroup(profileLines);
-  const prof = Array.isArray(msg.profile) ? msg.profile : [];
-  const N = prof.length;
-  let near = null, nearAng = 0;         // nearest sensed bin (for the ring)
+  const ring = msg.ring;
+  let dists, N, angOf;
+  if (ring && Array.isArray(ring.dist)) {
+    dists = ring.dist; N = dists.length;
+    angOf = (i) => (ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI / 180;
+  } else {                                  // legacy front-only fan
+    dists = Array.isArray(msg.profile) ? msg.profile : []; N = dists.length;
+    angOf = (i) => (60 - (i + 0.5) * (120 / N)) * Math.PI / 180;
+  }
+  let near = null, nearAng = 0;
   for (let i = 0; i < N; i++) {
-    const d = prof[i];
+    const d = dists[i];
     if (d == null) continue;
-    // Bin i CENTRE ANGLE (deg), LEFT -> RIGHT across +/- 60 deg:
-    //   angDeg = 60 - (i + 0.5) * (120 / N)
-    const a = (60 - (i + 0.5) * (120 / N)) * Math.PI / 180;
+    const a = angOf(i);
     const ex = d * Math.cos(a), ey = d * Math.sin(a);
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(

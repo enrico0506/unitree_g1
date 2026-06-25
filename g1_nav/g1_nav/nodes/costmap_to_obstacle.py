@@ -97,6 +97,10 @@ DEFAULTS = {
     "tight_open_m": 1.2,
     "tight_min": 0.7,
     "min_cluster_points": 10,   # k for the robust k-th-nearest cell pick
+    "ring_bin_deg": 5.0,        # full-circle ring: 360/this = sector count
+    "ring_min_cells": 1,        # one lethal cell already = a real sector (cells are pre-filtered);
+                                # OWN key (not the lidar node's ring_min_points) so the min-fallback
+                                # philosophy stays independent between the two backends.
 }
 
 # Frames + topics (parameters so the launch can override without code edits).
@@ -153,6 +157,11 @@ class CostmapToObstacle(Node):
         self.tight_open = float(c["tight_open_m"])
         self.tight_min = float(c["tight_min"])
         self.k_cluster = max(1, int(c["min_cluster_points"]))
+        # full-circle ring geometry (additive; mirrors obstacle_node.py's contract)
+        self.ring_bin_deg = float(c["ring_bin_deg"])
+        self.ring_min = max(1, int(c["ring_min_cells"]))
+        self.ring_n = max(1, int(round(360.0 / self.ring_bin_deg)))
+        self.ring_start_deg = -180.0
 
         # --- frames / topic (overridable params) ------------------------------
         self.global_frame = str(
@@ -244,8 +253,8 @@ class CostmapToObstacle(Node):
             self._write_clear()
             return
 
-        front_m, back_m, left_m, right_m = self._directional_nearest(grid, pose)
-        self._write_frame(front_m, back_m, left_m, right_m)
+        front_m, back_m, left_m, right_m, ring = self._directional_nearest(grid, pose)
+        self._write_frame(front_m, back_m, left_m, right_m, ring)
 
     # ----------------------------------------------------- costmap -> distances
     def _directional_nearest(self, grid, pose):
@@ -255,9 +264,10 @@ class CostmapToObstacle(Node):
         -yaw about the robot, translate by -robot_xy), keep those within
         obstacle_range_m, bin by atan2(ry, rx) into the four ~+/-45 deg wedges, and
         take the robust k-th-smallest hypot per wedge (or plain min when a wedge has
-        fewer than k cells). Returns (front, back, left, right) metres or None.
-        Sign convention matches the contract: x fwd, +y LEFT (front=+x, left=+y,
-        right=-y, back=-x).
+        fewer than k cells). Returns (front, back, left, right, ring) -- the four
+        wedge distances (metres or None) plus the full-circle sector ring (a length
+        ring_n list, metres or None per sector). Sign convention matches the
+        contract: x fwd, +y LEFT (front=+x, left=+y, right=-y, back=-x).
         """
         info = grid.info
         res = float(info.resolution)
@@ -266,16 +276,16 @@ class CostmapToObstacle(Node):
         ox = float(info.origin.position.x)
         oy = float(info.origin.position.y)
         if res <= 0.0 or w == 0 or h == 0:
-            return None, None, None, None
+            return None, None, None, None, self._empty_ring()
 
         data = np.asarray(grid.data, dtype=np.int16)
         if data.size != w * h:
-            return None, None, None, None
+            return None, None, None, None, self._empty_ring()
 
         # indices of lethal cells
         lethal_idx = np.nonzero(data >= self.lethal)[0]
         if lethal_idx.size == 0:
-            return None, None, None, None
+            return None, None, None, None, self._empty_ring()
 
         # cell (row, col) -> world centre (x, y) in the global (costmap) frame
         col = (lethal_idx % w).astype(np.float64)
@@ -296,7 +306,7 @@ class CostmapToObstacle(Node):
         dist = np.hypot(rx, ry)
         in_range = dist <= self.range_m
         if not np.any(in_range):
-            return None, None, None, None
+            return None, None, None, None, self._empty_ring()
         rx = rx[in_range]
         ry = ry[in_range]
         dist = dist[in_range]
@@ -306,7 +316,8 @@ class CostmapToObstacle(Node):
         left = self._robust_nearest(dist[(ang >= 45.0) & (ang < 135.0)])
         right = self._robust_nearest(dist[(ang <= -45.0) & (ang > -135.0)])
         back = self._robust_nearest(dist[np.abs(ang) >= 135.0])
-        return front, back, left, right
+        ring = self._ring_distances(ang, dist)
+        return front, back, left, right, ring
 
     def _robust_nearest(self, dists):
         """The k-th smallest distance (k = min_cluster_points) for robustness, or
@@ -322,6 +333,33 @@ class CostmapToObstacle(Node):
         if n < self.k_cluster:
             return float(np.min(dists))
         return float(np.partition(dists, self.k_cluster - 1)[self.k_cluster - 1])
+
+    def _ring_distances(self, ang, dist):
+        """Robust-nearest LETHAL-cell distance per full-circle sector (robot frame).
+
+        Bins the (already range-filtered, robot-frame) cells into ring_n sectors
+        over [-180,180) and takes the ring_min-th smallest hypot per sector, but
+        falls back to plain min for sparse sectors (costmap cells are already
+        voxel/inflation filtered, so one lethal cell = a real obstacle). Returns a
+        length-ring_n list, metres or None per sector. Sector i center angle =
+        ring_start_deg + (i + 0.5) * ring_bin_deg, atan2(y,x) convention (+=LEFT).
+        """
+        out = [None] * self.ring_n
+        if ang.size == 0:
+            return out
+        idx = np.floor((ang - self.ring_start_deg) / self.ring_bin_deg).astype(np.int64)
+        idx %= self.ring_n                  # wrap the atan2 +180 edge (-> bin 0)
+        for b in range(self.ring_n):
+            d = dist[idx == b]
+            if d.size == 0:
+                continue
+            out[b] = (float(np.min(d)) if d.size < self.ring_min
+                      else float(np.partition(d, self.ring_min - 1)[self.ring_min - 1]))
+        return out
+
+    def _empty_ring(self):
+        """All-null ring (clear) of the right length -- used before data arrives."""
+        return [None] * self.ring_n
 
     # ------------------------------------------------------- scale / tight maths
     # (copied VERBATIM from obstacle_node.py so the guard behaves identically)
@@ -384,19 +422,21 @@ class CostmapToObstacle(Node):
         self.left_filt = self._ema(self.left_filt, None)
         self.right_filt = self._ema(self.right_filt, None)
         self._emit(None, None, None, None,
-                   self.front_filt, self.back_filt, self.left_filt, self.right_filt)
+                   self.front_filt, self.back_filt, self.left_filt, self.right_filt,
+                   self._empty_ring())
 
-    def _write_frame(self, front_m, back_m, left_m, right_m):
+    def _write_frame(self, front_m, back_m, left_m, right_m, ring):
         """Real frame: EMA the four raw distances, then emit the full contract."""
         self.front_filt = self._ema(self.front_filt, front_m)
         self.back_filt = self._ema(self.back_filt, back_m)
         self.left_filt = self._ema(self.left_filt, left_m)
         self.right_filt = self._ema(self.right_filt, right_m)
         self._emit(front_m, back_m, left_m, right_m,
-                   self.front_filt, self.back_filt, self.left_filt, self.right_filt)
+                   self.front_filt, self.back_filt, self.left_filt, self.right_filt,
+                   ring)
 
     def _emit(self, front_m, back_m, left_m, right_m,
-              front_filt, back_filt, left_filt, right_filt):
+              front_filt, back_filt, left_filt, right_filt, ring=None):
         """Assemble + atomically write the JSON contract the dashboard guard reads."""
         scale_front = self._dist_scale(front_filt)
         scale_back = self._dist_scale(back_filt)
@@ -438,6 +478,12 @@ class CostmapToObstacle(Node):
             "side": {"left": left_m is not None, "right": right_m is not None},
             "gap": self._neutral_gap(),
             "profile": [],
+            "ring": {
+                "n": self.ring_n,
+                "bin_deg": self.ring_bin_deg,
+                "start_deg": self.ring_start_deg,
+                "dist": [_r(d) for d in ring] if ring is not None else [None] * self.ring_n,
+            },
         }
         self._write_shm(out)
 

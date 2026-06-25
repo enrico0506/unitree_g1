@@ -23,6 +23,7 @@ shm contract recap (null distance == clear / infinitely far):
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -62,6 +63,15 @@ _DEFAULTS = {
     "max_lateral_speed": 0.2,
     "turn_factor_min": 0.3,
     "search_yaw_rate": 0.4,
+    # 360 ring directional gating (guard consumes the node's "ring"; falls back
+    # to the 4-wedge per-axis logic whenever a "ring" key is absent).
+    "ring_gating": True,
+    "direction_cone_deg": 25.0,
+    "direction_cone_max_deg": 70.0,
+    "front_blind_compose_deg": 30.0,
+    "ring_min_motion": 0.03,
+    "robot_half_width_m": 0.25,
+    "clearance_margin_m": 0.10,
     # initial flags
     "enabled_default": False,
     "gap_follow_default": False,
@@ -118,6 +128,10 @@ class ObstacleGuard:
         self._pred_front = None        # dead-reckoned front distance while in the blind zone (None = inactive)
         self._pred_age = 0.0           # seconds we've been creeping forward on the estimate
         self._last_vx_cmd = 0.0        # forward speed actually applied last cycle (for dead-reckoning)
+        # After the guard auto-disables itself (perception fault), latch forward at 0
+        # until the operator RELEASES the forward command -- so a held W doesn't lurch
+        # the robot blind through whatever stopped it the instant control hands back.
+        self._autodis_hold = False
         self.stale_timeout_s = float(cfg["stale_timeout_s"])
         self.startup_grace_s = float(cfg["startup_grace_s"])
         self.fault_stop_s = float(cfg["fault_stop_s"])
@@ -128,6 +142,15 @@ class ObstacleGuard:
         self.announce_cooldown_s = float(cfg["announce_cooldown_s"])
         self.speaker_id = int(cfg["speaker_id"])
         self.led_warnings = bool(cfg["led_warnings"])
+
+        # --- 360 ring directional gating tuning ---
+        self.ring_gating = bool(cfg.get("ring_gating", True))
+        self.direction_cone_deg = float(cfg.get("direction_cone_deg", 25.0))
+        self.direction_cone_max_deg = float(cfg.get("direction_cone_max_deg", 70.0))
+        self.front_blind_compose_deg = float(cfg.get("front_blind_compose_deg", 30.0))
+        self.ring_min_motion = float(cfg.get("ring_min_motion", 0.03))
+        self.robot_half_w = float(cfg.get("robot_half_width_m", 0.25))
+        self.clearance_margin = float(cfg.get("clearance_margin_m", 0.10))
 
         # --- operator toggles (initial values from *_default) ---
         self.enabled = bool(cfg["enabled_default"])
@@ -151,6 +174,12 @@ class ObstacleGuard:
         self._ax = 1.0                     # applied forward/back scale
         self._ay = 1.0                     # applied left/right (strafe) scale
         self._ayaw = 1.0                   # applied yaw scale (tight-space only)
+        self._at = 1.0                     # applied translational scale (ring path)
+        # Per-axis EMERGENCY hard-stop flags set during apply() (vx, vy, vyaw). A
+        # downstream output smoother reads these to bypass its ramp on a safety stop
+        # (so a hard stop / FAULT is instantaneous) while still smoothing the gentle
+        # slow-zone scale-down. Same thread as apply(), so no lock needed.
+        self._hard = [False, False, False]
         self._last_apply_t = 0.0           # monotonic time of last slew step
 
         # --- cached shm state (under lock; None until first good frame) ---
@@ -231,13 +260,35 @@ class ObstacleGuard:
 
     @staticmethod
     def _num(value):
-        """Coerce a JSON value to float, treating null/missing as None (clear)."""
+        """Coerce a JSON value to a FINITE float, treating null/missing/non-finite
+        as None (clear). Rejecting NaN/inf here stops a corrupt shm value (e.g. a
+        NaN tight_factor or gap.vy_cmd) from poisoning the velocity downstream."""
         if value is None:
             return None
         try:
-            return float(value)
+            v = float(value)
         except (TypeError, ValueError):
             return None
+        return v if math.isfinite(v) else None
+
+    @staticmethod
+    def _ring_usable(ring):
+        """True only if `ring` is a dict with a non-empty dist list AND FINITE,
+        positive bin geometry. Corrupt metadata (bin_deg 0/NaN/inf, start_deg
+        NaN/inf) would make _ring_cone_min silently detect nothing -> fail OPEN and
+        also skip the legacy wedge stops; rejecting it here falls back to the robust
+        4-wedge path instead."""
+        if not isinstance(ring, dict):
+            return False
+        dist = ring.get("dist")
+        if not isinstance(dist, (list, tuple)) or len(dist) == 0:
+            return False
+        try:
+            bd = float(ring.get("bin_deg"))
+            sd = float(ring.get("start_deg"))
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(bd) and bd > 0.0 and math.isfinite(sd)
 
     # -----------------------------------------------------------------
     # Operator toggles (CONTRACT 2)
@@ -251,6 +302,7 @@ class ObstacleGuard:
             self.enabled = True
             self.mode = "STARTING"
             self.auto_disabled = False
+            self._autodis_hold = False
             self._enable_time = time.monotonic()
             self._fault_time = 0.0
             self._fault_spoken = False
@@ -259,19 +311,26 @@ class ObstacleGuard:
         else:
             self.enabled = False
             self.mode = "DISABLED"
+            self._autodis_hold = False                    # manual disable: hand back control cleanly
             self._reset_slew()                            # leave pass-through clean for next enable
             self._speak("off", "toggle", cooldown=0.0)    # one word, normal voice
 
     def _reset_slew(self):
-        """Reset the slew-limited applied scales to full (1.0).
+        """Reset the slew-limited applied scales to full (1.0) AND the blind-zone
+        predictor.
 
-        Called on enable/disable so the per-axis ramp never resumes from a stale
-        low value and the disabled pass-through stays a pure pass-through.
+        Called on enable/disable so neither the per-axis ramp nor the dead-reckoned
+        front estimate resumes from a stale value -- a re-enable must not carry a
+        phantom wall that freezes the robot in a clear area.
         """
         self._ax = 1.0
         self._ay = 1.0
         self._ayaw = 1.0
+        self._at = 1.0
         self._last_apply_t = 0.0
+        self._pred_front = None        # drop any stale dead-reckoned wall
+        self._pred_age = 0.0
+        self._last_vx_cmd = 0.0
 
     def set_gap_follow(self, on):
         self.gap_follow = bool(on)
@@ -320,9 +379,20 @@ class ObstacleGuard:
         limits. See CONTRACT 3 for the full state machine + stage ordering.
         """
         vx, vy, vyaw = float(desired[0]), float(desired[1]), float(desired[2])
+        self._hard = [False, False, False]   # reset; set True only on an emergency zero
 
         # --- Pass-through when disabled (but still keep the cache warm) ---
         if not self.enabled:
+            # If WE auto-disabled (perception fault), do NOT hand back full forward
+            # speed while forward is still held -- that lurches the robot blind through
+            # whatever stopped it. Hold forward at 0 until the operator releases
+            # (acknowledges manual control). Reverse / strafe / yaw stay free to escape.
+            if self._autodis_hold:
+                if vx > 0.0:
+                    vx = 0.0
+                    self._hard[0] = True
+                else:
+                    self._autodis_hold = False   # operator released -> manual control resumes
             return self._clamp_out(vx, vy, vyaw)
 
         data, age, _live = self._snapshot()
@@ -346,11 +416,15 @@ class ObstacleGuard:
             # Zero FORWARD vx only; reverse / yaw / strafe still allowed.
             if vx > 0.0:
                 vx = 0.0
+                self._hard[0] = True
             if now - self._fault_time >= self.fault_stop_s:
                 # Auto-disable: turn ourselves off and stick the UI banner. Speak
                 # the same one-word "off" so the operator knows it shut itself down.
+                # Latch forward-zero until the operator releases, so handing control
+                # back doesn't lurch the robot blind forward (see the disabled path).
                 self.enabled = False
                 self.auto_disabled = True
+                self._autodis_hold = True
                 self.mode = "DISABLED"
                 self._speak("off", "toggle", cooldown=0.0)
             return self._clamp_out(vx, vy, vyaw)
@@ -388,69 +462,144 @@ class ObstacleGuard:
         # when the sensor sees the front, else the dead-reckoned estimate carried
         # from when the wall slipped into the blind cone (the estimate is updated
         # below, once the forward speed applied this cycle is known).
+        # front_eff is the CLOSER of the live front reading and the dead-reckoned
+        # estimate -- not just the estimate when the reading vanishes. A low/short
+        # obstacle grazed at its top reports a PLATEAUED (too-far) front_raw while the
+        # body closes in; taking the min lets the dead-reckoned closing distance drive
+        # the stop instead of the misleadingly-far measurement.
         front_eff = front_raw
+        if self.predict_blind and self._pred_front is not None:
+            front_eff = (self._pred_front if front_eff is None
+                         else min(front_eff, self._pred_front))
         if self.predict_blind and front_raw is None and self._pred_front is not None:
-            front_eff = self._pred_front
             # ease forward speed down on the remembered wall as if we still saw it
             scale_front = min(scale_front, self._front_scale(front_eff))
 
-        # 1) Pick each axis's TARGET scale by the sign of motion, times the
-        #    global tight-space multiplier. (vyaw is only governed by tight.)
-        tgt_vx = (scale_front if vx > 0.0 else
-                  scale_back if vx < 0.0 else 1.0) * tight_factor
-        tgt_vy = (scale_left if vy > 0.0 else
-                  scale_right if vy < 0.0 else 1.0) * tight_factor
-        tgt_yaw = tight_factor
+        # --- choose gating path: ring (360 travel-direction) or legacy 4-wedge ---
+        ring = data.get("ring") if self.ring_gating else None
+        use_ring = self._ring_usable(ring)
 
-        # 2) SLEW-LIMIT the applied scales toward their targets so the real
-        #    speed ramps continuously at this ~30 Hz rate (smoothness fix).
+        # slew timing (shared by both paths)
         now_t = time.monotonic()
         dt = (now_t - self._last_apply_t) if self._last_apply_t > 0.0 else 0.0
         dt = clamp(dt, 0.0, 0.1)
         self._last_apply_t = now_t
         rate = self.scale_slew_per_s
-        self._ax = self._ramp(self._ax, tgt_vx, dt, rate)
-        self._ay = self._ramp(self._ay, tgt_vy, dt, rate)
-        self._ayaw = self._ramp(self._ayaw, tgt_yaw, dt, rate)
 
-        vx *= self._ax
-        vy *= self._ay
-        vyaw *= self._ayaw
+        if use_ring:
+            try:
+                trans_mag = math.hypot(vx, vy)
+                gate_d = None
+                if trans_mag >= self.ring_min_motion:
+                    heading = math.atan2(vy, vx)
+                    gate_d = self._ring_cone_min(ring, heading)
+                    # front-blind compose: near-forward travel honours the predictor
+                    if abs(math.degrees(heading)) < self.front_blind_compose_deg \
+                            and front_eff is not None:
+                        gate_d = (front_eff if gate_d is None
+                                  else min(gate_d, front_eff))
+                    scale_trans = 1.0 if gate_d is None else self._front_scale(gate_d)
+                else:
+                    scale_trans = 1.0    # no travel direction -> no ring gating
+                tgt_trans = scale_trans * tight_factor
+                tgt_yaw = tight_factor
+                self._at = self._ramp(self._at, tgt_trans, dt, rate)
+                self._ayaw = self._ramp(self._ayaw, tgt_yaw, dt, rate)
+                vx *= self._at
+                vy *= self._at
+                vyaw *= self._ayaw
+                # hard stop in the travel direction (RAW ring distance, no slew)
+                if trans_mag >= self.ring_min_motion and gate_d is not None \
+                        and gate_d < self.stop_at:
+                    vx = 0.0
+                    vy = 0.0
+                    self._hard[0] = self._hard[1] = True
+            except Exception:
+                use_ring = False        # any ring error -> fall through to legacy
+
+        if not use_ring:
+            # 1) Pick each axis's TARGET scale by the sign of motion, times the
+            #    global tight-space multiplier. (vyaw is only governed by tight.)
+            tgt_vx = (scale_front if vx > 0.0 else
+                      scale_back if vx < 0.0 else 1.0) * tight_factor
+            tgt_vy = (scale_left if vy > 0.0 else
+                      scale_right if vy < 0.0 else 1.0) * tight_factor
+            tgt_yaw = tight_factor
+
+            # 2) SLEW-LIMIT the applied scales toward their targets so the real
+            #    speed ramps continuously at this ~30 Hz rate (smoothness fix).
+            self._ax = self._ramp(self._ax, tgt_vx, dt, rate)
+            self._ay = self._ramp(self._ay, tgt_vy, dt, rate)
+            self._ayaw = self._ramp(self._ayaw, tgt_yaw, dt, rate)
+
+            vx *= self._ax
+            vy *= self._ay
+            vyaw *= self._ayaw
+
+            # 3) PER-DIRECTION HARD STOP -- independent of EMA/slew, RAW distances.
+            # Front uses front_eff (raw, or the dead-reckoned estimate) so a wall
+            # that vanished into the blind zone still stops the robot.
+            if vx > 0.0 and front_eff is not None and front_eff < self.stop_at:
+                vx = 0.0
+                self._hard[0] = True
+            if vx < 0.0 and back_raw is not None and back_raw < self.stop_at:
+                vx = 0.0
+                self._hard[0] = True
+            if vy > 0.0 and left_raw is not None and left_raw < self.stop_at:
+                vy = 0.0
+                self._hard[1] = True
+            if vy < 0.0 and right_raw is not None and right_raw < self.stop_at:
+                vy = 0.0
+                self._hard[1] = True
 
         # --- update the blind-zone predictor for the NEXT cycle -----------
+        # Dead-reckons a forward obstacle through the ~1 m front blind cone. Seeded and
+        # corrected ONLY from the RING's forward-CORRIDOR minimum (ring_fwd) -- which is
+        # path-accurate (low false-positive: an off-path obstacle in the broad +/-45 deg
+        # wedge does NOT seed it) and reads sparse/grazing returns the 10-point wedge
+        # overestimates. Key: the estimate is dead-reckoned CONTINUOUSLY by the distance
+        # travelled and a measurement may only CORRECT IT LOWER -- so a low/short obstacle
+        # grazed only at its top edge (whose measured slant range PLATEAUS while the body
+        # closes in) still converges to a stop instead of being trusted as "not closing".
         if self.predict_blind:
             turning = abs(vyaw) > 0.15
-            if front_raw is not None:
-                # sensor sees the front: (re)seed the estimate only when it's near the
-                # blind edge -- a far wall doesn't need dead-reckoning.
-                self._pred_front = (front_raw if front_raw < (self.blind_zone + 0.5)
-                                    else None)
+            ring_fwd = self._ring_cone_min(ring, 0.0) if isinstance(ring, dict) else None
+            seed_window = max(self.blind_zone + 0.5, self.slow_at)
+            visible = ring_fwd is not None and ring_fwd < seed_window
+            if turning or self._last_vx_cmd < -0.02:
+                self._pred_front = None        # turned / backed up -> dead-ahead estimate invalid
+                self._pred_age = 0.0
+            elif visible:
+                # In view in the forward corridor -> TRACK the live distance (up AND down,
+                # so a receding/static obstacle is followed, not falsely driven to a stop).
+                self._pred_front = ring_fwd
                 self._pred_age = 0.0
             elif self._pred_front is not None:
-                if turning or self._last_vx_cmd < -0.02:
-                    self._pred_front = None        # turned / backed up -> wall may not be dead-ahead
-                elif self._last_vx_cmd > 0.02:     # creeping forward -> dead-reckon it closer
-                    self._pred_front = max(0.0, self._pred_front - self._last_vx_cmd * dt)
-                    self._pred_age += dt
-                    if self._pred_age > self.predict_timeout_s:
-                        self._pred_front = None     # estimate drifted too long -> drop it
-
-        # 3) PER-DIRECTION HARD STOP -- independent of EMA/slew, RAW distances.
-        # Front uses front_eff (raw, or the dead-reckoned estimate) so a wall that
-        # vanished into the blind zone still stops the robot.
-        if vx > 0.0 and front_eff is not None and front_eff < self.stop_at:
-            vx = 0.0
-        if vx < 0.0 and back_raw is not None and back_raw < self.stop_at:
-            vx = 0.0
-        if vy > 0.0 and left_raw is not None and left_raw < self.stop_at:
-            vy = 0.0
-        if vy < 0.0 and right_raw is not None and right_raw < self.stop_at:
-            vy = 0.0
+                # Dropped out of view (a low/short obstacle grazed at its top edge falls
+                # below the upward-tilted FOV in the near field) -> DEAD-RECKON it closer by
+                # the distance travelled so it still converges to a stop, then KEEP the stop
+                # while the operator pushes forward (it may still be there, below the FOV --
+                # safety over liveness). Release only when it closes in, or when it goes
+                # stale AND the operator is no longer driving into it (then re-press resumes).
+                if self._last_vx_cmd > 0.02:
+                    self._pred_front -= self._last_vx_cmd * dt
+                self._pred_age += dt
+                # Release when it closes in (pred<=0), OR as soon as the operator stops
+                # pushing FORWARD into it (desired[0] small). While they hold forward we
+                # KEEP the stop (a grazing below-FOV obstacle may still be there -- safety
+                # over liveness). The instant they release, the phantom clears, so a
+                # crossed/departed obstacle resumes immediately on the next press -- no
+                # 4 s wait. A long-stale estimate is also dropped as a backstop.
+                if self._pred_front <= 0.0 or desired[0] <= 0.05:
+                    self._pred_front = None
+                    self._pred_age = 0.0
 
         # 4) Stage 8: gap-follow auto steering (only when the operator is
         #    actively commanding forward AND gap_follow is on). Applies AFTER the
         #    directional scaling above, on the already-scaled vx.
-        gap = data.get("gap") or {}
+        gap = data.get("gap")
+        if not isinstance(gap, dict):     # a non-dict truthy (string/int/list) in shm
+            gap = {}                       # would crash gap.get() and kill the command thread
         gap_state = gap.get("state", "SEARCH")
         if self.gap_follow and desired[0] > 0.05:
             yaw_cmd = self._num(gap.get("yaw_cmd")) or 0.0
@@ -458,8 +607,12 @@ class ObstacleGuard:
             turn_factor = self._num(gap.get("turn_factor"))
             if turn_factor is None:
                 turn_factor = 1.0
-            vyaw = desired[2] + yaw_cmd        # additive auto-steer toward gap
-            vy = desired[1] + vy_cmd           # additive corridor centering
+            # Add the steering ONTO the already-governed (slew-scaled, post-hard-stop)
+            # vy/vyaw -- NOT onto the raw operator command -- so we keep the directional
+            # + tight-space scaling instead of discarding it. The hard-stop re-enforce
+            # below then guarantees a safety-stopped axis stays zeroed.
+            vyaw = vyaw + yaw_cmd              # additive auto-steer toward gap
+            vy = vy + vy_cmd                   # additive corridor centering
             vx *= turn_factor                  # slow down when turning hard
 
         # 5) Recovery: boxed in with no gap -> turn in place toward open side.
@@ -467,6 +620,7 @@ class ObstacleGuard:
         #    commanding forward.
         if self.recovery and gap_state == "BLOCKED" and desired[0] > 0.05:
             vx = 0.0
+            self._hard[0] = True               # boxed-in stop is immediate
             left_m = self._num(data.get("left_m"))
             right_m = self._num(data.get("right_m"))
             # null == infinitely far == most open. Turn toward the more-open side
@@ -474,6 +628,26 @@ class ObstacleGuard:
             l = float("inf") if left_m is None else left_m
             r = float("inf") if right_m is None else right_m
             vyaw = self.search_yaw_rate if l >= r else -self.search_yaw_rate
+
+        # SAFETY re-enforce: gap-follow may INJECT a vy_cmd strafe (or vyaw) AFTER the
+        # hard-stop checks, into an axis the operator wasn't commanding -- so re-run the
+        # per-direction hard stops on the FINAL velocity. An injected strafe/forward into
+        # anything within stop_at is zeroed (and flagged), and any prior hard-stop is
+        # kept. The recovery turn-in-place yaw survives (yaw has no distance gate here).
+        if vx > 0.0 and front_eff is not None and front_eff < self.stop_at:
+            vx = 0.0; self._hard[0] = True
+        if vx < 0.0 and back_raw is not None and back_raw < self.stop_at:
+            vx = 0.0; self._hard[0] = True
+        if vy > 0.0 and left_raw is not None and left_raw < self.stop_at:
+            vy = 0.0; self._hard[1] = True
+        if vy < 0.0 and right_raw is not None and right_raw < self.stop_at:
+            vy = 0.0; self._hard[1] = True
+        if self._hard[0]:
+            vx = 0.0
+        if self._hard[1]:
+            vy = 0.0
+        if self._hard[2]:
+            vyaw = 0.0
 
         # Remember the forward speed actually applied, for next cycle's dead-reckoning.
         self._last_vx_cmd = vx
@@ -502,6 +676,50 @@ class ObstacleGuard:
             return cur - step
         return target
 
+    def _ring_cone_min(self, ring, heading_rad):
+        """Nearest ring obstacle in the robot's swept CORRIDOR along the travel
+        heading, or None (clear).
+
+        Per-bin corridor test (no two-pass probe -- that missed a close obstacle
+        just outside the narrow floor cone). The body sweeps a corridor of
+        half-width (robot_half_width + clearance_margin) along the heading, so a
+        bin at angle a, distance d, is "in the way" iff |a - heading| is within
+        the angle that corridor subtends AT THAT d: asin(corridor / d). Each bin
+        uses its OWN distance, so a near obstacle is caught at a wide angle and a
+        far one only when nearly dead-ahead -- the geometrically correct test, and
+        strictly less over-conservative than the old fixed +/-45 deg front wedge.
+        A direction_cone_deg FLOOR keeps a minimum cone (heading/sensor noise);
+        direction_cone_max_deg CAPS it so a ~0.05 m return can't make the corridor
+        omnidirectional and freeze all motion.
+        """
+        try:
+            dist = ring.get("dist")
+            if not isinstance(dist, (list, tuple)) or not dist:  # a dict passes len()
+                return None                                       # but dist[i] would KeyError
+            n = len(dist)
+            bin_deg = float(ring.get("bin_deg", 5.0))
+            start_deg = float(ring.get("start_deg", -180.0))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        heading_deg = math.degrees(heading_rad)
+        corridor = self.robot_half_w + self.clearance_margin
+        best = None
+        for i in range(n):
+            d = self._num(dist[i])
+            if d is None:
+                continue
+            center = start_deg + (i + 0.5) * bin_deg
+            diff = abs(((center - heading_deg + 180.0) % 360.0) - 180.0)
+            # half-angle the corridor subtends at this obstacle's distance.
+            if d <= corridor:
+                half = self.direction_cone_max_deg      # basically on top of us
+            else:
+                half = math.degrees(math.asin(corridor / d))
+                half = max(self.direction_cone_deg, min(half, self.direction_cone_max_deg))
+            if diff <= half and (best is None or d < best):
+                best = d
+        return best
+
     def _front_scale(self, d):
         """Forward speed scale for a (predicted) front distance -- mirrors the
         node's _dist_scale: smoothstep over [stop_at, slow_at] with the slow_min
@@ -516,7 +734,12 @@ class ObstacleGuard:
         return self.slow_min + (1.0 - self.slow_min) * e
 
     def _clamp_out(self, vx, vy, vyaw):
-        """Final re-clamp of the output to the __init__ limits."""
+        """Final re-clamp of the output to the __init__ limits. Any non-finite value
+        (a NaN that slipped through from corrupt shm) is forced to 0 -- a safe stop,
+        never a clamp(NaN)=NaN that would poison the shaper and the robot command."""
+        vx = vx if math.isfinite(vx) else 0.0
+        vy = vy if math.isfinite(vy) else 0.0
+        vyaw = vyaw if math.isfinite(vyaw) else 0.0
         return (clamp(vx, -self.max_vx, self.max_vx),
                 clamp(vy, -self.max_vy, self.max_vy),
                 clamp(vyaw, -self.max_vyaw, self.max_vyaw))
@@ -524,6 +747,14 @@ class ObstacleGuard:
     # -----------------------------------------------------------------
     # CONTRACT 2 / CONTRACT 5: introspection
     # -----------------------------------------------------------------
+
+    def hard_stop_flags(self):
+        """Per-axis (vx, vy, vyaw) emergency-stop flags from the LAST apply() call.
+        True means the guard forced that axis to zero for safety (hard stop / FAULT /
+        recovery), as opposed to a gentle slow-zone scale-down. A downstream output
+        smoother bypasses its ramp on these axes so a safety stop stays instantaneous.
+        Read on the same thread immediately after apply()."""
+        return tuple(self._hard)
 
     def forward_speed_scale(self):
         """Cached forward speed scale (1.0 when there is no usable data).
@@ -559,6 +790,7 @@ class ObstacleGuard:
                 "yaw_cmd": 0.0, "vy_cmd": 0.0, "turn_factor": 1.0,
             }
             profile = []
+            ring = None
         else:
             front_m = self._num(data.get("front_m"))
             front_filt_m = self._num(data.get("front_filt_m"))
@@ -569,6 +801,7 @@ class ObstacleGuard:
             left_filt_m = self._num(data.get("left_filt_m"))
             right_filt_m = self._num(data.get("right_filt_m"))
             profile = data.get("profile") or []
+            ring = data.get("ring")
             zone = data.get("zone", "CLEAR")
 
             def _tscale(key, fallback=None):
@@ -587,10 +820,14 @@ class ObstacleGuard:
             scale_right = _tscale("scale_right", 1.0)
             tight_factor = _tscale("tight_factor", 1.0)
             speed_scale = scale_front          # speed_scale == scale_front
-            raw_side = data.get("side") or {}
+            raw_side = data.get("side")
+            if not isinstance(raw_side, dict):
+                raw_side = {}
             side = {"left": bool(raw_side.get("left")),
                     "right": bool(raw_side.get("right"))}
-            raw_gap = data.get("gap") or {}
+            raw_gap = data.get("gap")
+            if not isinstance(raw_gap, dict):
+                raw_gap = {}
             gap = {
                 "state": raw_gap.get("state", "SEARCH"),
                 "center_deg": self._num(raw_gap.get("center_deg")) or 0.0,
@@ -623,6 +860,7 @@ class ObstacleGuard:
             "side": side,
             "gap": gap,
             "profile": profile,
+            "ring": ring,
             "fault": self.mode == "FAULT",
             "auto_disabled": bool(self.auto_disabled),
             "live": bool(live),

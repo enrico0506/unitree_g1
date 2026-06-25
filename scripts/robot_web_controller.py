@@ -36,7 +36,10 @@ import uvicorn
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
-from unitree_sdk2py.g1.loco.g1_loco_api import ROBOT_API_ID_LOCO_SET_VELOCITY
+from unitree_sdk2py.g1.loco.g1_loco_api import (
+    ROBOT_API_ID_LOCO_SET_VELOCITY,
+    ROBOT_API_ID_LOCO_SET_SWING_HEIGHT,
+)
 from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient as H2LocoClient
@@ -47,6 +50,7 @@ import yaml
 from camera_source import CameraSource
 from lidar_source import LidarSource, pack_cloud, OdomReader
 from map_builder import MapBuilder
+from cmd_shaper import CommandShaper
 
 
 # --- Paths ---
@@ -107,6 +111,8 @@ def load_config(path=CONFIG_PATH):
         "speeds": {"max_vx": 1.5, "max_vy": 1.0, "max_vyaw": 2.0, "slow_scale": 0.4},
         "control": {"send_hz": 30, "watchdog_timeout": 2.0,
                     "move_duration_s": 1.0, "cmd_resend_hz": 3},
+        "motion": dict(CommandShaper.DEFAULTS),   # jerk/accel velocity shaping
+        "gait": {"swing_height": None, "stand_height": None},
         "camera": {"stream_hz": 25},
         "lidar": {"stream_hz": 10, "max_points": 25000, "camera_height_m": 1.3},
         "map": {"dir": "maps", "voxel_size_m": 0.05, "max_points": 300000,
@@ -145,6 +151,12 @@ SEND_HZ = CFG["control"]["send_hz"]
 DT = 1.0 / SEND_HZ
 MOVE_DURATION = CFG["control"]["move_duration_s"]
 RESEND_PERIOD = 1.0 / CFG["control"]["cmd_resend_hz"]
+
+# Motion shaping (jerk/accel velocity smoothing) + optional SDK gait tuning.
+MOTION_CFG = CFG.get("motion", {})
+GAIT_CFG = CFG.get("gait", {})
+GAIT_SWING_HEIGHT = GAIT_CFG.get("swing_height")   # None = leave controller default
+GAIT_STAND_HEIGHT = GAIT_CFG.get("stand_height")   # None = leave controller default
 
 FSM_POLL_HZ = 2.0          # GetFsmId is a blocking RPC; keep it light
 FSM_BROADCAST_HZ = 2.0
@@ -251,6 +263,10 @@ class ControlState:
         self.vx = 0.0
         self.vy = 0.0
         self.vyaw = 0.0
+        # Actually-commanded (shaped + guard-governed) velocity, for the UI readout.
+        self.cmd_vx = 0.0
+        self.cmd_vy = 0.0
+        self.cmd_vyaw = 0.0
         self.last_packet_time = 0.0
         self.is_moving = False
         self.pending_cmd = None
@@ -283,6 +299,7 @@ mapper: MapBuilder = None
 
 guard: ObstacleGuard = None
 obstacle_mgr: ObstacleManager = None
+shaper: CommandShaper = None
 audio = None
 
 _mode_lock = threading.Lock()
@@ -291,6 +308,17 @@ _arm_lock = threading.Lock()   # serialize arm-action RPCs (and the hands_up tog
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _finite_vel(v, default=0.0):
+    """Coerce an incoming velocity to a FINITE float, or `default`. Guards against a
+    non-finite value (nan/inf, a "nan" string, None) ever reaching the robot --
+    clamp(nan) fails open to the high limit (full speed), so a bad value must die here."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
 
 
 def send_velocity(vx, vy, vyaw, duration):
@@ -384,6 +412,25 @@ def enable_continuous_gait():
         print(f"[GAIT] SetBalanceMode(1) returned {ret}", flush=True)
     except Exception as e:
         print(f"[GAIT] SetBalanceMode failed: {e}", flush=True)
+
+    # Optional SDK gait tuning (both default null in config -> skipped). UNVERIFIED
+    # ranges on this robot; only set when the operator opts in via config/robot.yaml.
+    if GAIT_STAND_HEIGHT is not None:
+        try:
+            ret = client.SetStandHeight(float(GAIT_STAND_HEIGHT))
+            print(f"[GAIT] SetStandHeight({GAIT_STAND_HEIGHT}) returned {ret}", flush=True)
+        except Exception as e:
+            print(f"[GAIT] SetStandHeight failed: {e}", flush=True)
+    if GAIT_SWING_HEIGHT is not None:
+        try:
+            # No wrapper on the G1 LocoClient -> call the raw api id. Same {"data": v}
+            # payload shape every other SET_* call uses (SetBalanceMode/SetStandHeight).
+            p = json.dumps({"data": float(GAIT_SWING_HEIGHT)})
+            ret = client._Call(ROBOT_API_ID_LOCO_SET_SWING_HEIGHT, p)
+            print(f"[GAIT] SetSwingHeight({GAIT_SWING_HEIGHT}) returned {ret}", flush=True)
+        except Exception as e:
+            print(f"[GAIT] SetSwingHeight failed: {e}", flush=True)
+
     state.gait_enabled = True
 
 
@@ -413,6 +460,8 @@ def enter_mode(new_mode):
     state.is_moving = False
     state.vx = state.vy = state.vyaw = 0.0
     state.gait_enabled = False
+    if shaper is not None:
+        shaper.reset()   # fresh walk session starts the ramp from rest, never a stale value
 
     # Set transitioning BEFORE mode so the FSM poller's mode-sync can't briefly
     # overwrite our just-set intent in the gap between these two assignments.
@@ -578,19 +627,27 @@ def apply_cmd(name):
             print(f"[CMD] {name}: fsm_id not captured -- run "
                   f"scripts/capture_combo_fsm.py, then set mode_combos.{name}."
                   f"fsm_id in config/mapping.yaml", flush=True)
+        elif not _mode_lock.acquire(blocking=False):
+            # Serialize with enter_mode (same lock): a combo must not race a mode
+            # transition's state.mode write, or command_loop could read mode=="walk"
+            # while the robot FSM is a combo and drive velocity into it.
+            print(f"[CMD] {name} ignored -- mode transition in progress", flush=True)
         else:
-            # Hand the whole body to this behavior: stop driving so the velocity
-            # keepalive can't fight the routine. mode != "walk" makes the command
-            # loop go quiet; the FSM poller leaves it (no FSM_TO_UI entry).
-            state.vx = state.vy = state.vyaw = 0.0
-            state.is_moving = False
-            state.gait_enabled = False
-            state.mode = name
-            print(f"[CMD] {name} -> SetFsmId({fsm})", flush=True)
             try:
-                client.SetFsmId(fsm)
-            except Exception as e:
-                print(f"[mode combo error: {e}]", flush=True)
+                # Hand the whole body to this behavior: stop driving so the velocity
+                # keepalive can't fight the routine. mode != "walk" makes the command
+                # loop go quiet; the FSM poller leaves it (no FSM_TO_UI entry).
+                state.vx = state.vy = state.vyaw = 0.0
+                state.is_moving = False
+                state.gait_enabled = False
+                state.mode = name
+                print(f"[CMD] {name} -> SetFsmId({fsm})", flush=True)
+                try:
+                    client.SetFsmId(fsm)
+                except Exception as e:
+                    print(f"[mode combo error: {e}]", flush=True)
+            finally:
+                _mode_lock.release()
 
     else:
         print(f"[cmd error: unknown '{name}']", flush=True)
@@ -635,6 +692,10 @@ def make_telemetry_msg():
         "battery_soc": state.battery_soc,
         "battery_v": state.battery_v,
         "battery_current": state.battery_current,
+        # Actually-commanded velocity after shaping + guard (UI shows real speed).
+        "cmd_vx": round(state.cmd_vx, 3),
+        "cmd_vy": round(state.cmd_vy, 3),
+        "cmd_vyaw": round(state.cmd_vyaw, 3),
     }
 
 
@@ -658,7 +719,8 @@ def command_loop():
     is exactly when the camera "lost signal"). Running it here keeps the event
     loop free for streaming.
     """
-    DEADZONE = 0.02            # m/s; below this a change isn't worth an RPC
+    DEADZONE = 0.01            # m/s; below this a change isn't worth an RPC (small so
+                              # the shaper's smooth ramp tail still reaches the robot)
     last_sent = (0.0, 0.0, 0.0)
     last_send_time = 0.0
     last_rearm_time = 0.0
@@ -674,30 +736,58 @@ def command_loop():
             state.pending_cmd = None
             threading.Thread(target=apply_cmd, args=(cmd,), daemon=True).start()
 
-        # Watchdog: browser went silent -> force stop.
+        # Watchdog: browser went silent -> force stop. Comms loss is a safety event,
+        # so reset the shaper (instant stop) rather than easing down a stale ramp.
         idle = now - state.last_packet_time
         if (idle > WATCHDOG_TIMEOUT and state.last_packet_time > 0
                 and (state.is_moving
                      or (state.vx, state.vy, state.vyaw) != (0.0, 0.0, 0.0))):
             print(f"[WATCHDOG] {idle:.2f}s idle -> stop", flush=True)
             state.vx = state.vy = state.vyaw = 0.0
+            if shaper is not None:
+                shaper.reset()
 
         # Desired velocity (zero unless actively walking).
-        if state.mode == "walk" and not state.transitioning:
-            desired = (clamp(state.vx, -MAX_VX, MAX_VX),
-                       clamp(state.vy, -MAX_VY, MAX_VY),
-                       clamp(state.vyaw, -MAX_VYAW, MAX_VYAW))
+        #   operator intent (clamped)
+        #     -> shaper.normalize()   diagonal -> speed ellipse
+        #     -> guard.apply()        obstacle scaling + emergency hard stop (safety)
+        #     -> shaper.shape(bypass) jerk/accel-limit the FINAL command, smoothing
+        #                             BOTH the operator input AND the guard's gentle
+        #                             slow-zone scale-down -- but BYPASS (snap) on any
+        #                             axis the guard hard-stopped, so a safety stop
+        #                             stays instantaneous. The snap also rebases the
+        #                             ramp, so a cleared obstacle re-accelerates from
+        #                             rest instead of lurching.
+        in_walk = state.mode == "walk" and not state.transitioning
+        if in_walk:
+            intent = (clamp(state.vx, -MAX_VX, MAX_VX),
+                      clamp(state.vy, -MAX_VY, MAX_VY),
+                      clamp(state.vyaw, -MAX_VYAW, MAX_VYAW))
+            if shaper is not None:
+                intent = shaper.normalize(intent)
+            governed = guard.apply(intent) if guard is not None else intent
+            hard = guard.hard_stop_flags() if guard is not None else (False, False, False)
+            desired = (shaper.shape(governed, DT, bypass=hard)
+                       if shaper is not None else governed)
+            # FINAL clamp: the jerk-limited shaper can momentarily overshoot the target
+            # by a few cm/s; never send a velocity beyond the configured caps.
+            desired = (clamp(desired[0], -MAX_VX, MAX_VX),
+                       clamp(desired[1], -MAX_VY, MAX_VY),
+                       clamp(desired[2], -MAX_VYAW, MAX_VYAW))
         else:
+            # Not walking: commanded zero. Keep the guard state machine ticking
+            # (FAULT / startup grace) and reset the shaper so the next walk ramps
+            # cleanly from rest.
+            if guard is not None:
+                guard.apply((0.0, 0.0, 0.0))
+            if shaper is not None:
+                shaper.reset()
             desired = (0.0, 0.0, 0.0)
 
-        # Obstacle guard: scales/stops forward motion (+ optional gap steering). Pure
-        # pass-through when disabled; the hard safety stop lives inside guard.apply().
-        if guard is not None:
-            desired = guard.apply(desired)
+        state.cmd_vx, state.cmd_vy, state.cmd_vyaw = desired   # for the UI readout
 
         moving = desired != (0.0, 0.0, 0.0)
         changed = any(abs(desired[i] - last_sent[i]) > DEADZONE for i in range(3))
-        in_walk = state.mode == "walk" and not state.transitioning
 
         # Send only on CHANGE or as a low-rate refresh -- these are blocking RPCs;
         # flooding them at loop rate saturates the DDS layer (kills movement+camera).
@@ -766,7 +856,7 @@ async def broadcast_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper
-    global guard, obstacle_mgr, audio
+    global guard, obstacle_mgr, shaper, audio
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -850,6 +940,11 @@ async def lifespan(app: FastAPI):
     guard = ObstacleGuard(cfg_path=str(OBSTACLE_CFG_PATH), audio=audio, limits=(MAX_VX, MAX_VY, MAX_VYAW))
     guard.start()
     print("Obstacle guard ready (disabled until toggled).", flush=True)
+
+    # Velocity shaper: jerk/accel-limited smoothing of the teleop command (smooth walk).
+    shaper = CommandShaper(cfg=MOTION_CFG, max_speeds=(MAX_VX, MAX_VY, MAX_VYAW))
+    print(f"Command shaper ready (motion smoothing {'ON' if shaper.enabled else 'OFF'}).",
+          flush=True)
 
     # Blocking robot RPCs run in their own thread; the event loop only streams.
     cmd_thread = threading.Thread(target=command_loop, daemon=True)
@@ -1149,9 +1244,12 @@ async def ws_endpoint(ws: WebSocket):
 
             if mtype == "move":
                 if state.mode == "walk" and not state.transitioning:
-                    state.vx = float(msg.get("vx", 0.0))
-                    state.vy = float(msg.get("vy", 0.0))
-                    state.vyaw = float(msg.get("vyaw", 0.0))
+                    # Sanitize to a FINITE float -> 0. A non-finite velocity (e.g. a
+                    # client sending {"vx":"nan"}) must never reach the robot: the
+                    # downstream clamp(nan) would fail OPEN to full speed.
+                    state.vx = _finite_vel(msg.get("vx"))
+                    state.vy = _finite_vel(msg.get("vy"))
+                    state.vyaw = _finite_vel(msg.get("vyaw"))
 
             elif mtype == "stop":
                 # Zero the velocity; command_loop sends Move(0,0,0), which halts
