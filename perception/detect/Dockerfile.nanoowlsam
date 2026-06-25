@@ -13,12 +13,17 @@
 #   sudo docker build -f Dockerfile.nanoowlsam -t g1-detect-nanoowlsam:latest .
 FROM dustynv/nanosam:r35.3.1
 
-# NanoOWL on top of the nanosam stack. transformers is pinned < 4.42 because 4.42+
-# dropped Python 3.8 (the JetPack-5 interpreter); adjust if OWL-ViT fails to load.
+# NanoOWL on top of the nanosam stack. transformers is pinned to 4.32.1: newer 4.4x
+# scale OWL-ViT detection scores ~5x too low (real detections fall under threshold),
+# and 4.42+ also drop Python 3.8. 4.32.1 gives correct OWL-ViT scores on this stack.
 RUN git clone --depth 1 https://github.com/NVIDIA-AI-IOT/nanoowl /opt/nanoowl \
  && cd /opt/nanoowl \
- && pip3 install --no-cache-dir "transformers==4.41.2" "Pillow" \
+ && pip3 install --no-cache-dir "transformers==4.32.1" "Pillow" \
  && pip3 install --no-cache-dir -e .
+
+# nanoowl's editable install does not reliably land on sys.path in this base, and
+# detect_service runs from /app (not /opt/nanoowl), so pin the package dir explicitly.
+ENV PYTHONPATH=/opt/nanoowl
 
 # Pre-cache the OWL-ViT HuggingFace weights into the image so the robot runs OFFLINE
 # (no HF download at runtime). The TRT image-encoder engine replaces the vision tower

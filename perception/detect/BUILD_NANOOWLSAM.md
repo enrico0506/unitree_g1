@@ -103,9 +103,10 @@ Engine paths can be overridden with `OWL_ENGINE`, `SAM_ENCODER`, `SAM_DECODER`.
   (ONNX sources: NanoSAM README's gdown links; OWL downloads from HF automatically.)
 - **Nothing detected** even with objects in view → `OWL_THRESHOLD` too high, or the
   text encoder weights weren't cached. Lower `OWL_THRESHOLD` to ~0.05 to confirm recall.
-- **`transformers` import / OWL-ViT load error** on Py3.8 → the pin in
-  `Dockerfile.nanoowlsam` (`transformers==4.41.2`) may need adjusting. 4.42+ dropped
-  Python 3.8.
+- **Detections all fall under threshold / nothing detected with objects clearly in
+  view** → transformers version. `transformers==4.32.1` is pinned because 4.4x scale
+  OWL-ViT scores ~5x too low (verified on-device: a clear person scored 0.03 on 4.41.2
+  vs 0.15 on 4.32.1). If OWL-ViT won't load at all, that's the Py3.8 cutoff (4.42+).
 - **OWL engine build hangs / OOM** (8 GB Orin Nano, nanoowl issue #33) → add 8–16 GB
   swap and disable zram before `prepare_nanoowlsam_engines.sh`, or extract a baked
   engine from `dustynv/nanoowl:r35.3.1` instead.

@@ -65,6 +65,7 @@ sudo docker run -d --name g1-detect \
   -e ALWAYS_ON="${ALWAYS_ON}" \
   -e TRANSFORMERS_OFFLINE=1 \
   -e HF_HUB_OFFLINE=1 \
+  -e PYTHONPATH=/opt/nanoowl \
   "${IMAGE}" \
   python3 /app/detect_service.py
 
