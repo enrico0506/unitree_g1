@@ -60,13 +60,13 @@ def _sector(ang_deg):
 
 def test_ring_empty_and_floor():
     d = _mk_dnf()
-    out, n = d._compute_ring(np.zeros((0, 3), np.float32))
+    out, _pd, n = d._compute_ring(np.zeros((0, 3), np.float32))
     assert np.isnan(out).all() and n == 0, "empty -> all NaN"
     # floor-only: many points at height ~0 (below ground_clear) -> no obstacle sector
     floor = np.array([_pt(fw, lf, 0.0, d)
                       for fw in np.arange(0.5, 2.4, 0.05) for lf in np.arange(-0.6, 0.6, 0.05)],
                      np.float32)
-    out, n = d._compute_ring(floor)
+    out, _pd, n = d._compute_ring(floor)
     assert np.isnan(out).all(), "floor must NOT produce obstacle sectors (no false positive)"
     print("PASS  empty + floor-only -> no reading")
 
@@ -80,7 +80,7 @@ def test_ring_detects_near_obstacle():
     floor = np.array([_pt(fw, lf, 0.0, d)
                       for fw in np.arange(0.5, 2.4, 0.08) for lf in np.arange(-0.6, 0.6, 0.08)],
                      np.float32)
-    out, n = d._compute_ring(np.vstack([floor, obj]))
+    out, _pd, n = d._compute_ring(np.vstack([floor, obj]))
     s = _sector(0.0)
     assert np.isfinite(out[s]), f"forward sector {s} should report the object"
     assert abs(out[s] - 1.0) < 0.15, f"reported dist {out[s]:.2f} ~ 1.0 m"
@@ -93,7 +93,7 @@ def test_ring_fov_clip():
     ang = math.radians(70.0)
     obj = np.array([_pt(1.0 * math.cos(ang), 1.0 * math.sin(ang), h, d)
                     for h in (0.15, 0.18, 0.2)] * 3, np.float32)
-    out, _ = d._compute_ring(obj)
+    out, _pd, _n = d._compute_ring(obj)
     assert np.isnan(out).all(), "object outside camera FOV must not report"
     print("PASS  object outside FOV -> no reading (no phantom)")
 
@@ -149,17 +149,19 @@ def test_ring_detects_cable_rejects_floor_noise():
     cable = np.array([_pt(1.0 + dx, ly, 0.04, d)
                       for dx in (-0.01, 0.0, 0.01) for ly in np.arange(-0.15, 0.16, 0.03)],
                      np.float32)
-    out, _ = d._compute_ring(cable)
+    out, kpts, _n = d._compute_ring(cable)
     s = _sector(0.0)
     assert np.isfinite(out[s]), "4 cm floor cable at 1 m should be detected (ring clearance 3 cm)"
     assert abs(out[s] - 1.0) < 0.15, f"cable dist {out[s]:.2f} ~ 1.0 m"
+    assert len(kpts) > 0, "cable must yield near-ground viz points for the 3D sphere"
     # floor NOISE just below the ring clearance (<=2 cm) must NOT read as a cable
     noise = np.array([_pt(fw, ly, 0.02, d)
                       for fw in np.arange(0.5, 2.0, 0.05) for ly in np.arange(-0.4, 0.4, 0.05)],
                      np.float32)
-    out2, _ = d._compute_ring(noise)
+    out2, kpts2, _n = d._compute_ring(noise)
     assert np.isnan(out2).all(), "sub-clearance floor noise must not phantom-trigger cables"
-    print(f"PASS  cable: 4cm cable @1m detected ({out[s]:.2f} m); 2cm floor noise rejected")
+    assert len(kpts2) == 0, "sub-clearance noise must not emit viz points"
+    print(f"PASS  cable: 4cm cable @1m detected ({out[s]:.2f} m), {len(kpts)} viz pts; noise rejected")
 
 
 if __name__ == "__main__":

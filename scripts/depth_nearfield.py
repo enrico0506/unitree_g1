@@ -108,6 +108,7 @@ class DepthNearField:
         self._lock = threading.Lock()
         self._front = None         # last computed nearest forward distance (m) or None
         self._ring = None          # last per-sector ring (np (ring_n,), NaN = no reading) or None
+        self._points = None        # last kept near-ground points (M,3) for the 3D viz, or None
         self._n_near = 0           # qualifying point count (for telemetry / validation)
         self._frame_ok = True      # last frame passed the floor-ramp sanity check
         self._floor_ramp = 0.0     # last measured floor-height ramp (m) across the forward band
@@ -179,8 +180,9 @@ class DepthNearField:
         near obstacle, or a depth hole, leaves NaN so the guard merge keeps the lidar value).
         """
         out = np.full(self.ring_n, np.nan, dtype=np.float64)
+        empty = np.zeros((0, 3), dtype=np.float32)
         if cloud is None or len(cloud) == 0:
-            return out, 0
+            return out, empty, 0
         X = cloud[:, 0]
         Y = cloud[:, 1]
         Zc = cloud[:, 2] - self.ls_mount_height
@@ -197,7 +199,13 @@ class DepthNearField:
         )
         n = int(np.count_nonzero(keep))
         if n == 0:
-            return out, 0
+            return out, empty, 0
+        # kept near-ground points for the viz, in the SAME frame as the node's msg.points
+        # (x-fwd, y-left, z = height above floor) -- so the 3D sphere shows exactly the
+        # near-floor obstacles the depth fusion reacts to. Strided to a bounded count.
+        kpts = np.column_stack((fwd[keep], left[keep], height[keep])).astype(np.float32)
+        if kpts.shape[0] > 800:
+            kpts = kpts[:: (kpts.shape[0] // 800 + 1)]
         a = ang[keep]
         h = horiz[keep]
         sector = (np.floor((a - self.ring_start_deg) / self.ring_bin_deg)
@@ -205,7 +213,7 @@ class DepthNearField:
         counts = np.bincount(sector, minlength=self.ring_n)
         populated = counts >= self.ring_min_pts
         if not populated.any():
-            return out, n
+            return out, kpts, n
         # k-th nearest per sector via one lexsort (sector, then range) + block starts.
         order = np.lexsort((h, sector))
         h_sorted = h[order]
@@ -214,7 +222,7 @@ class DepthNearField:
         kth_rank = np.minimum(self.kth, counts)          # clamp k to the sector's count
         kth_idx = starts + (kth_rank - 1)
         out[populated] = h_sorted[kth_idx[populated]]
-        return out, n
+        return out, kpts, n
 
     def _frame_sanity(self, cloud):
         """Frame-sanity metrics. With the CORRECT mount frame the derotated floor sits at
@@ -260,9 +268,9 @@ class DepthNearField:
                               and offset <= self.frame_offset_tol)
                     if ok:
                         front, n = self._compute(cloud)
-                        ring, _nr = self._compute_ring(cloud)
+                        ring, dpts, _nr = self._compute_ring(cloud)
                     else:
-                        front, ring, n = None, None, 0    # bad frame -> fail to lidar-only
+                        front, ring, dpts, n = None, None, None, 0  # bad frame -> fail to lidar-only
                         if cloud is not None and (self._warn_ct % 30 == 0):
                             print(f"[DEPTH] frame rejected (floor ramp {ramp:.2f} m / offset "
                                   f"{offset:.2f} m, floor pts {nf}); depth OFF this frame -- "
@@ -271,6 +279,7 @@ class DepthNearField:
                     with self._lock:
                         self._front = front
                         self._ring = ring
+                        self._points = dpts
                         self._n_near = n
                         self._frame_ok = ok
                         self._floor_ramp = ramp
@@ -280,6 +289,7 @@ class DepthNearField:
                     with self._lock:
                         self._front = None
                         self._ring = None
+                        self._points = None
                         self._n_near = 0
                         self._frame_ok = False
                     print(f"[DEPTH] compute error: {e}", flush=True)
@@ -287,6 +297,7 @@ class DepthNearField:
                 with self._lock:
                     self._front = None
                     self._ring = None
+                    self._points = None
             dt = time.monotonic() - t0
             if dt < self.period:
                 self._stop.wait(self.period - dt)
@@ -317,6 +328,19 @@ class DepthNearField:
             "start_deg": self.ring_start_deg,
             "dist": [None if not np.isfinite(v) else round(float(v), 3) for v in ring],
         }
+
+    def front_points(self):
+        """Kept near-ground DEPTH points as a flat [x0,y0,z0, ...] list (x-fwd, y-left,
+        z = height above floor) -- same frame/units as the node's msg.points, so the 3D
+        sphere can render the near-floor obstacles (e.g. a cable) the depth fusion sees
+        but the up-tilted Mid-360 misses. None when disabled / frame rejected."""
+        if not self.enabled:
+            return None
+        with self._lock:
+            pts = self._points
+        if pts is None or len(pts) == 0:
+            return None
+        return [round(float(v), 2) for v in np.asarray(pts, dtype=np.float32).ravel()]
 
     def telemetry(self):
         with self._lock:

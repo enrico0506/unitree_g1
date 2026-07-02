@@ -350,14 +350,29 @@
     if (ring && Array.isArray(ring.dist)) {
       const n = ring.dist.length;
       const binRad = (ring.bin_deg * Math.PI) / 180;
-      const hasState = Array.isArray(ring.state);
-      const hasProb = Array.isArray(ring.prob);
+      // fold the near-ground DEPTH ring in (min-merge, depth-fired sectors -> occupied) so
+      // the 2D ring shows EXACTLY what the fused guard reacts to -- incl. cables the Mid-360
+      // misses. Never mutates msg; geometry must match (same 72/5deg/-180 ring).
+      let dist = ring.dist, state = ring.state, prob = ring.prob;
+      const dr = msg && msg.depth_ring;
+      if (dr && Array.isArray(dr.dist) && dr.dist.length === n) {
+        dist = ring.dist.slice();
+        state = Array.isArray(ring.state) ? ring.state.slice() : new Array(n).fill(0);
+        prob = Array.isArray(ring.prob) ? ring.prob.slice() : new Array(n).fill(0);
+        for (let i = 0; i < n; i++) {
+          const dv = dr.dist[i];
+          if (dv == null) continue;
+          if (dist[i] == null || dv < dist[i]) { dist[i] = dv; state[i] = 2; prob[i] = 1; }
+        }
+      }
+      const hasState = Array.isArray(state);
+      const hasProb = Array.isArray(prob);
       for (let i = 0; i < n; i++) {
         const cRad = ((ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI) / 180;
-        const d = ring.dist[i];
+        const d = dist[i];
         if (hasState) {
-          const st = ring.state[i];
-          const p = hasProb ? clamp(ring.prob[i], 0, 1) : (st === 2 ? 1 : 0);
+          const st = state[i];
+          const p = hasProb ? clamp(prob[i], 0, 1) : (st === 2 ? 1 : 0);
           if (st === 2) {                      // occupied
             const reach = num(d) ? d / RADAR_RANGE_M : 1;
             sector(ctx, cx, cy, R, cRad, binRad, reach, occColor(d, stop, slow),

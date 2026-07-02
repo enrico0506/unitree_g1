@@ -312,6 +312,15 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
         px.push(dd * Math.cos(a)); py.push(dd * Math.sin(a)); ph.push(0.4);
       }
     }
+    // ALSO fold in the near-ground DEPTH points (cables / low objects the up-tilted
+    // Mid-360 cannot see) so the sphere shows EXACTLY what the fused guard reacts to.
+    // Same frame (x-fwd, y-left, z=height above floor); they cluster + box like the rest.
+    const dpts = msg && msg.depth_points;
+    if (Array.isArray(dpts) && dpts.length >= 3) {
+      const room = (MAX_POINTS - px.length) * 3;
+      const m = Math.min(dpts.length - (dpts.length % 3), Math.max(0, room));
+      for (let i = 0; i < m; i += 3) { px.push(dpts[i]); py.push(dpts[i + 1]); ph.push(dpts[i + 2]); }
+    }
 
     const cells = voxelize((emit) => { for (let i = 0; i < px.length; i++) emit(px[i], py[i], ph[i], i); });
     const clusters = clusterCells(cells);

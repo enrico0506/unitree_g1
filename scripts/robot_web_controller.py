@@ -1095,6 +1095,10 @@ async def broadcast_loop():
             tm = guard.telemetry()
             if depth_nf is not None:
                 tm["depth"] = depth_nf.telemetry()
+                # near-ground DEPTH detections (cables/low objects the Mid-360 can't see) so
+                # the 2D ring + 3D sphere show EXACTLY what the fused guard reacts to.
+                tm["depth_points"] = depth_nf.front_points()   # flat [x,y,z] (viz frame) or None
+                tm["depth_ring"] = depth_nf.front_ring()       # per-sector depth ring or None
             await broadcast(tm)
 
         await asyncio.sleep(0.1)
