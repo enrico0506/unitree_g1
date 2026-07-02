@@ -46,6 +46,15 @@ _DEFAULTS = {
     "ring_bin_deg": 5.0,       # MUST match the lidar ring (obstacle.yaml ring_bin_deg) to merge
     "ring_fov_half_deg": 43.0, # D435i horizontal half-FOV (~87 deg HFOV) the camera actually sees
     "ring_min_points": 2,      # min near points in a 5 deg sector before it reports (per-sector)
+    # --- frame self-validation: a wrong mount pitch/height tilts the derotated floor so its
+    #     height ramps with range. With the correct frame a flat floor sits at height ~0 at
+    #     ALL ranges. If the floor ramps more than the tolerance, the frame is UNTRUSTWORTHY
+    #     -> emit NO ring/scalar this frame (fail to lidar-only), never a false near-stop.
+    #     Makes depth_fusion.enabled safe off-robot: watch telemetry frame_ok on the robot. ---
+    "frame_check": True,
+    "frame_floor_ramp_m": 0.15,  # max floor-height DRIFT across the 0.5-2 m band (wrong pitch)
+    "frame_floor_offset_m": 0.12, # max |median floor height| from 0 (wrong camera_height)
+    "frame_min_floor_pts": 30,   # need this many candidate floor points to judge the frame
 }
 
 
@@ -84,11 +93,19 @@ class DepthNearField:
         self.ring_start_deg = -180.0                         # shared convention with the node/guard
         self.ring_fov_half = float(cfg.get("ring_fov_half_deg", 43.0))
         self.ring_min_pts = max(1, int(cfg.get("ring_min_points", 2)))
+        # frame self-validation
+        self.frame_check = bool(cfg.get("frame_check", True))
+        self.frame_ramp_tol = float(cfg.get("frame_floor_ramp_m", 0.15))
+        self.frame_offset_tol = float(cfg.get("frame_floor_offset_m", 0.12))
+        self.frame_min_floor_pts = int(cfg.get("frame_min_floor_pts", 30))
 
         self._lock = threading.Lock()
         self._front = None         # last computed nearest forward distance (m) or None
         self._ring = None          # last per-sector ring (np (ring_n,), NaN = no reading) or None
         self._n_near = 0           # qualifying point count (for telemetry / validation)
+        self._frame_ok = True      # last frame passed the floor-ramp sanity check
+        self._floor_ramp = 0.0     # last measured floor-height ramp (m) across the forward band
+        self._warn_ct = 0          # throttle for the frame-rejected warning
         self._live = False
         self._stamp = 0.0
         self._stop = threading.Event()
@@ -193,18 +210,64 @@ class DepthNearField:
         out[populated] = h_sorted[kth_idx[populated]]
         return out, n
 
+    def _frame_sanity(self, cloud):
+        """Frame-sanity metrics. With the CORRECT mount frame the derotated floor sits at
+        height ~0 at every forward range. Returns (ramp_m, offset_m, n_floor):
+          - offset = |median floor height|  -> catches a wrong camera_height (uniform shift)
+          - ramp   = spread of per-range-bin floor height -> catches a wrong mount pitch (tilt)
+        A large ramp/offset (or too few floor points) => untrustworthy frame."""
+        if cloud is None or len(cloud) == 0:
+            return 0.0, 0.0, 0
+        X = cloud[:, 0]
+        Y = cloud[:, 1]
+        Zc = cloud[:, 2] - self.ls_mount_height
+        fwd = X * self._ct + Zc * self._st
+        up = -X * self._st + Zc * self._ct
+        height = up + self.cam_h
+        ang = np.degrees(np.arctan2(Y, fwd))
+        m = ((fwd > 0.5) & (fwd < 2.0) & (np.abs(ang) < self.ring_fov_half)
+             & (np.abs(height) < 0.6))               # plausible floor band only
+        nf = int(np.count_nonzero(m))
+        if nf < self.frame_min_floor_pts:
+            return 0.0, 0.0, nf
+        fb, hb = fwd[m], height[m]
+        offset = abs(float(np.median(hb)))
+        floors = []
+        for lo, hi in ((0.5, 1.0), (1.0, 1.5), (1.5, 2.0)):
+            sel = (fb >= lo) & (fb < hi)
+            if np.count_nonzero(sel) >= 5:
+                floors.append(float(np.percentile(hb[sel], 10.0)))   # 10th pct = floor
+        ramp = float(max(floors) - min(floors)) if len(floors) >= 2 else 0.0
+        return ramp, offset, nf
+
     def _run(self):
         while not self._stop.is_set():
             t0 = time.monotonic()
             if self.enabled and self.lidar is not None:
                 try:
                     cloud = self.lidar.get_cloud()
-                    front, n = self._compute(cloud)
-                    ring, _nr = self._compute_ring(cloud)
+                    ok, ramp, offset, nf = True, 0.0, 0.0, 0
+                    if self.frame_check:
+                        ramp, offset, nf = self._frame_sanity(cloud)
+                        ok = (nf >= self.frame_min_floor_pts
+                              and ramp <= self.frame_ramp_tol
+                              and offset <= self.frame_offset_tol)
+                    if ok:
+                        front, n = self._compute(cloud)
+                        ring, _nr = self._compute_ring(cloud)
+                    else:
+                        front, ring, n = None, None, 0    # bad frame -> fail to lidar-only
+                        if cloud is not None and (self._warn_ct % 30 == 0):
+                            print(f"[DEPTH] frame rejected (floor ramp {ramp:.2f} m / offset "
+                                  f"{offset:.2f} m, floor pts {nf}); depth OFF this frame -- "
+                                  f"CHECK D435i pitch/height.", flush=True)
+                        self._warn_ct += 1
                     with self._lock:
                         self._front = front
                         self._ring = ring
                         self._n_near = n
+                        self._frame_ok = ok
+                        self._floor_ramp = ramp
                         self._live = cloud is not None
                         self._stamp = time.monotonic()
                 except Exception as e:
@@ -212,6 +275,7 @@ class DepthNearField:
                         self._front = None
                         self._ring = None
                         self._n_near = 0
+                        self._frame_ok = False
                     print(f"[DEPTH] compute error: {e}", flush=True)
             else:
                 with self._lock:
@@ -255,4 +319,6 @@ class DepthNearField:
                 "front_near_m": (round(self._front, 3) if self._front is not None else None),
                 "n_near": int(self._n_near),
                 "live": bool(self._live),
+                "frame_ok": bool(self._frame_ok),        # watch this on-robot to validate the frame
+                "floor_ramp_m": round(float(self._floor_ramp), 3),
             }

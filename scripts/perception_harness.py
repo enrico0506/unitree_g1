@@ -82,6 +82,8 @@ def make_node(overrides=None):
     n.max_above = float(cfg["obstacle_max_above_m"])
     # QW1 -- per-cell elevation ground seg (mirror __init__; gated on ground.py import)
     n.ground_elevation = bool(cfg.get("ground_elevation", True)) and mod.ground is not None
+    n.ground_use_gravity = bool(cfg.get("ground_use_gravity", True))
+    n._gravity = None                                  # harness feeds no IMU -> no levelling
     n.elev_cell = float(cfg.get("elev_cell_m", 0.20))
     n.elev_floor_pct = float(cfg.get("elev_floor_percentile", 10.0))
     n.elev_min_cell_pts = max(1, int(cfg.get("elev_min_cell_points", 3)))

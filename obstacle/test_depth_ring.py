@@ -37,6 +37,10 @@ def _mk_dnf():
     d.ring_fov_half = 43.0
     d.ring_min_pts = 2
     d.kth = 4
+    d.frame_check = True
+    d.frame_ramp_tol = 0.15
+    d.frame_offset_tol = 0.12
+    d.frame_min_floor_pts = 30
     return d
 
 
@@ -113,9 +117,35 @@ def test_merge_fail_safe_and_monotonic():
     print("PASS  merge: min-merge, never-clear, geometry-guarded, non-mutating")
 
 
+def _floor(d, dz=0.0):
+    return np.array([_pt(fw, lf, dz, d)
+                     for fw in np.arange(0.5, 2.0, 0.04) for lf in np.arange(-0.6, 0.6, 0.05)],
+                    np.float32)
+
+
+def test_frame_check_rejects_bad_frame():
+    d = _mk_dnf()  # assumes the validated 47.6 deg pitch / 1.30 m height
+    ok = lambda r, o, n: (n >= d.frame_min_floor_pts and r <= d.frame_ramp_tol
+                          and o <= d.frame_offset_tol)
+    # CORRECT frame: flat floor at the assumed geometry -> accept
+    r, o, n = d._frame_sanity(_floor(d))
+    assert ok(r, o, n), f"good frame wrongly rejected: ramp={r:.3f} off={o:.3f} n={n}"
+    # WRONG PITCH: same physical floor captured at a 12 deg-off true pitch -> floor ramps
+    d_true = _mk_dnf(); th = math.radians(47.6 - 12.0)
+    d_true._ct, d_true._st = math.cos(th), math.sin(th)
+    r2, o2, _ = d._frame_sanity(_floor(d_true))
+    assert not ok(r2, o2, n), f"wrong-pitch frame NOT caught: ramp={r2:.3f} off={o2:.3f}"
+    # WRONG HEIGHT: floor physically 0.3 m off from the assumed camera_height -> offset
+    r3, o3, _ = d._frame_sanity(_floor(d, dz=0.30))
+    assert not ok(r3, o3, n), f"wrong-height frame NOT caught: ramp={r3:.3f} off={o3:.3f}"
+    print(f"PASS  frame-check: good(ramp {r:.2f}/off {o:.2f}) accept; "
+          f"12deg-pitch(ramp {r2:.2f}) + 0.3m-height(off {o3:.2f}) rejected -> lidar-only")
+
+
 if __name__ == "__main__":
     test_ring_empty_and_floor()
     test_ring_detects_near_obstacle()
     test_ring_fov_clip()
     test_merge_fail_safe_and_monotonic()
+    test_frame_check_rejects_bad_frame()
     print("\nALL DEPTH-RING TESTS PASS")

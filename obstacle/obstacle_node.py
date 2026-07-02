@@ -309,6 +309,10 @@ class ObstacleNode(Node):
                 tau_s=float(c.get("occ_decay_s", 0.7)),
                 l_high=float(c.get("occ_l_high", 1.5)))   # ~2 returns to mark occupied (noise reject)
         self._deskewer = ImuGyroDeskewer(buffer_s=0.5) if self.use_deskew else None
+        # QW1 fix 1.5: EMA of the IMU accelerometer = measured gravity in the sensor frame,
+        # used to LEVEL the elevation-grid ground seg (previously fed raw z, assumed z-up).
+        self.ground_use_gravity = bool(c.get("ground_use_gravity", True))
+        self._gravity = None           # (3,) float32 accelerometer EMA, or None until first IMU
         self._last_proc_t = None       # wall time of last processed frame (occupancy dt)
 
         # --- per-frame state --------------------------------------------------
@@ -389,7 +393,14 @@ class ObstacleNode(Node):
     # ------------------------------------------------------------------- IMU
     def _on_imu(self, msg):
         """Buffer the 200 Hz Livox gyro for cloud de-skew. Runs on a different
-        callback than _on_cloud; ImuGyroDeskewer.add_gyro is internally locked."""
+        callback than _on_cloud; ImuGyroDeskewer.add_gyro is internally locked.
+        Also maintains a slow EMA of the accelerometer = measured gravity in the
+        sensor frame, used to LEVEL the elevation-grid ground seg (QW1 fix 1.5)."""
+        a = msg.linear_acceleration
+        g = np.array((float(a.x), float(a.y), float(a.z)), dtype=np.float32)
+        if np.isfinite(g).all():
+            # heavy smoothing (alpha=0.02) rejects transient motion accel, keeps gravity
+            self._gravity = g if self._gravity is None else (0.98 * self._gravity + 0.02 * g)
         if self._deskewer is None:
             return
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -812,6 +823,11 @@ class ObstacleNode(Node):
             # ~12 cm inlier band. Global plane above/floor_abc kept above for the self-mask
             # height test, viz and the front-cone diagnostic. True == obstacle (keep).
             pts = np.column_stack((x, y, z)).astype(np.float32, copy=False)
+            # QW1 fix 1.5: level the elevation-grid input against measured gravity so a
+            # tilted/swaying sensor's per-cell floor is computed in a gravity-aligned frame
+            # (rotation preserves point order -> the returned mask still aligns to x/y/z).
+            if self.ground_use_gravity and self._gravity is not None:
+                pts = ground.level_by_gravity(pts, self._gravity)
             keep_ground = ground.segment_obstacles_elevation(
                 pts, cell=self.elev_cell, ground_clearance=self.ground_clear,
                 max_above=self.max_above, floor_pct=self.elev_floor_pct,
