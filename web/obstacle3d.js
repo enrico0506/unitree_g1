@@ -26,21 +26,43 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
   const DEF_STOP = 0.75, DEF_SLOW = 1.75;
   let STOP_M = DEF_STOP, SLOW_M = DEF_SLOW;
   const H_MAX = 1.9;                   // height (m) mapped to the top of the lightness ramp
-  const CELL = 0.13;                   // clustering cell size (m)
+  const CELL = 0.13;                   // clustering / voxel cell size (m)
   const MAX_POINTS = 4096;             // point-cloud buffer cap
+  const MAX_CELLS = 1500;              // columns-mode instanced-column cap
   const MAX_BOXES = 24;                // pooled per-object bounding boxes
   const MIN_CLUSTER_CELLS = 4;         // reject specks (< this many cells = noise, no box/colour)
+  const MIN_H = 0.06;                  // columns mode: min drawn column height (low hits stay visible)
+  const POINT_SIZE = 0.18;             // points mode: disc size (m) -- bigger = fuller/easier to see
   const TRACK_GATE_M = 0.65;           // nearest-centroid association gate (robot-relative frame)
   const TRACK_MISS_MAX = 6;            // retire a track after this many unmatched frames
   const D435I_FOV_DEG = 87;
   const COL = { grid: 0x232c3e, dome: 0x35507d, robot: 0x5c8df2,
                 stop: 0xff4747, slow: 0xff8636, noise: 0x5b647a };
 
-  let scene, camera, renderer, controls, cloud, cloudPos, cloudCol, boxes = [];
-  let stopRing, slowRing, mount, booted = false, lastMsg = null;
+  let scene, camera, renderer, controls, cloud, cloudPos, cloudCol, boxes = [], columns;
+  let stopRing, slowRing, mount, booted = false, lastMsg = null, toggleBtn = null;
+  // render mode: "points" (per-object coloured cloud) or "columns" (legacy height-coloured
+  // voxel columns). Remembered across reloads.
+  let mode = "points";
+  try { const s = localStorage.getItem("obs3dMode"); if (s === "columns" || s === "points") mode = s; } catch (e) {}
   const _red = new THREE.Color(COL.stop), _amber = new THREE.Color(COL.slow),
         _c = new THREE.Color(), _c2 = new THREE.Color();
+  const _m = new THREE.Matrix4(), _p = new THREE.Vector3(),
+        _q = new THREE.Quaternion(), _s = new THREE.Vector3();
   function clampv(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  function applyMode() {
+    if (cloud) cloud.visible = (mode === "points");
+    if (columns) columns.visible = (mode === "columns");
+    if (toggleBtn) toggleBtn.textContent = (mode === "points" ? "◾ Columns" : "• Points");
+  }
+  function setMode(m) {
+    if (m !== "points" && m !== "columns") return;
+    mode = m;
+    try { localStorage.setItem("obs3dMode", m); } catch (e) {}
+    applyMode();
+    if (lastMsg) refresh(lastMsg);
+  }
 
   // --- temporal object tracker: keeps a colour/ID stable across frames so the
   //     per-object hues don't strobe at 10 Hz (which would defeat recognition). ---
@@ -50,6 +72,14 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
   // stable hue per object id (golden-angle -> maximally distinct categorical colours)
   function hueColor(id, out) {
     return out.setHSL((id * 0.61803398875) % 1, 0.68, 0.56);
+  }
+
+  // columns mode: legacy height ramp cyan(ground) -> green -> amber -> red(tall)
+  const _RAMP = [[0x28e0d0], [0x3fd39b], [0xff8636], [0xff4747]].map((c) => new THREE.Color(c[0]));
+  function heightColor(h, out) {
+    const t = clampv(h / H_MAX, 0, 1) * (_RAMP.length - 1);
+    const i = Math.min(_RAMP.length - 2, Math.floor(t));
+    return out.copy(_RAMP[i]).lerp(_RAMP[i + 1], t - i);
   }
 
   // soft round sprite for the points (depth-correct discs, not square splats)
@@ -145,10 +175,18 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
     geo.setAttribute("color", new THREE.BufferAttribute(cloudCol, 3).setUsage(THREE.DynamicDrawUsage));
     geo.setDrawRange(0, 0);
     cloud = new THREE.Points(geo, new THREE.PointsMaterial({
-      size: 0.11, sizeAttenuation: true, vertexColors: true, map: discTexture(),
+      size: POINT_SIZE, sizeAttenuation: true, vertexColors: true, map: discTexture(),
       transparent: true, alphaTest: 0.5, depthWrite: true,
     }));
     scene.add(cloud);
+
+    // --- legacy voxel COLUMNS (toggle target): one height-coloured box per occupied cell ---
+    const boxGeo = new THREE.BoxGeometry(1, 1, 1); boxGeo.translate(0, 0, 0.5);  // grow from z=0
+    columns = new THREE.InstancedMesh(boxGeo, new THREE.MeshLambertMaterial(), MAX_CELLS);
+    columns.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    columns.count = 0;
+    scene.add(columns);
+    scene.add(new THREE.DirectionalLight(0xffffff, 0.6).translateZ(5));  // shading for the boxes
 
     // --- pooled per-object bounding boxes (unit cube edges, scaled/placed per frame) ---
     const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
@@ -158,7 +196,22 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
       b.visible = false; scene.add(b); boxes.push(b);
     }
 
+    // mode toggle: a small fixed corner button + the 'c' key (choice persists).
+    toggleBtn = document.createElement("button");
+    toggleBtn.id = "obs3d-mode"; toggleBtn.title = "Toggle 3D view: points / columns (c)";
+    toggleBtn.style.cssText = "position:fixed;bottom:10px;left:10px;z-index:9999;" +
+      "padding:4px 9px;font:600 12px system-ui,sans-serif;color:#E9EDF6;" +
+      "background:rgba(20,26,38,0.85);border:1px solid #5C8DF2;border-radius:6px;cursor:pointer;";
+    toggleBtn.onclick = () => setMode(mode === "points" ? "columns" : "points");
+    document.body.appendChild(toggleBtn);
+    window.addEventListener("keydown", (e) => {
+      const tag = (e.target && e.target.tagName) || "";
+      if ((e.key === "c" || e.key === "C") && !/INPUT|TEXTAREA/.test(tag))
+        setMode(mode === "points" ? "columns" : "points");
+    });
+
     booted = true;
+    applyMode();
     if (lastMsg) refresh(lastMsg);
     animate();
     window.addEventListener("resize", onResize);
@@ -268,23 +321,39 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
     const keyToCl = new Map();
     for (const cl of clusters) for (const k of cl.keys) keyToCl.set(k, cl);
 
-    // write the point cloud: colour each point by its object's stable hue, with height
-    // as a lightness cue within that hue; ungrouped (noise) points -> dim steel.
-    const n = Math.min(px.length, MAX_POINTS);
-    for (let i = 0; i < n; i++) {
-      cloudPos[i * 3] = px[i]; cloudPos[i * 3 + 1] = py[i]; cloudPos[i * 3 + 2] = ph[i];
-      const key = Math.round(px[i] / CELL) + "," + Math.round(py[i] / CELL);
-      const cl = keyToCl.get(key);
-      if (cl) {
-        hueColor(cl.id, _c);
-        _c.getHSL(_hsl);
-        _c.setHSL(_hsl.h, _hsl.s, clampv(0.30 + 0.5 * (ph[i] / H_MAX), 0.22, 0.82));
-      } else { _c.setHex(COL.noise); }
-      cloudCol[i * 3] = _c.r; cloudCol[i * 3 + 1] = _c.g; cloudCol[i * 3 + 2] = _c.b;
+    if (mode === "points") {
+      // POINTS: colour each point by its object's stable hue, height as a lightness cue;
+      // ungrouped (noise) points -> dim steel.
+      const n = Math.min(px.length, MAX_POINTS);
+      for (let i = 0; i < n; i++) {
+        cloudPos[i * 3] = px[i]; cloudPos[i * 3 + 1] = py[i]; cloudPos[i * 3 + 2] = ph[i];
+        const key = Math.round(px[i] / CELL) + "," + Math.round(py[i] / CELL);
+        const cl = keyToCl.get(key);
+        if (cl) {
+          hueColor(cl.id, _c);
+          _c.getHSL(_hsl);
+          _c.setHSL(_hsl.h, _hsl.s, clampv(0.30 + 0.5 * (ph[i] / H_MAX), 0.22, 0.82));
+        } else { _c.setHex(COL.noise); }
+        cloudCol[i * 3] = _c.r; cloudCol[i * 3 + 1] = _c.g; cloudCol[i * 3 + 2] = _c.b;
+      }
+      cloud.geometry.setDrawRange(0, n);
+      cloud.geometry.attributes.position.needsUpdate = true;
+      cloud.geometry.attributes.color.needsUpdate = true;
+    } else {
+      // COLUMNS (legacy): one height-coloured box per occupied cell.
+      let ci = 0;
+      for (const cc of cells.values()) {
+        if (ci >= MAX_CELLS) break;
+        _s.set(CELL, CELL, Math.max(MIN_H, cc.h));
+        _m.compose(_p.set(cc.cx, cc.cy, 0), _q, _s);
+        columns.setMatrixAt(ci, _m);
+        heightColor(cc.h, _c); columns.setColorAt(ci, _c);
+        ci++;
+      }
+      columns.count = ci;
+      columns.instanceMatrix.needsUpdate = true;
+      if (columns.instanceColor) columns.instanceColor.needsUpdate = true;
     }
-    cloud.geometry.setDrawRange(0, n);
-    cloud.geometry.attributes.position.needsUpdate = true;
-    cloud.geometry.attributes.color.needsUpdate = true;
 
     // per-object bounding boxes, coloured by the object hue, tinted toward red when the
     // object is inside the slow/stop band (threat) so the safety cue survives.
@@ -332,6 +401,9 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
         }
       } catch (e) { /* defensive */ }
     },
+    setMode: function (m) { try { setMode(m); } catch (e) {} },
+    toggleMode: function () { try { setMode(mode === "points" ? "columns" : "points"); } catch (e) {} },
+    getMode: function () { return mode; },
   };
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", build);
