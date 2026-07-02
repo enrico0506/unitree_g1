@@ -256,58 +256,122 @@
 
   function fmtDist(v) { return num(v) ? v.toFixed(2) + " m" : "--"; }
 
-  const RADAR_SIZE = 180, RADAR_R = 80;       // CSS px; R leaves a margin
-  const Z_STOP = 0.7, Z_SLOW = 2.0;           // thresholds (match lidar.js)
-  const RADAR_RANGE_M = 3.0;
+  const RADAR_RANGE_M = 3.0;                  // dome radius the ring maps onto
+  // Guard thresholds (metres). Defaults MATCH the node (0.75 / 1.75); the real
+  // values ride in on msg.stop_m / msg.slow_m and override these per frame. These
+  // are the ONLY place thresholds live in this file (see thresholds()).
+  const DEF_STOP = 0.75, DEF_SLOW = 1.75;
+  const D435I_FOV_DEG = 87;                   // forward depth-camera cone hint
   const RC = { stop: "#FF4747", slow: "#FF8636", clear: "#3FD39B",
-               grid: "#232C3E", dim: "#7E879B" };
+               free: "#3FD39B", unknown: "#8A93A6",
+               grid: "#232C3E", dim: "#7E879B", origin: "#E9EDF6", fov: "#5C8DF2" };
 
-  function radarZoneColor(d) {
-    if (d == null) return null;               // empty sector -> not drawn
-    if (d < Z_STOP) return RC.stop;
-    if (d < Z_SLOW) return RC.slow;
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  // Read the guard's real thresholds if present; else the node defaults (NOT 0.7/2.0).
+  function thresholds(msg) {
+    const stop = (msg && num(msg.stop_m)) ? msg.stop_m : DEF_STOP;
+    const slow = (msg && num(msg.slow_m)) ? msg.slow_m : DEF_SLOW;
+    return { stop, slow };
+  }
+
+  // "#rrggbb" -> [r,g,b] (0..255), then a linear lerp returning a css rgb() string.
+  function hexRGB(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+  function lerpHex(a, b, t) {
+    const A = hexRGB(a), B = hexRGB(b); t = clamp(t, 0, 1);
+    return "rgb(" + Math.round(A[0] + (B[0] - A[0]) * t) + ","
+                  + Math.round(A[1] + (B[1] - A[1]) * t) + ","
+                  + Math.round(A[2] + (B[2] - A[2]) * t) + ")";
+  }
+  // Occupied colour: amber (far / at slow) -> red (near / at stop) by proximity.
+  function occColor(d, stop, slow) {
+    if (!num(d)) return RC.slow;
+    return lerpHex(RC.slow, RC.stop, (slow - d) / ((slow - stop) || 1));
+  }
+  // Fallback (no state array): old zone colouring by raw distance; null -> not drawn.
+  function fallbackColor(d, stop, slow) {
+    if (d == null) return null;
+    if (d < stop) return RC.stop;
+    if (d < slow) return RC.slow;
     return RC.clear;
+  }
+
+  // Fill one polar sector (triangle from origin) — shared by every state.
+  function sector(ctx, cx, cy, R, cRad, binRad, reachFrac, fill, alpha) {
+    const r = R * clamp(reachFrac, 0, 1);
+    const a0 = cRad - binRad / 2, a1 = cRad + binRad / 2;
+    // robot frame (x fwd, y left) -> screen (canvas y is DOWN):
+    //   screenX = cx - r*sin(angle)  (+left -> screen-left)
+    //   screenY = cy - r*cos(angle)  (+fwd  -> screen-up)
+    ctx.fillStyle = fill; ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx - r * Math.sin(a0), cy - r * Math.cos(a0));
+    ctx.lineTo(cx - r * Math.sin(a1), cy - r * Math.cos(a1));
+    ctx.closePath();
+    ctx.fill();
   }
 
   // Draw the polar radar into a 2D context, centred in a `size`-CSS-px square.
   // Frame-agnostic so the same routine fills the small panel canvas AND the big
-  // top-right feed canvas (just a different size).
+  // top-right feed canvas (just a different size). Honest 3-state occupancy:
+  //   unknown -> faint gray full wedge   (we cannot see here; NOT drawn as clear)
+  //   free    -> faint green full wedge   (scanned & clear)
+  //   occupied-> amber..red spike to the hit, opacity scaled by occupancy prob
   function drawRadarGeom(ctx, size, msg) {
     const cx = size / 2, cy = size / 2, R = (size / 2) * 0.9;
+    const { stop, slow } = thresholds(msg);
     ctx.clearRect(0, 0, size, size);
 
-    // concentric range rings at stop / slow / max.
-    ctx.strokeStyle = RC.grid; ctx.lineWidth = 1;
-    [Z_STOP, Z_SLOW, RADAR_RANGE_M].forEach((rm) => {
+    // concentric range rings: stop (faint red), slow (faint amber), max (grid).
+    const ring2d = (rm, color, alpha) => {
+      ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.arc(cx, cy, R * Math.min(1, rm / RADAR_RANGE_M), 0, Math.PI * 2);
       ctx.stroke();
-    });
-    // forward crosshair (up = +X forward).
+    };
+    ring2d(stop, RC.stop, 0.35);
+    ring2d(slow, RC.slow, 0.30);
+    ring2d(RADAR_RANGE_M, RC.grid, 0.65);
+    ctx.globalAlpha = 1;
+
+    // forward crosshair (up = +X forward) + D435i forward FOV hint (dashed).
+    ctx.strokeStyle = RC.grid; ctx.globalAlpha = 0.6; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - R); ctx.stroke();
+    const half = ((D435I_FOV_DEG / 2) * Math.PI) / 180;
+    ctx.strokeStyle = RC.fov; ctx.globalAlpha = 0.28; ctx.setLineDash([4, 4]);
+    [-half, half].forEach((a) => {
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.lineTo(cx - R * Math.sin(a), cy - R * Math.cos(a)); ctx.stroke();
+    });
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
 
     const ring = msg && msg.ring;
     if (ring && Array.isArray(ring.dist)) {
       const n = ring.dist.length;
       const binRad = (ring.bin_deg * Math.PI) / 180;
+      const hasState = Array.isArray(ring.state);
+      const hasProb = Array.isArray(ring.prob);
       for (let i = 0; i < n; i++) {
+        const cRad = ((ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI) / 180;
         const d = ring.dist[i];
-        const col = radarZoneColor(d);
-        if (!col) continue;                   // clear/empty sector
-        const cDeg = ring.start_deg + (i + 0.5) * ring.bin_deg;
-        const cRad = (cDeg * Math.PI) / 180;
-        const r = R * Math.min(1, d / RADAR_RANGE_M);
-        const a0 = cRad - binRad / 2, a1 = cRad + binRad / 2;
-        // robot frame (x fwd, y left) -> screen (canvas y is DOWN):
-        //   screenX = cx - r*sin(angle)  (+left -> screen-left)
-        //   screenY = cy - r*cos(angle)  (+fwd  -> screen-up)
-        ctx.fillStyle = col; ctx.globalAlpha = 0.85;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(cx - r * Math.sin(a0), cy - r * Math.cos(a0));
-        ctx.lineTo(cx - r * Math.sin(a1), cy - r * Math.cos(a1));
-        ctx.closePath();
-        ctx.fill();
+        if (hasState) {
+          const st = ring.state[i];
+          const p = hasProb ? clamp(ring.prob[i], 0, 1) : (st === 2 ? 1 : 0);
+          if (st === 2) {                      // occupied
+            const reach = num(d) ? d / RADAR_RANGE_M : 1;
+            sector(ctx, cx, cy, R, cRad, binRad, reach, occColor(d, stop, slow),
+                   clamp(0.35 + 0.6 * p, 0, 1));
+          } else if (st === 1) {               // free / clear
+            sector(ctx, cx, cy, R, cRad, binRad, 1, RC.free, 0.10);
+          } else {                             // unknown (state 0 / anything else)
+            sector(ctx, cx, cy, R, cRad, binRad, 1, RC.unknown, 0.07);
+          }
+        } else {                               // fallback: old zone-by-distance
+          const col = fallbackColor(d, stop, slow);
+          if (!col) continue;                  // null sector -> not drawn
+          sector(ctx, cx, cy, R, cRad, binRad, d / RADAR_RANGE_M, col, 0.85);
+        }
       }
       ctx.globalAlpha = 1;
     } else {
@@ -316,6 +380,10 @@
       ctx.textAlign = "center";
       ctx.fillText("no ring data", cx, cy);
     }
+
+    // sensor origin dot (robot centre).
+    ctx.globalAlpha = 1; ctx.fillStyle = RC.origin;
+    ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2); ctx.fill();
   }
 
   // Size a canvas backing store to its CSS box (DPR-aware) and draw the radar,

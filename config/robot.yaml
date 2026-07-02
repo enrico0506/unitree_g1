@@ -77,8 +77,10 @@ gait:
 step:
   enabled: true            # master kill-switch: false = pacer is an unconditional no-op
   default_mode: continuous # startup mode; MUST be 'continuous' (== pass-through, today's behaviour)
-  distance_quantize: false # OPTIONAL: terminate ON on MEASURED odom displacement (per-mode target).
-                           # OFF until gantry-validated; auto-falls-back to time when odom is stale.
+  distance_quantize: true  # ENABLED to control STRIDE: ends the ON burst at `target` m of MEASURED
+                           # odom travel, so each step is ~target instead of 1.5-2.25x over (fixed timer).
+                           # This is the ONLY server-side stride knob (SDK has none). GANTRY-VALIDATE:
+                           # auto-falls-back to time-based when odom is stale (watch step_estimated).
   drive_timeout_s: 1.5     # distance-mode backstop: the ON window can never hang open longer than this
   idle_eps: 0.001          # |intent|>this on an axis == the operator is holding that direction
   # SETTLE GATE: a burst only (re)starts once the SHAPER's realized velocity has fallen
@@ -110,9 +112,17 @@ step:
     # rebalance. on_s 0.50 (~0.44 m/s) completes the weight transfer CLEANLY (confirmed).
     # That is about the floor for a clean velocity-pulsed step. To go FASTER raise on_s a
     # touch (0.52-0.55); if it ever half-steps again, raise on_s, do NOT lower it.
-    vx:   { mag_frac: 0.48, on_s: 0.54, off_s: 0.45, target: 0.22 }  # fwd/back ~0.50 m/s (faster+snappier so the step completes; low swing keeps it short)
-    vy:   { mag_frac: 0.62, on_s: 0.55, off_s: 0.50, target: 0.16 }  # strafe (slower axis -> higher frac)
-    vyaw: { mag_frac: 0.65, on_s: 0.42, off_s: 0.44, target: 0.22 }  # rotate: ~1.1 rad/s rate (clears the no-pivot threshold)
+    # SMALL = short STRIDE (little ground per step), the climb-mode feel. With
+    # distance_quantize:true (above) the ON burst ENDS the instant odom shows `target` m of
+    # real travel -> the stride is ~target instead of 1.5-2.25x over. `target` is THE stride
+    # knob now (off_s is back to short -> it only sets cadence, not stride). HARD FLOOR: the
+    # onboard walk controller's minimum step is ~0.2 m, so targets below that just hit the
+    # floor -- climb-mode-tiny is NOT reachable from walk-mode velocity (swing_height, the
+    # sub-floor lever, is disabled: SET_SWING_HEIGHT hangs on this firmware). Lower `target`
+    # to shorten the stride down to that floor; raise it for longer steps.
+    vx:   { mag_frac: 0.48, on_s: 0.54, off_s: 0.45, target: 0.18 }  # ~0.2 m stride (near the floor)
+    vy:   { mag_frac: 0.62, on_s: 0.55, off_s: 0.50, target: 0.13 }  # strafe (shorter axis)
+    vyaw: { mag_frac: 0.65, on_s: 0.42, off_s: 0.44, target: 0.18 }  # rotate ~0.18 rad (~10 deg) per step
     swing_height: 0.06     # SHUFFLE: lower foot lift than normal (0.10) so a smaller step
                            # completes cleanly. Raise toward 0.10 if it toe-scuffs; this is
                            # the lever for going below the ~0.29 m velocity floor.

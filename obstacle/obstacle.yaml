@@ -161,7 +161,26 @@ viz_max_points: 3000         # cap on exported points (~2.5k kept/frame -> 3000 
 # 360 deg gating, so this ALSO densifies that gating -- fail-safe: a cleared sector lingers
 # up to viz_accum_s (conservative directional braking, never blind).
 viz_accum_s: 0.6             # merge window (s); 0 = off (old per-frame sweep). ~0.6 = full circle.
+                             #   (Tried 1.0 to hold a sparse pole longer -> over-accumulated sway/edge
+                             #   returns all round and boxed the robot in. Back to 0.6; the pole is
+                             #   better solved by occ_l_high noise-rejection than a wider window.)
 viz_accum_max_frames: 12     # hard cap on buffered frames (memory/CPU; ~1.2 s @ 10 Hz)
+
+# --- log-odds occupancy ring (obstacle-precision: stable + 3-state) ---------
+# The raw per-sector ring feeds a log-odds occupancy grid so the ring is stable
+# (no flicker), self-clears, and reports honest occupied / free / UNKNOWN. The
+# emitted distance = min(occupancy, raw), so gating is never LESS conservative
+# than the current scan. occ_decay_s = how long a sector HOLDS an obstacle between
+# returns. occ_l_high = log-odds a sector must reach to count as OCCUPIED: with
+# occ_l_occ=0.85 per return, 0.85 = ONE return marks it (noisy -> boxed the robot
+# in); 1.7 requires TWO returns (rejects lone stray/sway points). Raise occ_l_high
+# to de-phantom; raise occ_decay_s to hold sparse obstacles longer (do it only
+# WITH the higher l_high, or phantoms persist). use_occupancy:false -> raw ring.
+use_occupancy: true          # false = legacy raw per-frame ring
+occ_decay_s: 0.7             # occupancy hold/decay time constant (s)
+occ_l_high: 1.5              # log-odds to mark a sector OCCUPIED (~2 returns; 0.85 = 1 return = noisy)
+occ_r_bin_m: 0.05            # occupancy radial bin size (m)
+use_deskew: true             # IMU-gyro motion-compensate the cloud (needs /livox/imu; else identity)
 
 # --- D435i depth fusion (fills the Mid-360's near-GROUND blind zone) -------
 # The head RealSense D435i is tilted ~47 deg DOWN, so it sees the floor ~0.5-2 m

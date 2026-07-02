@@ -95,18 +95,34 @@ def make_node(overrides=None):
     n.ring_start_deg = -180.0
     n.floor_abc = None
     n.cfg = cfg
+    # precision pipeline attrs (mirror obstacle_node.__init__). Occupancy is stateful
+    # across detect() calls, since sim_perception reuses one node for a whole run;
+    # de-skew is identity here (no ROS/IMU / per-point times in the harness).
+    n.use_occupancy = bool(cfg.get("use_occupancy", True)) and mod.PolarOccupancyGrid is not None
+    n.use_deskew = False
+    n._deskewer = None
+    n._last_proc_t = None
+    n.occ = None
+    if n.use_occupancy:
+        n.occ = mod.PolarOccupancyGrid(
+            n_sectors=n.ring_n, r_max=n.range_m,
+            r_bin=float(cfg.get("occ_r_bin_m", 0.05)),
+            start_deg=n.ring_start_deg, tau_s=float(cfg.get("occ_decay_s", 0.7)),
+            l_high=float(cfg.get("occ_l_high", 1.5)))
     return n
 
 
-def detect(node, pts):
+def detect(node, pts, dt=0.1):
     """Run the REAL ground-mask + ring + 4-wedge detection on a (N,3) cloud.
     Returns dict with the wedge distances, the full ring, and point counts.
-    Mirrors obstacle_node._on_cloud steps 1-3 + 5b exactly."""
+    Mirrors obstacle_node._on_cloud steps 1-3 + 5b/5c exactly (incl. the log-odds
+    occupancy finalize; `dt` drives the occupancy decay across calls)."""
     pts = np.asarray(pts, dtype=np.float32)
     pts = pts[np.isfinite(pts).all(axis=1)]
     if len(pts) == 0:
+        ring0, st0, pr0 = node._finalize_ring([None] * node.ring_n, dt)
         return dict(front=None, left=None, right=None, back=None,
-                    ring=[None] * node.ring_n, n_in=0, n_keep=0)
+                    ring=ring0, ring_state=st0, ring_prob=pr0, n_in=0, n_keep=0)
     x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
     horiz = np.hypot(x, y)
     if node.ground_removal:
@@ -120,8 +136,10 @@ def detect(node, pts):
     left = node._robust_nearest(horiz[(ang >= 45.0) & (ang < 135.0)])
     right = node._robust_nearest(horiz[(ang <= -45.0) & (ang > -135.0)])
     back = node._robust_nearest(horiz[np.abs(ang) >= 135.0])
-    ring = node._ring_distances(ang, horiz)
+    raw_ring = node._ring_distances(ang, horiz)
+    ring, state, prob = node._finalize_ring(raw_ring, dt)
     return dict(front=front, left=left, right=right, back=back, ring=ring,
+                ring_state=state, ring_prob=prob,
                 n_in=len(pts), n_keep=int(keep.sum()))
 
 

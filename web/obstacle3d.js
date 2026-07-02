@@ -24,18 +24,27 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
   "use strict";
 
   const RANGE_M = 3.0;                 // detection dome radius (matches the radar)
-  const Z_STOP = 0.7, Z_SLOW = 2.0;    // ground danger rings (match obstacle.js radar)
+  // Ground danger rings. Defaults MATCH the node (0.75 / 1.75, NOT 0.7/2.0); the
+  // real values arrive on msg.stop_m / msg.slow_m and rescale the rings live.
+  const DEF_STOP = 0.75, DEF_SLOW = 1.75;
+  let STOP_M = DEF_STOP, SLOW_M = DEF_SLOW;
   const H_MAX = 1.9;                   // height (m) at the top of the colour ramp
   const CELL = 0.13;                   // voxel cell size (m) — smaller = finer/denser
   const MIN_H = 0.06;                  // min drawn column height so low hits stay visible
   const MAX_CELLS = 1500;              // instanced-column cap (bounded GPU work)
+  const D435I_FOV_DEG = 87;            // forward depth-camera cone hint
   const COL = { grid: 0x232c3e, dome: 0x35507d, robot: 0x5c8df2,
                 stop: 0xff4747, slow: 0xff8636 };
 
-  let scene, camera, renderer, controls, columns;
+  let scene, camera, renderer, controls, columns, stopRing, slowRing;
   let mount, booted = false, lastMsg = null;
+  // Preallocated scratch — reused every frame so the update loop never allocates
+  // (per-frame `new` here causes GC stutter / instance flicker).
   const _m = new THREE.Matrix4(), _p = new THREE.Vector3(),
         _q = new THREE.Quaternion(), _s = new THREE.Vector3(), _col = new THREE.Color();
+  const _voxCol = new THREE.Color(), _dc = new THREE.Color(),
+        _amber = new THREE.Color(COL.slow), _red = new THREE.Color(COL.stop);
+  function clampv(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
   // Height -> colour ramp: ground (cyan) -> waist (green) -> tall (amber) -> high (red).
   const RAMP = [
@@ -107,10 +116,23 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
     grid.material.transparent = true;
     scene.add(grid);
 
-    // stop / slow / range reference rings on the ground (danger context).
-    scene.add(groundRing(Z_STOP, COL.stop));
-    scene.add(groundRing(Z_SLOW, COL.slow));
+    // stop / slow / range reference rings on the ground (danger context). The stop
+    // and slow rings are built at unit radius and SCALED to the live thresholds, so
+    // refresh() can rescale them when the guard reports its real stop_m / slow_m.
+    stopRing = groundRing(1, COL.stop); stopRing.scale.set(STOP_M, STOP_M, 1); scene.add(stopRing);
+    slowRing = groundRing(1, COL.slow); slowRing.scale.set(SLOW_M, SLOW_M, 1); scene.add(slowRing);
     scene.add(groundRing(RANGE_M, COL.dome));
+
+    // D435i forward depth-FOV hint (~87 deg cone) — faint boundary lines on the ground.
+    const fovHalf = ((D435I_FOV_DEG / 2) * Math.PI) / 180;
+    const fovPts = [];
+    [-fovHalf, fovHalf].forEach((a) => {
+      fovPts.push(0, 0, 0.02, RANGE_M * Math.cos(a), RANGE_M * Math.sin(a), 0.02);
+    });
+    const fovGeo = new THREE.BufferGeometry();
+    fovGeo.setAttribute("position", new THREE.Float32BufferAttribute(fovPts, 3));
+    scene.add(new THREE.LineSegments(fovGeo,
+      new THREE.LineBasicMaterial({ color: COL.robot, transparent: true, opacity: 0.18 })));
 
     // translucent detection dome — upper hemisphere "sphere".
     const dome = new THREE.Mesh(
@@ -176,6 +198,14 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
   function refresh(msg) {
     if (!booted) return;
 
+    // thresholds: prefer the guard's real values; else node defaults. Rescale the
+    // ground rings only when they actually change (cheap; avoids per-frame work).
+    const ns = (msg && typeof msg.stop_m === "number" && isFinite(msg.stop_m)) ? msg.stop_m : DEF_STOP;
+    const nl = (msg && typeof msg.slow_m === "number" && isFinite(msg.slow_m)) ? msg.slow_m : DEF_SLOW;
+    if (ns !== STOP_M) { STOP_M = ns; if (stopRing) stopRing.scale.set(STOP_M, STOP_M, 1); }
+    if (nl !== SLOW_M) { SLOW_M = nl; if (slowRing) slowRing.scale.set(SLOW_M, SLOW_M, 1); }
+
+    const ring = msg && msg.ring;
     const pts = msg && msg.points;
     let cells;
     if (Array.isArray(pts) && pts.length >= 3) {
@@ -184,19 +214,37 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
         for (let i = 0; i < m; i += 3) emit(pts[i], pts[i + 1], pts[i + 2]);
       });
     } else {
-      // Fallback: no point export -> a column per non-null ring sector.
-      const ring = msg && msg.ring;
+      // Fallback: no point export -> a stub column per OCCUPIED ring sector.
       cells = voxelize((emit) => {
         if (!ring || !Array.isArray(ring.dist) ||
             !isFinite(ring.bin_deg) || !isFinite(ring.start_deg)) return;
+        const st = Array.isArray(ring.state) ? ring.state : null;
         for (let i = 0; i < ring.dist.length; i++) {
           const d = ring.dist[i];
-          if (d == null) continue;
+          const occupied = st ? (st[i] === 2) : (d != null);
+          if (!occupied || d == null) continue;
           const a = ((ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI) / 180;
           const dd = Math.min(d, RANGE_M);
           emit(dd * Math.cos(a), dd * Math.sin(a), 0.5);   // unknown height -> stub
         }
       });
+    }
+
+    // Occupancy lookup by angle from the ring (state/prob) -> tints voxels by
+    // proximity * occupancy-probability ON TOP of the height colour. Absent -> height only.
+    const rState = (ring && Array.isArray(ring.state)) ? ring.state : null;
+    const rProb  = (ring && Array.isArray(ring.prob)) ? ring.prob : null;
+    const haveOcc = !!(ring && (rState || rProb) && Array.isArray(ring.dist) &&
+                       isFinite(ring.bin_deg) && isFinite(ring.start_deg));
+    const rN = haveOcc ? (ring.n || ring.dist.length) : 0;
+    function occAt(cx, cy) {
+      if (!haveOcc || rN <= 0) return 0;
+      const deg = Math.atan2(cy, cx) * 180 / Math.PI;
+      let idx = Math.floor((deg - ring.start_deg) / ring.bin_deg);
+      idx = ((idx % rN) + rN) % rN;
+      const occupied = rState ? (rState[idx] === 2) : (ring.dist[idx] != null);
+      if (!occupied) return 0;
+      return rProb ? clampv(rProb[idx], 0, 1) : 1;
     }
 
     let k = 0;
@@ -207,7 +255,19 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
       _s.set(CELL * 0.92, CELL * 0.92, hDraw);
       _m.compose(_p, _q, _s);
       columns.setMatrixAt(k, _m);
-      columns.setColorAt(k, heightColor(c.h));
+
+      _voxCol.copy(heightColor(c.h));
+      if (haveOcc) {
+        const r = Math.hypot(c.cx, c.cy);
+        // proximity: 1 at/inside stop, 0 beyond slow.
+        const prox = clampv((SLOW_M - r) / ((SLOW_M - STOP_M) || 1), 0, 1);
+        const threat = prox * occAt(c.cx, c.cy);
+        if (threat > 0) {
+          _dc.copy(_amber).lerp(_red, prox);     // amber (far) -> red (close)
+          _voxCol.lerp(_dc, 0.65 * threat);
+        }
+      }
+      columns.setColorAt(k, _voxCol);
       k++;
     });
     columns.count = k;

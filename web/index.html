@@ -3,8 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- Phone auto-detect: a phone-sized touch device is sent to the stripped-down
+       /phone teleop surface before the heavy dashboard loads. Escape hatches:
+       open /?full=1 to force the full dashboard (remembered), and /phone has a
+       "Full" link back. Tablets / touch-laptops (min side > 600px) stay here. -->
+  <script>
+  (function () {
+    try {
+      var q = new URLSearchParams(location.search);
+      if (q.get("full") === "1") { localStorage.setItem("g1.surface", "full"); return; }
+      if (localStorage.getItem("g1.surface") === "full") return;   // user chose full dashboard
+      var small = Math.min(screen.width || 9999, screen.height || 9999) <= 600;
+      var coarse = (navigator.maxTouchPoints || 0) > 0
+        || (window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+      if (small && coarse) location.replace("/phone");            // a phone -> phone teleop
+    } catch (e) {}
+  })();
+  </script>
   <title>G1 Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=19">
+  <link rel="stylesheet" href="/static/style.css?v=20">
   <script type="importmap">
   {
     "imports": {
@@ -79,6 +96,15 @@
     </div>
 
     <div class="header-spacer"></div>
+
+    <!-- Jump to the stripped-down phone teleop page (and remember the choice so a
+         phone opening "/" lands there next time too). -->
+    <a class="control-chip" href="/phone" title="Open the phone teleop page"
+       onclick="try{localStorage.removeItem('g1.surface')}catch(e){}">📱 Phone</a>
+
+    <!-- Single-controller lock: who currently drives the robot. Click to take
+         control back from a phone. Hidden until the first {type:"control"} msg. -->
+    <button id="controlChip" class="control-chip" type="button" hidden>control?</button>
 
     <div id="status" class="status">
       <span class="dot"></span>
@@ -223,17 +249,17 @@
     </main>
   </div>
 
-  <script src="/static/obstacle.js?v=6"></script>
+  <script src="/static/obstacle.js?v=7"></script>
   <script src="/static/step_mode.js?v=3"></script>
-  <script src="/static/drive_mode.js?v=4"></script>
-  <script src="/static/controller.js?v=20"></script>
+  <script src="/static/drive_mode.js?v=5"></script>
+  <script src="/static/controller.js?v=21"></script>
   <script src="/static/camera.js?v=4"></script>
   <script src="/static/cam-overlay.js?v=6"></script>
   <script src="/static/hands.js?v=1"></script>
   <script src="/static/pose.js?v=5"></script>
   <script src="/static/detect.js?v=4"></script>
-  <script type="module" src="/static/lidar.js?v=13"></script>
-  <script type="module" src="/static/obstacle3d.js?v=6"></script>
+  <script type="module" src="/static/lidar.js?v=14"></script>
+  <script type="module" src="/static/obstacle3d.js?v=7"></script>
   <script src="/static/feedview.js?v=1"></script>
 </body>
 </html>

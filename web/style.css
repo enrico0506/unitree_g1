@@ -401,3 +401,25 @@ input:focus-visible { outline-offset: 0; }
 }
 
 @media (min-width: 1500px) { body { max-width: 1480px; margin: 0 auto; } }
+
+/* =========================================================================
+   Single-controller lock chip (header). Shows who currently drives the robot;
+   click to take control back from a phone. Hidden until the first control msg.
+   ========================================================================= */
+.control-chip {
+  font-family: inherit; font-size: 11px; font-weight: 700; letter-spacing: .03em;
+  color: var(--steel, #8A93A6); background: var(--surface-2, #161C2A);
+  border: 1px solid var(--line, #232C3E); border-radius: 999px;
+  padding: 6px 12px; min-height: 30px; cursor: pointer; white-space: nowrap;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.control-chip[hidden] { display: none; }
+.control-chip.mine {
+  color: #06281C; background: var(--live, #3FD39B); border-color: var(--live, #3FD39B);
+  cursor: default;
+}
+.control-chip.theirs {
+  color: var(--caution, #FF8636);
+  border-color: color-mix(in srgb, var(--caution, #FF8636) 50%, var(--line, #232C3E));
+}
+.control-chip.theirs:hover { color: var(--chalk, #E9EDF6); }

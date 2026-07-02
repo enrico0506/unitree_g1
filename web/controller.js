@@ -46,6 +46,19 @@ const wsUrl = `ws://${location.host}/ws`;
 let ws = null;
 let connected = false;
 
+// --- Single-controller lock (shared with the phone page over the same /ws) ---
+// Identity is one id per page LOAD (survives reconnects; not persisted). The laptop
+// never auto-grabs the lock -- the server assigns it on connect only if it's free,
+// so a lone laptop drives exactly as before. When another device takes control, our
+// outbound commands are dropped (see send()) and the control chip explains why.
+const CLIENT_ID = (window.crypto && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : "laptop-" + Math.random().toString(36).slice(2);
+const CLIENT_LABEL = "Laptop";
+const ALWAYS_ALLOWED_MSGS = new Set(["hello", "take_control"]);
+let hasControl = false;
+let ownerLabel = null;
+
 const statusEl = document.getElementById("status");
 const statusText = document.getElementById("statusText");
 
@@ -54,6 +67,8 @@ function connect() {
 
   ws.onopen = () => {
     connected = true;
+    // Announce identity so the server can arbitrate the control lock (take-if-free).
+    send({ type: "hello", client_id: CLIENT_ID, label: CLIENT_LABEL });
     statusEl.classList.add("connected");
     statusText.textContent = "Connected";
     setInfo("infoConn", "connected");
@@ -79,6 +94,7 @@ function connect() {
         window.LidarOverlay && window.LidarOverlay.updateObstacle(msg);
         window.Obstacle3D && window.Obstacle3D.update(msg);
       }
+      else if (msg.type === "control") updateControl(msg);
     } catch (e) { /* ignore */ }
   };
 
@@ -87,6 +103,7 @@ function connect() {
     // Zero held keys + recentre the thumbsticks so a still-held input can't
     // re-assert a stale velocity the instant the socket reconnects.
     clearAllHeld();
+    hasControl = false; ownerLabel = null; renderControlChip();
     statusEl.classList.remove("connected");
     statusText.textContent = "Disconnected — retrying...";
     setInfo("infoConn", "disconnected");
@@ -98,9 +115,11 @@ function connect() {
 }
 
 function send(obj) {
-  if (connected && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
+  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
+  // Read-only device: while another device holds the control lock, drop every
+  // mutating command (move/mode/obstacle/step/map/cmd). hello + take_control pass.
+  if (obj && obj.type && !ALWAYS_ALLOWED_MSGS.has(obj.type) && !hasControl) return;
+  ws.send(JSON.stringify(obj));
 }
 
 connect();
@@ -220,6 +239,52 @@ function requestMode(name) {
   }
   logEvent(`mode → ${name}`);
   send({ type: "mode", name });
+}
+
+// =========================================================================
+// SINGLE-CONTROLLER LOCK (multi-device arbitration; shared with the phone page)
+// =========================================================================
+
+function updateControl(msg) {
+  const ownerId = msg.owner_id || null;
+  const prev = hasControl;
+  hasControl = (ownerId !== null && ownerId === CLIENT_ID);
+  ownerLabel = msg.owner_label || null;
+  renderControlChip();
+  // The laptop is the DEFAULT driver: whenever the lock is FREE (nobody driving),
+  // reclaim it automatically so a lone laptop -- or the laptop after a phone leaves
+  // -- keeps working exactly as before. It never auto-steals from another device
+  // (acts only when ownerId is null); a phone must always take control explicitly.
+  if (ownerId === null) {
+    send({ type: "take_control", client_id: CLIENT_ID });
+    return;
+  }
+  if (prev && !hasControl) {
+    // Just lost control -> drop held keys / recentre sticks so nothing is latched.
+    clearAllHeld();
+    logEvent(ownerLabel ? `control taken by ${ownerLabel}` : "control taken by another device", "warn");
+  } else if (!prev && hasControl) {
+    logEvent("you have control", "ok");
+  }
+}
+
+function renderControlChip() {
+  const chip = document.getElementById("controlChip");
+  if (!chip) return;
+  chip.hidden = false;
+  chip.classList.toggle("mine", hasControl);
+  chip.classList.toggle("theirs", !hasControl);
+  chip.textContent = hasControl
+    ? "● You have control"
+    : (ownerLabel ? `○ ${ownerLabel} has control · Take back` : "○ Take control");
+}
+
+const _controlChip = document.getElementById("controlChip");
+if (_controlChip) {
+  _controlChip.addEventListener("click", () => {
+    // Clicking when you already hold control is a no-op (avoids a needless velocity reset).
+    if (!hasControl) send({ type: "take_control", client_id: CLIENT_ID });
+  });
 }
 
 // =========================================================================

@@ -52,13 +52,30 @@
   }
 
   // Deadzone + rescale so the very first motion past the deadzone starts at 0
-  // (no velocity step), and full deflection still reaches 1.
+  // (no velocity step), and full deflection still reaches 1. Used for the single
+  // (1-D) Turn axis, where axial == radial.
   function shape(v) {
     const a = Math.abs(v);
     if (a <= DEADZONE) return 0;
     const lin = (a - DEADZONE) / (1 - DEADZONE);              // 0..1 past the deadzone
     const curved = EXPO * lin * lin * lin + (1 - EXPO) * lin; // expo: fine near centre, full at edge
     return Math.sign(v) * curved;
+  }
+
+  // RADIAL deadzone + expo for a 2-D stick: apply the curve to the *magnitude* of
+  // the (nx, ny) vector, then re-project onto the same direction. Shaping each axis
+  // on its own (the old per-axis `shape`) distorts diagonals -- a clean 45° push
+  // gets curved twice and snaps toward the nearest cardinal, and the diagonal
+  // reaches ~1.41 vs 1.0 on a cardinal. Shaping the magnitude keeps the heading
+  // honest and the response uniform in every direction, like a real thumbstick.
+  function shapeVec(nx, ny) {
+    const mag = Math.hypot(nx, ny);
+    if (mag <= DEADZONE) return { x: 0, y: 0 };
+    const m = Math.min(mag, 1);                               // knob is already circle-clamped to 1
+    const lin = (m - DEADZONE) / (1 - DEADZONE);              // 0..1 past the deadzone
+    const curved = EXPO * lin * lin * lin + (1 - EXPO) * lin; // same expo curve, on the magnitude
+    const s = curved / mag;                                   // preserve direction, set new length
+    return { x: nx * s, y: ny * s };
   }
 
   // The sticks may only deflect while the robot is in LIVE walk -- never during
@@ -370,8 +387,9 @@
     // LEFT stick: forward/back + strafe. Screen-up (ny<0) -> forward (+vx);
     // screen-left (nx<0) -> strafe-left (+vy, matching the 'A' key).
     sticks.push(makeStick(padMount, "Move", "fwd / strafe", (nx, ny) => {
-      axes.strafe = shape(-nx);
-      axes.fwd    = shape(-ny);
+      const v = shapeVec(nx, ny);       // radial deadzone+expo: honest diagonals
+      axes.strafe = -v.x;
+      axes.fwd    = -v.y;
     }));
     // RIGHT stick: turn only. Screen-left (nx<0) -> turn-left (+vyaw, like Arrow-Left).
     sticks.push(makeStick(padMount, "Turn", "yaw", (nx /*, ny */) => {

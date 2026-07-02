@@ -24,6 +24,7 @@ Sign convention (the UI must match): angle = atan2(y, x): 0 = straight ahead,
 import json
 import math
 import os
+import sys
 import time
 from collections import deque
 
@@ -32,6 +33,23 @@ import rclpy
 import yaml
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+
+# --- optional precision modules (siblings in obstacle/). Guarded so a missing/
+#     broken module degrades gracefully to the validated legacy behaviour rather
+#     than crashing the perception node. See obstacle-precision-modules memory. ---
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from occupancy import PolarOccupancyGrid   # log-odds ring (stable + 3-state)
+except Exception:                              # pragma: no cover
+    PolarOccupancyGrid = None
+try:
+    from deskew import ImuGyroDeskewer          # IMU-gyro motion compensation
+except Exception:                              # pragma: no cover
+    ImuGyroDeskewer = None
+try:
+    from filters import custommsg_to_numpy      # fast CustomMsg->numpy (with per-point times)
+except Exception:                              # pragma: no cover
+    custommsg_to_numpy = None
 
 SHM_PATH = "/dev/shm/g1_obstacle.json"
 YAML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obstacle.yaml")
@@ -99,6 +117,18 @@ DEFAULTS = {
     # blind). 0 = off (old per-frame sweeping behaviour).
     "viz_accum_s": 0.6,            # rolling merge window in seconds (0 disables)
     "viz_accum_max_frames": 12,    # hard cap on buffered frames (memory/CPU bound)
+    # --- precision pipeline (obstacle-precision-modules; graceful fallback) ---
+    "use_occupancy": True,         # fuse the raw ring into a log-odds occupancy grid:
+                                   #   stable (no flicker), 3-state (unknown/free/occupied).
+                                   #   Emitted ring distance = min(occupancy, raw) so the guard
+                                   #   is NEVER less conservative than the current scan.
+    "occ_decay_s": 0.7,            # occupancy leaky-decay time constant (s) toward unknown
+    "occ_l_high": 1.5,             # log-odds a sector must reach to count as OCCUPIED (~2 returns;
+                                   #   l_occ=0.85 so 0.85 == 1 return == noisy -> boxes the robot in)
+    "occ_r_bin_m": 0.05,           # occupancy radial bin size (m)
+    "use_deskew": True,            # IMU-gyro motion-compensate the cloud (needs /livox/imu +
+                                   #   per-point times); identity when either is unavailable.
+    "imu_topic": "/livox/imu",     # Livox 200 Hz IMU (same frame as the cloud)
 }
 
 
@@ -201,6 +231,23 @@ class ObstacleNode(Node):
         self.accum_max = max(1, int(c.get("viz_accum_max_frames", 12)))
         self._accum = deque(maxlen=self.accum_max)
 
+        # --- precision pipeline: occupancy ring + IMU de-skew --------------------
+        # occ: log-odds polar grid the raw ring feeds each frame -> a stable, 3-state
+        # ring (see _finalize_ring). deskewer: IMU-gyro motion comp (fed by _on_imu).
+        # Both degrade to legacy behaviour when the module/IMU is unavailable.
+        self.use_occupancy = bool(c.get("use_occupancy", True)) and PolarOccupancyGrid is not None
+        self.use_deskew = bool(c.get("use_deskew", True)) and ImuGyroDeskewer is not None
+        self.occ = None
+        if self.use_occupancy:
+            self.occ = PolarOccupancyGrid(
+                n_sectors=self.ring_n, r_max=self.range_m,
+                r_bin=float(c.get("occ_r_bin_m", 0.05)),
+                start_deg=self.ring_start_deg,
+                tau_s=float(c.get("occ_decay_s", 0.7)),
+                l_high=float(c.get("occ_l_high", 1.5)))   # ~2 returns to mark occupied (noise reject)
+        self._deskewer = ImuGyroDeskewer(buffer_s=0.5) if self.use_deskew else None
+        self._last_proc_t = None       # wall time of last processed frame (occupancy dt)
+
         # --- per-frame state --------------------------------------------------
         self.seq = 0
         self.front_filt = None        # EMA of the front distance (None until first reading)
@@ -227,6 +274,18 @@ class ObstacleNode(Node):
         self.kind = kind  # "pc2" or "custom"
         self.create_subscription(
             msg_type, self.topic, self._on_cloud, qos_profile_sensor_data)
+
+        # IMU (200 Hz, same frame as the cloud) feeds the de-skewer. Best-effort:
+        # if the topic/type is unavailable, de-skew simply stays identity.
+        if self._deskewer is not None:
+            try:
+                from sensor_msgs.msg import Imu
+                self.create_subscription(
+                    Imu, str(self.cfg.get("imu_topic", "/livox/imu")),
+                    self._on_imu, qos_profile_sensor_data)
+            except Exception as e:
+                self.get_logger().warn(f"IMU sub failed ({e}); de-skew disabled")
+                self._deskewer = None
 
         self.get_logger().info(
             f"g1_obstacle: {self.topic} ({kind}) -> {SHM_PATH} | range={self.range_m}m "
@@ -264,23 +323,50 @@ class ObstacleNode(Node):
                 f"{self.topic} not advertised yet; assuming PointCloud2")
         return PointCloud2, "pc2"
 
+    # ------------------------------------------------------------------- IMU
+    def _on_imu(self, msg):
+        """Buffer the 200 Hz Livox gyro for cloud de-skew. Runs on a different
+        callback than _on_cloud; ImuGyroDeskewer.add_gyro is internally locked."""
+        if self._deskewer is None:
+            return
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        w = msg.angular_velocity
+        self._deskewer.add_gyro(t, float(w.x), float(w.y), float(w.z))
+
     # --------------------------------------------------------------- callback
     def _on_cloud(self, msg):
-        # ---- 0. message -> (N,3) -------------------------------------------
+        # ---- 0. message -> (N,3) [+ per-point times for de-skew] ------------
+        # CustomMsg has no zero-copy numpy view. Decimate to ~6000 points -- ample
+        # for obstacle distances/gaps and keeps the callback under the 10 Hz Jetson
+        # budget. When de-skewing, parse via custommsg_to_numpy so we ALSO get each
+        # point's absolute time (timebase+offset_time); otherwise the xyz-only path.
+        times = None
         if self.kind == "custom":
-            # CustomMsg has no zero-copy numpy view, so the per-point Python parse
-            # is the slow path. Decimate to ~6000 points -- ample for obstacle
-            # distances/gaps and keeps the callback well under the 10 Hz budget on
-            # the Jetson. (We use CustomMsg because this driver build's PointCloud2
-            # path stalls after one frame.)
             pn = int(getattr(msg, "point_num", 0) or len(msg.points))
             decimate = max(1, pn // 6000)
-            pts = custom_xyz(msg, decimate)
+            if self._deskewer is not None and custommsg_to_numpy is not None:
+                try:
+                    pts, times, _ = custommsg_to_numpy(msg, decimate=decimate)
+                except Exception:
+                    pts, times = custom_xyz(msg, decimate), None
+            else:
+                pts = custom_xyz(msg, decimate)
         else:
             pts = pc2_xyz(msg)
         n_raw = len(pts)
         if n_raw == 0:
             return
+
+        # ---- 0b. IMU-gyro de-skew (motion compensation) --------------------
+        # Rotate every point into the sensor orientation at the frame-end time,
+        # removing the intra-frame smear from body sway/turn. No-op without a gyro
+        # buffer or per-point times (the pc2 path, or before the first IMU frames).
+        if (self._deskewer is not None and times is not None and len(pts)
+                and self._deskewer.n_samples() > 1):
+            try:
+                pts = self._deskewer.deskew(pts, times, float(np.max(times)))
+            except Exception:
+                pass
 
         # ---- 1. finite + spatial filter ------------------------------------
         # Two paths: the tilt-aware ground-plane removal + footprint self-mask
@@ -367,7 +453,16 @@ class ObstacleNode(Node):
             x, y, z, ang, horiz)
 
         # ---- 5b. full-circle 360 deg ring (additive; merged-window points) --
-        ring_dist = self._ring_distances(acc_ang, acc_horiz)
+        raw_ring = self._ring_distances(acc_ang, acc_horiz)
+        # 5c. fuse the raw ring into the log-odds occupancy grid -> a stable,
+        # 3-state ring. Emitted distance = min(occupancy, raw) so directional
+        # gating is NEVER less conservative than the current scan (safety); the
+        # state/prob arrays drive the dashboard's honest unknown/free/occupied view.
+        now = time.time()
+        dt = 0.1 if self._last_proc_t is None \
+            else clamp(now - self._last_proc_t, 1e-3, 1.0)
+        self._last_proc_t = now
+        ring_dist, ring_state, ring_prob = self._finalize_ring(raw_ring, dt)
 
         # ---- 6. write the contract -----------------------------------------
         self.seq += 1
@@ -390,6 +485,10 @@ class ObstacleNode(Node):
             "scale_right": round(scale_right, 3),
             "tight_factor": round(tight_factor, 3),
             "side": {"left": left_m is not None, "right": right_m is not None},
+            # the guard's real thresholds, so the dashboard colours match exactly
+            # (effective = raw + safety_bubble) instead of the old hardcoded 0.7/2.0.
+            "stop_m": round(self.stop_at, 3),
+            "slow_m": round(self.slow_at, 3),
             "ring": {
                 "n": self.ring_n,
                 "bin_deg": self.ring_bin_deg,
@@ -397,6 +496,10 @@ class ObstacleNode(Node):
                 "dist": [_r(d) for d in ring_dist],
             },
         }
+        # 3-state occupancy overlay (only when the occupancy grid is active).
+        if ring_state is not None:
+            out["ring"]["state"] = ring_state
+            out["ring"]["prob"] = ring_prob
         # Actual kept obstacle points (what the guard perceives) for the 3D sphere,
         # merged over the accumulation window (matches the ring above).
         if self.viz_points:
@@ -489,6 +592,38 @@ class ObstacleNode(Node):
                 val = nm if val is None else min(val, nm)
             dist[b] = val
         return dist
+
+    def _finalize_ring(self, raw_dist, dt):
+        """Fuse the raw per-sector nearest into the log-odds occupancy grid and
+        return (dist, state, prob) for the contract. `dt` = seconds since the last
+        finalize (drives the occupancy decay).
+
+        dist[i] = the CLOSER of the occupancy-derived nearest and THIS frame's raw
+        reading, so the guard is never LESS conservative than the current scan --
+        occupancy only ADDS persistence (an obstacle seen a moment ago still shows)
+        plus an honest per-sector state (0=unknown / 1=free / 2=occupied). Returns
+        (raw_dist, None, None) when occupancy is disabled (legacy ring behaviour).
+        """
+        if self.occ is None:
+            return raw_dist, None, None
+        sr = np.array([np.nan if d is None else d for d in raw_dist], dtype=float)
+        self.occ.update(sr, dt)
+        occ_dist, occ_state = self.occ.nearest_occupied()
+        prob = self.occ.prob_per_sector()
+        out = [None] * self.ring_n
+        for i in range(self.ring_n):
+            raw = raw_dist[i]
+            od = float(occ_dist[i])
+            od = None if not math.isfinite(od) else od
+            if raw is None:
+                out[i] = od
+            elif od is None:
+                out[i] = raw
+            else:
+                out[i] = raw if raw < od else od
+        state = [int(s) for s in occ_state]
+        prob_l = [round(float(p), 3) for p in prob]
+        return out, state, prob_l
 
     def _fit_floor(self, x, y, z):
         """Robustly fit a floor plane z = a*x + b*y + c to the candidate points.

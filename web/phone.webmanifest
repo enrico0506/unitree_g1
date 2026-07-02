@@ -1,0 +1,19 @@
+{
+  "name": "G1 Drive",
+  "short_name": "G1 Drive",
+  "description": "Unitree G1 phone teleop",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0A0D13",
+  "theme_color": "#0A0D13",
+  "start_url": "/phone",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/static/phone-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

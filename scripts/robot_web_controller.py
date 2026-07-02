@@ -44,6 +44,11 @@ from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient as H2LocoClient
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_
+try:
+    # Physical-remote button state, for attributing un-commanded FSM changes.
+    from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+except Exception:      # keep the dashboard importable if this IDL is unavailable
+    WirelessController_ = None
 
 import yaml
 
@@ -310,7 +315,17 @@ state = ControlState()
 client: LocoClient = None
 reader: H2LocoClient = None
 arm_client: G1ArmActionClient = None   # gesture/arm-action service ("arm")
+remote_watcher = None                  # RemoteWatcher: attributes external FSM changes
 clients: set = set()
+
+# --- Single-controller lock (multi-device arbitration) ---
+# Exactly one connected device ("the controller") may drive the robot at a time;
+# all other clients are read-only until they explicitly tap "Take control". This
+# stops two devices from stomping the shared state.vx/vy/vyaw at 30 Hz each.
+#   client_meta:      WebSocket -> {"id": <str>, "label": <str>}   (per-connection identity)
+#   control_owner_id: the client_id that currently holds the lock, or None (free).
+client_meta: dict = {}
+control_owner_id = None
 
 camera: CameraSource = None
 pose: CameraSource = None
@@ -383,6 +398,98 @@ def call_with_timeout(fn, timeout):
     return result["value"]
 
 
+# ---------------------------------------------------------------------------
+# FSM change attribution: tell OUR commands apart from EXTERNAL ones (physical
+# remote or the robot's onboard firmware), so a spontaneous mode flip -- e.g. the
+# G1's onboard obstacle/climb behaviour switching 802 -> 812 -> 802 on its own --
+# is flagged in the log with a best-effort source instead of looking commanded.
+# ---------------------------------------------------------------------------
+
+# Remote button bit -> name (matches config/mapping.yaml + capture_combo_fsm.py).
+REMOTE_BIT_NAMES = {
+    0: "R1", 1: "L1", 2: "start", 3: "select", 4: "R2", 5: "L2",
+    6: "F1", 7: "F2", 8: "A", 9: "B", 10: "X", 11: "Y",
+    12: "up", 13: "left", 14: "down", 15: "right",
+}
+
+
+def _remote_combo_name(mask):
+    names = [REMOTE_BIT_NAMES.get(b, f"bit{b}") for b in range(16) if mask & (1 << b)]
+    return "+".join(names) if names else "-"
+
+
+# FSM ids WE asked the robot to enter -> the monotonic time we asked. A transition
+# to an id we requested within the window (or while a mode transition is running) is
+# "ours"; anything else is external.
+_fsm_intents = {}
+_FSM_INTENT_WINDOW_S = 20.0
+
+
+def note_fsm_intent(fsm_id):
+    """Record that the dashboard just commanded fsm_id, so fsm_poll_loop can tell a
+    commanded transition from an external (remote / onboard-firmware) one."""
+    try:
+        _fsm_intents[int(fsm_id)] = time.monotonic()
+    except (TypeError, ValueError):
+        pass
+
+
+def fsm_change_is_ours(fsm_id):
+    """True if this observed transition was (very likely) commanded by the dashboard."""
+    if state.transitioning:                     # inside a run_enter_mode sequence
+        return True
+    t = _fsm_intents.get(fsm_id)
+    return t is not None and (time.monotonic() - t) <= _FSM_INTENT_WINDOW_S
+
+
+class RemoteWatcher:
+    """Caches the physical remote's latest button state (rt/wirelesscontroller) so an
+    un-commanded FSM change can be attributed to a remote press -- or, when the remote
+    is silent, cleared of it (pointing at the robot's onboard firmware)."""
+
+    def __init__(self):
+        self._sub = None
+        self._last_keys = 0
+        self._press_t = 0.0        # monotonic of the last NON-zero key combo
+        self._press_names = "-"
+        self._msg_t = 0.0          # monotonic of the last message (is the remote alive?)
+
+    def start(self):
+        if WirelessController_ is None:
+            print("[REMOTE] WirelessController_ IDL missing; remote attribution off",
+                  flush=True)
+            return
+        try:
+            self._sub = ChannelSubscriber("rt/wirelesscontroller", WirelessController_)
+            self._sub.Init(self._on_msg, 10)
+            print("[REMOTE] watching rt/wirelesscontroller for FSM attribution",
+                  flush=True)
+        except Exception as e:
+            print(f"[REMOTE] subscribe failed ({e}); remote attribution off", flush=True)
+
+    def _on_msg(self, msg):
+        # DDS thread: a couple of non-blocking field copies.
+        self._msg_t = time.monotonic()
+        keys = int(getattr(msg, "keys", 0) or 0)
+        if keys:
+            self._last_keys = keys
+            self._press_t = time.monotonic()
+            self._press_names = _remote_combo_name(keys)
+
+    def attribution(self, window_s=2.5):
+        """One-line source hint for a just-observed EXTERNAL fsm change."""
+        now = time.monotonic()
+        if self._press_t > 0 and (now - self._press_t) <= window_s:
+            return (f"PHYSICAL REMOTE {self._press_names} "
+                    f"(0x{self._last_keys:04x}, {now - self._press_t:.2f}s ago)")
+        alive = self._msg_t > 0 and (now - self._msg_t) < 2.0
+        if not alive:
+            return ("onboard firmware -- remote is OFF/silent AND the dashboard issued "
+                    "no command (e.g. the robot's built-in obstacle/climb behaviour)")
+        return ("onboard firmware/other -- remote connected but no button pressed AND "
+                "the dashboard issued no command")
+
+
 def fsm_poll_loop():
     period = 1.0 / FSM_POLL_HZ
     while True:
@@ -391,8 +498,20 @@ def fsm_poll_loop():
             code, fsm = result
             if code == 0:
                 if fsm != state.fsm_id:
-                    print(f"[FSM] {state.fsm_id} ({fsm_name(state.fsm_id)}) "
-                          f"-> {fsm} ({fsm_name(fsm)})", flush=True)
+                    old = state.fsm_id
+                    if old is None or fsm_change_is_ours(fsm):
+                        # old is None = the first read after startup (state sync), not a
+                        # real transition -> plain [FSM], never flagged external.
+                        print(f"[FSM] {old} ({fsm_name(old)}) "
+                              f"-> {fsm} ({fsm_name(fsm)})", flush=True)
+                    else:
+                        # No dashboard command matches this transition -> it came from
+                        # the physical remote or the robot's onboard firmware. Attribute
+                        # the source so a spontaneous flip is obvious in the log.
+                        src = (remote_watcher.attribution()
+                               if remote_watcher is not None else "unknown source")
+                        print(f"[FSM-EXTERNAL] {old} ({fsm_name(old)}) "
+                              f"-> {fsm} ({fsm_name(fsm)}) | source: {src}", flush=True)
                     # If we left main_control, we lost continuous gait state
                     if fsm != FSM_MAIN_CONTROL:
                         state.gait_enabled = False
@@ -503,6 +622,7 @@ def apply_step_swing(mode, force=False):
 # ---------------------------------------------------------------------------
 
 def wait_for_fsm(target_fsm, timeout=15.0, poll_period=0.1):
+    note_fsm_intent(target_fsm)     # a dashboard-commanded transition (not external)
     deadline = time.time() + timeout
     while time.time() < deadline:
         if state.fsm_id == target_fsm:
@@ -708,6 +828,7 @@ def apply_cmd(name):
                 state.gait_enabled = False
                 state.mode = name
                 print(f"[CMD] {name} -> SetFsmId({fsm})", flush=True)
+                note_fsm_intent(fsm)     # dashboard-commanded combo (not external)
                 try:
                     client.SetFsmId(fsm)
                 except Exception as e:
@@ -735,6 +856,42 @@ async def broadcast(msg):
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
+
+
+# ---------------------------------------------------------------------------
+# Single-controller lock helpers
+# ---------------------------------------------------------------------------
+
+def make_control_msg():
+    """Snapshot of who holds control, sent to every client so each device can tell
+    whether it may drive (owner_id === its own client_id) and show the holder."""
+    owner_label = None
+    roster = []
+    for meta in client_meta.values():
+        cid = meta.get("id")
+        is_owner = cid is not None and cid == control_owner_id
+        roster.append({"id": cid, "label": meta.get("label"), "is_owner": is_owner})
+        if is_owner:
+            owner_label = meta.get("label")
+    return {"type": "control", "owner_id": control_owner_id,
+            "owner_label": owner_label, "clients": roster}
+
+
+async def _set_owner(new_id):
+    """Transfer the single-controller lock to `new_id`, then tell every client.
+
+    SAFETY: zero the velocity + reset the shaper/pacer on every handoff so the new
+    owner starts from a full stop and the previous owner's latched velocity (or a
+    mid-ramp/mid-pulse) can never carry over into someone else's session."""
+    global control_owner_id
+    control_owner_id = new_id
+    state.vx = state.vy = state.vyaw = 0.0
+    state.is_moving = False
+    if shaper is not None:
+        shaper.reset()
+    if pacer is not None:
+        pacer.reset()
+    await broadcast(make_control_msg())
 
 
 def make_state_msg():
@@ -950,7 +1107,7 @@ async def broadcast_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf
-    global guard, obstacle_mgr, shaper, pacer, audio
+    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -975,6 +1132,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         arm_client = None
         print(f"ArmActionClient init failed ({e}); gestures disabled.", flush=True)
+
+    # Remote watcher first, so fsm_poll_loop can attribute an external FSM change to
+    # the physical remote vs the robot's onboard firmware from the very first flip.
+    remote_watcher = RemoteWatcher()
+    remote_watcher.start()
 
     fsm_thread = threading.Thread(target=fsm_poll_loop, daemon=True)
     fsm_thread.start()
@@ -1114,9 +1276,23 @@ app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
+# The HTML shells reference their JS/CSS with ?v= cache-busting query strings, but
+# the shells THEMSELVES had no Cache-Control, so phones/tunnels served a stale copy
+# on a soft reload (new ?v= never fetched). "no-cache" = always revalidate the shell
+# (still 304-cheap via ETag); the versioned static assets stay fully cacheable.
+_HTML_HEADERS = {"Cache-Control": "no-cache"}
+
+
 @app.get("/")
 async def index():
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers=_HTML_HEADERS)
+
+
+@app.get("/phone")
+async def phone():
+    # Stripped-down touch teleop surface (steering + obstacle toggle + mode ladder).
+    # Same /ws protocol as the laptop console; shares the single-controller lock.
+    return FileResponse(WEB_DIR / "phone.html", headers=_HTML_HEADERS)
 
 
 # ---------------------------------------------------------------------------
@@ -1367,8 +1543,10 @@ async def ws_lidar(ws: WebSocket):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    global control_owner_id
     await ws.accept()
     clients.add(ws)
+    client_meta[ws] = {"id": None, "label": None}
     print("[ws] client connected", flush=True)
 
     # Push speed caps so the UI matches config/robot.yaml (single source of truth).
@@ -1389,6 +1567,9 @@ async def ws_endpoint(ws: WebSocket):
     await ws.send_text(json.dumps(make_state_msg()))
     if mapper is not None:
         await ws.send_text(json.dumps(mapper.status()))
+    # Who currently holds the single-controller lock -- the client uses this to know
+    # whether it may drive, and to render the control chip / take-control overlay.
+    await ws.send_text(json.dumps(make_control_msg()))
 
     try:
         while True:
@@ -1399,6 +1580,44 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             mtype = msg.get("type")
+
+            # --- Identity + single-controller arbitration (before any mutation) ---
+            if mtype == "hello":
+                # A client announces its stable per-load id + display label. If the
+                # lock is free, the first announcer grabs it (take-if-free) so a lone
+                # laptop/phone always drives; otherwise it starts read-only.
+                cid = str(msg.get("client_id") or "")
+                label = (str(msg.get("label") or "device"))[:24]
+                client_meta[ws] = {"id": cid or None, "label": label}
+                if cid and control_owner_id is None:
+                    await _set_owner(cid)
+                else:
+                    await ws.send_text(json.dumps(make_control_msg()))
+                continue
+
+            if mtype == "take_control":
+                # Explicit "I control the movements now" -- always steals the lock from
+                # whoever held it (and zeroes velocity via _set_owner, so no lurch).
+                cid = str(msg.get("client_id") or "")
+                if cid:
+                    meta = client_meta.get(ws) or {"id": None, "label": "device"}
+                    meta["id"] = cid
+                    client_meta[ws] = meta
+                    await _set_owner(cid)
+                continue
+
+            # Every other message MUTATES robot state -> only the lock owner may send
+            # it. A client that skipped 'hello' but is first to drive grabs a free lock.
+            meta = client_meta.get(ws) or {}
+            my_id = meta.get("id")
+            if my_id is not None and control_owner_id is None:
+                await _set_owner(my_id)
+            if my_id is None or my_id != control_owner_id:
+                continue                      # read-only device -> ignore
+
+            # Owner is alive: ONLY the controller's traffic feeds the motion watchdog,
+            # so the robot stops if the controlling device goes silent even while other
+            # (read-only) devices keep the socket busy.
             state.last_packet_time = time.time()
 
             if mtype == "move":
@@ -1482,12 +1701,22 @@ async def ws_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         print("[ws] client disconnected", flush=True)
-        state.vx = state.vy = state.vyaw = 0.0
-        state.is_moving = False
     except Exception as e:
         print(f"[ws] error: {e}", flush=True)
     finally:
         clients.discard(ws)
+        meta = client_meta.pop(ws, None)
+        # Only halt + release the lock if the DEPARTING client actually held control.
+        # A read-only client leaving must NOT stop the robot the owner is still driving.
+        if (meta is not None and meta.get("id") is not None
+                and meta.get("id") == control_owner_id):
+            state.vx = state.vy = state.vyaw = 0.0
+            state.is_moving = False
+            control_owner_id = None            # lock is free; a present device can grab it
+            try:
+                await broadcast(make_control_msg())
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

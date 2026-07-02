@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Locked viewport: no pinch-zoom / double-tap-zoom so thumbs on the sticks
+       never accidentally zoom the page. viewport-fit=cover for notched phones. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <!-- iPhone Safari blocks the Fullscreen API + orientation lock for web pages;
+       the ONLY route to real chromeless fullscreen on iOS is "Add to Home Screen"
+       (standalone). These apple-* tags + the manifest make that launch fullscreen. -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="G1 Drive">
+  <meta name="theme-color" content="#0A0D13">
+  <title>G1 · Phone Teleop</title>
+  <link rel="manifest" href="/static/phone.webmanifest">
+  <link rel="apple-touch-icon" href="/static/phone-icon.svg">
+  <link rel="stylesheet" href="/static/phone.css?v=11">
+  <!-- three.js (shared vendored copy) for the LiDAR cloud feed + 3D obstacle sphere -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/vendor/three/three.module.js",
+      "three/addons/OrbitControls.js": "/static/vendor/three/OrbitControls.js"
+    }
+  }
+  </script>
+</head>
+<body data-mode="damp" data-feed="radar">
+
+  <!-- ================= top bar ================= -->
+  <header class="ph-top">
+    <div class="ph-mode">
+      <span class="ph-eyebrow">Mode</span>
+      <span class="ph-mode-word" id="phMode">damp</span>
+      <span class="ph-transit" id="phTransit" hidden>transitioning…</span>
+    </div>
+
+    <div class="ph-status" id="phStatus">
+      <span class="ph-dot"></span><span id="phStatusText">connecting…</span>
+    </div>
+
+    <div class="ph-batt" id="phBatt" title="battery">
+      <span class="ph-batt-icon"><i id="phBattFill"></i></span>
+      <span id="phBattText">—</span>
+    </div>
+
+    <button class="ph-chip" id="phControlChip" type="button">control?</button>
+    <a class="ph-fs" href="/?full=1" title="Full dashboard" aria-label="full dashboard">⧉</a>
+    <button class="ph-fs" id="phFsBtn" type="button" title="Landscape / fullscreen (turn phone sideways)" aria-label="landscape">⤢</button>
+  </header>
+
+  <!-- ================= mode ladder ================= -->
+  <nav class="ph-modes" id="phModes" aria-label="power / posture">
+    <button class="ph-mbtn" data-mode="zero_torque" type="button">Zero<small>torque</small></button>
+    <button class="ph-mbtn" data-mode="damp" type="button">Damp</button>
+    <button class="ph-mbtn" data-mode="stand" type="button">Stand</button>
+    <button class="ph-mbtn ph-walk" data-mode="walk" type="button">Walk</button>
+  </nav>
+
+  <!-- ================= driving deck: stick | center | stick ============== -->
+  <main class="ph-deck" id="phDeck">
+    <!-- LEFT thumbstick -->
+    <div class="ph-stick-wrap">
+      <div class="ph-stick" id="phStickMove"><div class="ph-knob"></div></div>
+      <div class="ph-stick-cap">Move<small>fwd · strafe</small></div>
+    </div>
+
+    <!-- CENTER: obstacle view + feed switch + obstacle on/off + STOP -->
+    <section class="ph-center">
+      <div class="ph-obsview" id="phObsView" data-feed="radar">
+        <div class="ph-feed-toggle">
+          <button data-feed-btn="radar"  type="button">2D</button>
+          <button data-feed-btn="sphere" type="button">3D</button>
+          <button data-feed-btn="cloud"  type="button">Feed</button>
+          <span class="ph-feed-badge" id="lidarBadge">…</span>
+        </div>
+        <!-- one visible at a time (CSS keys off #phObsView[data-feed]) -->
+        <canvas id="bigRadar" class="ph-feed-layer" data-layer="radar"></canvas>
+        <div id="bigSphere"   class="ph-feed-layer" data-layer="sphere"></div>
+        <div id="lidarView"   class="ph-feed-layer" data-layer="cloud"></div>
+      </div>
+
+      <button class="ph-obs-btn" id="phObsBtn" type="button">
+        <span class="ph-obs-led" aria-hidden="true"></span>
+        <span class="ph-obs-label">Obstacle avoidance</span>
+        <span class="ph-obs-state" id="phObsState">—</span>
+      </button>
+
+      <!-- Step size (continuous / medium / small) — same as the dashboard selector. -->
+      <div class="ph-step" id="phStep" role="group" aria-label="step size">
+        <span class="ph-step-label">Step</span>
+        <button data-step="continuous" type="button">Normal</button>
+        <button data-step="medium" type="button">Med</button>
+        <button data-step="small" type="button">Small</button>
+      </div>
+
+      <button class="ph-stop" id="phStop" type="button">STOP</button>
+    </section>
+
+    <!-- RIGHT thumbstick -->
+    <div class="ph-stick-wrap">
+      <div class="ph-stick" id="phStickTurn"><div class="ph-knob"></div></div>
+      <div class="ph-stick-cap">Turn<small>yaw</small></div>
+    </div>
+
+    <!-- shown when you hold control but the robot isn't in Walk yet -->
+    <div class="ph-deck-hint" id="phDeckHint" hidden>Switch to <b>Walk</b> to drive</div>
+  </main>
+
+  <!-- exit forced-landscape (only visible in landscape; the ⤢ toggle lives in the
+       header, which is hidden in the joysticks-only landscape view). -->
+  <button class="ph-land-exit" id="phLandExit" type="button" title="Exit landscape" aria-label="exit landscape">✕</button>
+
+  <!-- ================= take-control overlay (shown when read-only) ========= -->
+  <div class="ph-overlay" id="phTakeOverlay" hidden>
+    <div class="ph-overlay-card">
+      <div class="ph-overlay-title" id="phOverlayTitle">Another device has control</div>
+      <div class="ph-overlay-sub" id="phOverlaySub">Tap below to drive from this phone.</div>
+      <button class="ph-take" id="phTakeBtn" type="button">Take control</button>
+    </div>
+  </div>
+
+  <!-- ================= swipe-to-confirm sheet (mode changes) ============== -->
+  <div class="ph-sheet" id="phSheet" hidden>
+    <div class="ph-sheet-card">
+      <button class="ph-sheet-x" id="phSheetX" type="button" aria-label="cancel">✕</button>
+      <div class="ph-sheet-title" id="phSheetTitle">Switch mode?</div>
+      <div class="ph-sheet-note" id="phSheetNote"></div>
+      <div class="ph-swipe" id="phSwipe">
+        <div class="ph-swipe-fill" id="phSwipeFill"></div>
+        <span class="ph-swipe-hint" id="phSwipeHint">swipe to confirm ▶</span>
+        <div class="ph-swipe-knob" id="phSwipeKnob">▶</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= portrait "rotate to landscape" hint ================ -->
+  <div class="ph-rotate" id="phRotate">
+    <div class="ph-rotate-icon">↻</div>
+    <div>Rotate to <b>landscape</b> to drive</div>
+  </div>
+
+  <!-- ================= iOS "Add to Home Screen" hint (dismissible) ======== -->
+  <div class="ph-a2hs" id="phA2hs" hidden>
+    <div class="ph-a2hs-card">
+      <button class="ph-a2hs-x" id="phA2hsX" type="button" aria-label="dismiss">✕</button>
+      <div class="ph-a2hs-title">Fullscreen on iPhone</div>
+      <div class="ph-a2hs-body">
+        Safari can't force fullscreen. For a chromeless, landscape driving screen:
+        tap <b>Share</b> <span class="ph-a2hs-icon">􀈂</span> → <b>Add to Home Screen</b>,
+        then open <b>G1&nbsp;Drive</b> from the icon.
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/phone.js?v=11"></script>
+  <!-- viz modules (ES modules, deferred): render on the PHONE's GPU; phone.js feeds
+       them obstacle frames + drives the feed switch. -->
+  <script type="module" src="/static/obstacle3d.js?v=6"></script>
+  <script type="module" src="/static/lidar.js?v=13"></script>
+</body>
+</html>

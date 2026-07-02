@@ -238,26 +238,31 @@ obstacleGroup.visible = false;
 scene.add(obstacleGroup);
 
 const OBS_Z = 0.05;                     // sit just above the grid
-const STOP_M = 0.7, SLOW_M = 2.0;       // distance thresholds for colour ramp
+const OBS_RANGE_M = 3.0;                // ring-fan max reach (matches the node range)
+// Distance thresholds. Defaults MATCH the node (0.75 / 1.75, NOT 0.7/2.0); the real
+// values arrive on msg.stop_m / msg.slow_m and override per frame. Single source here.
+const DEF_STOP = 0.75, DEF_SLOW = 1.75;
+let STOP_M = DEF_STOP, SLOW_M = DEF_SLOW;
 const COL_STOP = 0xff3b30, COL_SLOW = 0xffb020, COL_CLEAR = 0x32d74b;
-const COL_SIDE = 0xff8c1a;
+const COL_FREE = 0x2f8f5f, COL_UNKNOWN = 0x565f72, COL_SIDE = 0xff8c1a;
 
-// Reused materials (lines rebuild geometry each message; materials persist).
-const profileMatStop  = new THREE.LineBasicMaterial({ color: COL_STOP });
-const profileMatSlow  = new THREE.LineBasicMaterial({ color: COL_SLOW });
-const profileMatClear = new THREE.LineBasicMaterial({ color: COL_CLEAR });
-const sideMat = new THREE.LineBasicMaterial({ color: COL_SIDE });
+// Ring "fan" as ONE preallocated LineSegments (origin->endpoint per sector) with
+// per-vertex colours. The old code rebuilt a Group of THREE.Line objects (new
+// geometry) every message -> GC churn + flicker; this updates the buffers in place
+// (three.js best practice). Capacity covers up to 360 x 1deg sectors + side ticks.
+const FAN_MAX_SEGS = 400;
+const _fanPos = new Float32Array(FAN_MAX_SEGS * 2 * 3);
+const _fanCol = new Float32Array(FAN_MAX_SEGS * 2 * 3);
+const fanGeo = new THREE.BufferGeometry();
+fanGeo.setAttribute("position", new THREE.BufferAttribute(_fanPos, 3));
+fanGeo.setAttribute("color", new THREE.BufferAttribute(_fanCol, 3));
+const fanMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.92 });
+const fan = new THREE.LineSegments(fanGeo, fanMat);
+fan.frustumCulled = false;              // endpoints move; skip stale-bounds culling
+obstacleGroup.add(fan);
 
-// Profile "fan": radial lines from origin to each sensed bin (B).
-const profileLines = new THREE.Group();
-obstacleGroup.add(profileLines);
-
-// Side / back ticks (C).
-const sideTicks = new THREE.Group();
-obstacleGroup.add(sideTicks);
-
-// Nearest-obstacle marker ring (B): a flat ring laid on the ground, recoloured
-// and pulsed by zone. Built once, repositioned per message.
+// Nearest-obstacle marker ring: a flat ring laid on the ground, recoloured and
+// pulsed by zone. Built once, repositioned per message.
 const nearGeo = new THREE.RingGeometry(0.14, 0.20, 28);
 const nearMat = new THREE.MeshBasicMaterial({ color: COL_STOP, transparent: true, opacity: 0.9, side: THREE.DoubleSide });
 const nearMarker = new THREE.Mesh(nearGeo, nearMat);
@@ -265,19 +270,9 @@ nearMarker.visible = false;
 obstacleGroup.add(nearMarker);
 let nearPulse = false;                  // animate opacity when STOP
 
-function distMat(d) {
-  if (d == null || d >= SLOW_M) return profileMatClear;
-  return d < STOP_M ? profileMatStop : profileMatSlow;
-}
-
-// Dispose every child geometry of a Group and empty it (avoid GPU leaks).
-function emptyGroup(g) {
-  for (let i = g.children.length - 1; i >= 0; i--) {
-    const c = g.children[i];
-    if (c.geometry) c.geometry.dispose();
-    g.remove(c);
-  }
-}
+// Preallocated scratch (no per-frame allocation).
+const _fc = new THREE.Color(), _camber = new THREE.Color(COL_SLOW), _cred = new THREE.Color(COL_STOP);
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
 function updateObstacle(msg) {
   if (!msg) return;
@@ -290,28 +285,76 @@ function updateObstacle(msg) {
   obstacleGroup.visible = visible;
   if (!visible) { nearPulse = false; return; }
 
-  // --- (B) 360 ring fan + nearest obstacle --------------------------------
-  emptyGroup(profileLines);
+  // thresholds: prefer the guard's real values; else node defaults.
+  STOP_M = (typeof msg.stop_m === "number" && isFinite(msg.stop_m)) ? msg.stop_m : DEF_STOP;
+  SLOW_M = (typeof msg.slow_m === "number" && isFinite(msg.slow_m)) ? msg.slow_m : DEF_SLOW;
+
+  // --- 360 ring fan (honest 3-state) into the preallocated buffer ---------
   const ring = msg.ring;
-  let dists = [], N = 0, angOf = () => 0;
-  if (ring && Array.isArray(ring.dist)) {
-    dists = ring.dist; N = dists.length;
-    angOf = (i) => (ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI / 180;
-  }
-  let near = null, nearAng = 0;
-  for (let i = 0; i < N; i++) {
-    const d = dists[i];
-    if (d == null) continue;
-    const a = angOf(i);
-    const ex = d * Math.cos(a), ey = d * Math.sin(a);
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(
-      new Float32Array([0, 0, OBS_Z, ex, ey, OBS_Z]), 3));
-    profileLines.add(new THREE.Line(g, distMat(d)));
-    if (near == null || d < near) { near = d; nearAng = a; }
+  const hasRing = ring && Array.isArray(ring.dist);
+  const dists = hasRing ? ring.dist : [];
+  const state = (hasRing && Array.isArray(ring.state)) ? ring.state : null;
+  const prob  = (hasRing && Array.isArray(ring.prob)) ? ring.prob : null;
+  const N = hasRing ? dists.length : 0;
+  const angOf = hasRing
+    ? (i) => (ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI / 180
+    : () => 0;
+
+  let v = 0;                            // vertex cursor into the fan buffers
+  function seg(x1, y1, r, g, b) {
+    if (v + 2 > FAN_MAX_SEGS * 2) return;
+    _fanPos[v * 3] = 0; _fanPos[v * 3 + 1] = 0; _fanPos[v * 3 + 2] = OBS_Z;
+    _fanCol[v * 3] = r; _fanCol[v * 3 + 1] = g; _fanCol[v * 3 + 2] = b; v++;
+    _fanPos[v * 3] = x1; _fanPos[v * 3 + 1] = y1; _fanPos[v * 3 + 2] = OBS_Z;
+    _fanCol[v * 3] = r; _fanCol[v * 3 + 1] = g; _fanCol[v * 3 + 2] = b; v++;
   }
 
-  // Nearest-obstacle marker: closest profile point, else front_m straight ahead.
+  let near = null, nearAng = 0;
+  for (let i = 0; i < N; i++) {
+    const a = angOf(i);
+    const d = dists[i];
+    if (state) {
+      const st = state[i];
+      const p = prob ? clamp01(prob[i]) : (st === 2 ? 1 : 0);
+      if (st === 2) {                    // occupied: amber->red by proximity, faded by prob
+        const dd = Math.min(d == null ? OBS_RANGE_M : d, OBS_RANGE_M);
+        const t = clamp01((SLOW_M - dd) / ((SLOW_M - STOP_M) || 1));
+        _fc.copy(_camber).lerp(_cred, t).multiplyScalar(0.55 + 0.45 * p);
+        seg(dd * Math.cos(a), dd * Math.sin(a), _fc.r, _fc.g, _fc.b);
+        if (d != null && (near == null || d < near)) { near = d; nearAng = a; }
+      } else if (st === 1) {             // free: faint green out to range
+        _fc.setHex(COL_FREE).multiplyScalar(0.22);
+        seg(OBS_RANGE_M * Math.cos(a), OBS_RANGE_M * Math.sin(a), _fc.r, _fc.g, _fc.b);
+      } else {                           // unknown: faint gray out to range
+        _fc.setHex(COL_UNKNOWN).multiplyScalar(0.20);
+        seg(OBS_RANGE_M * Math.cos(a), OBS_RANGE_M * Math.sin(a), _fc.r, _fc.g, _fc.b);
+      }
+    } else {                             // fallback: old behaviour, sensed bins only
+      if (d == null) continue;
+      _fc.setHex(d < STOP_M ? COL_STOP : d < SLOW_M ? COL_SLOW : COL_CLEAR);
+      seg(d * Math.cos(a), d * Math.sin(a), _fc.r, _fc.g, _fc.b);
+      if (near == null || d < near) { near = d; nearAng = a; }
+    }
+  }
+
+  // Side ticks folded into the same buffer (short cross ticks along forward, X).
+  const side = msg.side || {};
+  function tick(yVal) {
+    if (yVal == null || v + 2 > FAN_MAX_SEGS * 2) return;
+    _fc.setHex(COL_SIDE);
+    _fanPos[v * 3] = -0.12; _fanPos[v * 3 + 1] = yVal; _fanPos[v * 3 + 2] = OBS_Z;
+    _fanCol[v * 3] = _fc.r; _fanCol[v * 3 + 1] = _fc.g; _fanCol[v * 3 + 2] = _fc.b; v++;
+    _fanPos[v * 3] = 0.12; _fanPos[v * 3 + 1] = yVal; _fanPos[v * 3 + 2] = OBS_Z;
+    _fanCol[v * 3] = _fc.r; _fanCol[v * 3 + 1] = _fc.g; _fanCol[v * 3 + 2] = _fc.b; v++;
+  }
+  if (side.left && msg.left_m != null) tick(+msg.left_m);
+  if (side.right && msg.right_m != null) tick(-msg.right_m);
+
+  fanGeo.setDrawRange(0, v);
+  fanGeo.attributes.position.needsUpdate = true;
+  fanGeo.attributes.color.needsUpdate = true;
+
+  // Nearest-obstacle marker: closest occupied sector, else front_m straight ahead.
   const zone = msg.zone || "CLEAR";
   let markD = near, markA = nearAng;
   if (markD == null && msg.front_m != null) { markD = msg.front_m; markA = 0; }
@@ -326,29 +369,13 @@ function updateObstacle(msg) {
     nearMarker.visible = false;
     nearPulse = false;
   }
-
-  // --- (C) side ticks ------------------------------------------------------
-  emptyGroup(sideTicks);
-  const side = msg.side || {};
-  function sideTick(yVal) {
-    if (yVal == null) return;
-    const g = new THREE.BufferGeometry();
-    // a short cross tick at (0, yVal, z), oriented along forward (X).
-    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
-      -0.12, yVal, OBS_Z,  0.12, yVal, OBS_Z,
-    ]), 3));
-    sideTicks.add(new THREE.Line(g, sideMat));
-  }
-  if (side.left && msg.left_m != null) sideTick(+msg.left_m);
-  if (side.right && msg.right_m != null) sideTick(-msg.right_m);
 }
 
 function clearObstacle() {
   obstacleGroup.visible = false;
   nearMarker.visible = false;
   nearPulse = false;
-  emptyGroup(profileLines);
-  emptyGroup(sideTicks);
+  fanGeo.setDrawRange(0, 0);
 }
 
 window.LidarOverlay = { updateObstacle, clear: clearObstacle };
