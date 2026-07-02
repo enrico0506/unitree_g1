@@ -1209,8 +1209,9 @@ async def lifespan(app: FastAPI):
         print("Obstacle perception node started (viz always-on).", flush=True)
 
     # D435i near-ground depth fusion: reuses the dashboard's RealSense cloud (lidar)
-    # to fill the Mid-360's near-ground forward blind zone. DEFAULT OFF (validate the
-    # frame on the robot first); the guard mixes its distance into the forward stop.
+    # to fill the Mid-360's near-ground forward blind zone. Enabled via obstacle.yaml
+    # (depth_fusion.enabled: true) + self-gated by the frame-sanity check; the guard
+    # mixes its per-sector ring into the fused ring, min-only (never clears a reading).
     depth_nf = DepthNearField(lidar_source=lidar, cfg_path=str(OBSTACLE_CFG_PATH),
                               ls_mount_height=LIDAR_CAMERA_HEIGHT)
     depth_nf.start()

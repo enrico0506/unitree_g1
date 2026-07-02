@@ -826,8 +826,17 @@ class ObstacleNode(Node):
             # QW1 fix 1.5: level the elevation-grid input against measured gravity so a
             # tilted/swaying sensor's per-cell floor is computed in a gravity-aligned frame
             # (rotation preserves point order -> the returned mask still aligns to x/y/z).
-            if self.ground_use_gravity and self._gravity is not None:
-                pts = ground.level_by_gravity(pts, self._gravity)
+            g = self._gravity
+            if self.ground_use_gravity and g is not None:
+                # Orient the accelerometer EMA to point DOWN by its own z sign -- sign-agnostic,
+                # so it is correct whether the IMU reports gravity or specific-force-UP (REP-145).
+                # Then LEVEL only if it is plausibly vertical (< ~35 deg from straight down): a
+                # wrong sign or garbage IMU asks for a large/flipped rotation -> rejected -> safe
+                # no-op (falls back to the assumed-z-up behaviour, never rotates the cloud wrong).
+                gd = g if g[2] < 0.0 else -g
+                gn = float(np.sqrt(gd[0] * gd[0] + gd[1] * gd[1] + gd[2] * gd[2]))
+                if gn > 1e-3 and (-gd[2] / gn) > 0.82:     # cos(35 deg) ~ 0.82
+                    pts = ground.level_by_gravity(pts, gd)
             keep_ground = ground.segment_obstacles_elevation(
                 pts, cell=self.elev_cell, ground_clearance=self.ground_clear,
                 max_above=self.max_above, floor_pct=self.elev_floor_pct,

@@ -114,7 +114,6 @@ class DepthNearField:
         self._floor_ramp = 0.0     # last measured floor-height ramp (m) across the forward band
         self._warn_ct = 0          # throttle for the frame-rejected warning
         self._live = False
-        self._stamp = 0.0
         self._stop = threading.Event()
         self._thread = None
 
@@ -175,7 +174,7 @@ class DepthNearField:
 
         Same validated derotation as ``_compute`` but, instead of one forward corridor,
         bins the near-ground points into the lidar ring's sectors and reports each
-        sector's k-th nearest horizontal range. Returns (dist, n_near) where ``dist`` is
+        sector's k-th nearest horizontal range. Returns (dist, kept_points, n_near); ``dist`` is
         (ring_n,) float64 with NaN == "no reading" (never emitted as clear -- absence of a
         near obstacle, or a depth hole, leaves NaN so the guard merge keeps the lidar value).
         """
@@ -284,7 +283,6 @@ class DepthNearField:
                         self._frame_ok = ok
                         self._floor_ramp = ramp
                         self._live = cloud is not None
-                        self._stamp = time.monotonic()
                 except Exception as e:
                     with self._lock:
                         self._front = None
