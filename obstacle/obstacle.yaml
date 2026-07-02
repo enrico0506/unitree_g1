@@ -207,3 +207,6 @@ depth_fusion:
   ring_bin_deg: 5.0          # MUST equal the lidar ring_bin_deg above, or the merge is skipped
   ring_fov_half_deg: 43.0    # D435i horizontal half-FOV (~87 deg HFOV) actually imaged
   ring_min_points: 2         # min near points in a 5 deg sector before it reports
+  ring_ground_clearance: 0.03  # SMALL-OBJECT floor: ring sees cables/cords >~3 cm tall on the
+                             #   floor (scalar corridor keeps 0.08). RAISE toward 0.05 if a
+                             #   noisy/specular floor false-triggers; LOWER risks floor noise.

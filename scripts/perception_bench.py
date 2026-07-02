@@ -73,10 +73,14 @@ def _bin_idx(d):
     return None
 
 
-def run_bench(noise=0.02, sway_amp=2.0, seed=0):
+def run_bench(noise=0.02, sway_amp=2.0, seed=0, scns=None):
     """Sweep every scenario open-loop (robot drives forward so obstacles pass far->near),
     accumulating a per-sector TP/FP/FN ledger vs the GT ring. Returns a KPI dict."""
-    scns = sp.scenarios()
+    scns = scns if scns is not None else sp.scenarios()
+    per_scn = {}
+
+    def _rate(a, b):
+        return (a / b) if b else float("nan")
     # confusion, overall + per range bin
     TP = FP = FN = TN = 0
     tp_by = [0] * len(RANGE_BINS); fn_by = [0] * len(RANGE_BINS)
@@ -92,7 +96,7 @@ def run_bench(noise=0.02, sway_amp=2.0, seed=0):
         rng = np.random.RandomState(seed)
         x, y, theta = scn["start"]
         nsteps = int(scn["dur"] / sp.DT)
-        first_true = None; first_det = None; scn_fp = 0
+        first_true = None; first_det = None; scn_fp = 0; scn_tp = 0; scn_fn = 0
         for step in range(nsteps):
             t = step * sp.DT
             obs = sp.obstacles_at(scn["obstacles"], t)
@@ -120,14 +124,16 @@ def run_bench(noise=0.02, sway_amp=2.0, seed=0):
             for s, tv in gt_occ.items():
                 b = _bin_idx(tv)
                 if _near(s, pc_occ):
-                    TP += 1
+                    TP += 1; scn_tp += 1
                     if b is not None:
                         tp_by[b] += 1
                         pv = min((pc_occ[(s + d) % N] for d in range(-TOL, TOL + 1)
                                   if ((s + d) % N) in pc_occ), key=lambda v: abs(v - tv))
                         e = (pv - tv) ** 2; sq_err.append(e); sq_err_by[b].append(e)
-                elif b is not None:
-                    FN += 1; fn_by[b] += 1
+                else:
+                    FN += 1; scn_fn += 1
+                    if b is not None:
+                        fn_by[b] += 1
             # precision side: a perceived sector with NO GT within tol is a false stop
             for s in pc_occ:
                 if not _near(s, gt_occ):
@@ -153,14 +159,13 @@ def run_bench(noise=0.02, sway_amp=2.0, seed=0):
             y += vx * math.sin(theta) * sp.DT
 
         fp_per_scn.append(scn_fp)
+        per_scn[name] = {"recall": _rate(scn_tp, scn_tp + scn_fn), "tp": scn_tp,
+                         "fn": scn_fn, "fp": scn_fp}
         if first_true is not None:
             if first_det is not None:
                 latencies.append((first_det - first_true) * sp.DT)
             else:
                 misses += 1
-
-    def _rate(a, b):
-        return (a / b) if b else float("nan")
 
     prec = _rate(TP, TP + FP); rec = _rate(TP, TP + FN)
     f1 = _rate(2 * prec * rec, prec + rec) if (prec == prec and rec == rec and prec + rec) else float("nan")
@@ -176,6 +181,22 @@ def run_bench(noise=0.02, sway_amp=2.0, seed=0):
         "latency_max_s": (float(np.max(latencies)) if latencies else float("nan")),
         "front_misses": misses,
         "false_stop_sectors_per_scenario": float(np.mean(fp_per_scn)) if fp_per_scn else 0.0,
+        "per_scenario": per_scn,
+    }
+
+
+def small_scenarios():
+    """Fine-detection stress set: thin poles at range + a small pole. These are the
+    body-height objects the Mid-360 CAN see; cables ON THE FLOOR are depth-only (the sim
+    models only the lidar, so they are exercised by obstacle/test_depth_ring.py instead)."""
+    C = lambda cx, cy, r, **k: dict(type="circle", cx=cx, cy=cy, r=r, **k)
+    fwd = lambda: dict(policy="forward", start=(0, 0, 0), goal=(20, 0), dur=14.0)
+    return {
+        "thin_pole_1m":  dict(**fwd(), obstacles=[C(3.0, 0.0, 0.02, h=1.2)]),   # 4 cm dia
+        "thin_pole_2m":  dict(**fwd(), obstacles=[C(4.0, 0.0, 0.02, h=1.2)]),
+        "wire_pole_3m":  dict(**fwd(), obstacles=[C(5.0, 0.0, 0.015, h=1.2)]),  # 3 cm dia wire
+        "small_pole_3m": dict(**fwd(), obstacles=[C(5.0, 0.0, 0.05, h=1.2)]),   # 10 cm dia
+        "thin_offaxis":  dict(**fwd(), obstacles=[C(3.5, 0.8, 0.02, h=1.2)]),
     }
 
 
@@ -198,6 +219,11 @@ def print_report(k):
     print(f"  Front detection latency: median {m(k['latency_median_s'])} s  "
           f"max {m(k['latency_max_s'])} s   misses {k['front_misses']}")
     print(f"  False-stop sectors / scenario: {k['false_stop_sectors_per_scenario']:.2f}")
+    if k.get("per_scenario"):
+        print("-" * 66)
+        print("  Per-scenario recall (TP/FN, FP):")
+        for nm, s in k["per_scenario"].items():
+            print(f"    {nm:16s} {pct(s['recall'])}   (TP {s['tp']}  FN {s['fn']}  FP {s['fp']})")
     print("-" * 66)
     print("  COVERAGE GAPS (geometry cannot monitor -- NOT scored, not laundered):")
     print("    - low objects to the SIDES / REAR (depth forward-only, lidar near-floor-blind)")
@@ -223,13 +249,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--small", action="store_true", help="fine-detection stress set (thin poles)")
     ap.add_argument("--noise", type=float, default=0.02)
     ap.add_argument("--sway", type=float, default=2.0)
     args = ap.parse_args()
     if args.selftest:
         selftest()
     else:
-        k = run_bench(noise=args.noise, sway_amp=args.sway)
+        scns = small_scenarios() if args.small else None
+        k = run_bench(noise=args.noise, sway_amp=args.sway, scns=scns)
         if args.json:
             print(json.dumps(k, indent=2))
         else:

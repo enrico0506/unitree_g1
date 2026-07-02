@@ -46,6 +46,11 @@ _DEFAULTS = {
     "ring_bin_deg": 5.0,       # MUST match the lidar ring (obstacle.yaml ring_bin_deg) to merge
     "ring_fov_half_deg": 43.0, # D435i horizontal half-FOV (~87 deg HFOV) the camera actually sees
     "ring_min_points": 2,      # min near points in a 5 deg sector before it reports (per-sector)
+    # SMALL-OBJECT floor: the ring uses a LOWER clearance than the scalar corridor so a
+    # low CABLE / cord / thin bar on the floor (a few cm tall) clears the floor and is seen.
+    # Bounded by the D435i near-field noise (~1-3 cm) -- below ~3 cm objects blend into floor
+    # noise (physics floor). Raise if the flat floor false-triggers on your surface.
+    "ring_ground_clearance": 0.03,  # ring obstacle floor (m); scalar corridor keeps 0.08
     # --- frame self-validation: a wrong mount pitch/height tilts the derotated floor so its
     #     height ramps with range. With the correct frame a flat floor sits at height ~0 at
     #     ALL ranges. If the floor ramps more than the tolerance, the frame is UNTRUSTWORTHY
@@ -93,6 +98,7 @@ class DepthNearField:
         self.ring_start_deg = -180.0                         # shared convention with the node/guard
         self.ring_fov_half = float(cfg.get("ring_fov_half_deg", 43.0))
         self.ring_min_pts = max(1, int(cfg.get("ring_min_points", 2)))
+        self.ring_ground_clear = float(cfg.get("ring_ground_clearance", 0.03))  # low: catch cables
         # frame self-validation
         self.frame_check = bool(cfg.get("frame_check", True))
         self.frame_ramp_tol = float(cfg.get("frame_floor_ramp_m", 0.15))
@@ -185,7 +191,7 @@ class DepthNearField:
         ang = np.degrees(np.arctan2(left, fwd))          # 0 ahead, + left (node/guard convention)
         horiz = np.hypot(fwd, left)
         keep = (
-            (height > self.ground_clear) & (height < self.max_height)
+            (height > self.ring_ground_clear) & (height < self.max_height)  # LOW floor: catch cables
             & (fwd > self.min_range) & (fwd < self.max_range)
             & (np.abs(ang) < self.ring_fov_half)         # only where the camera actually sees
         )

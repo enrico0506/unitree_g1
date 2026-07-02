@@ -36,6 +36,7 @@ def _mk_dnf():
     d.ring_start_deg = -180.0
     d.ring_fov_half = 43.0
     d.ring_min_pts = 2
+    d.ring_ground_clear = 0.03
     d.kth = 4
     d.frame_check = True
     d.frame_ramp_tol = 0.15
@@ -142,10 +143,30 @@ def test_frame_check_rejects_bad_frame():
           f"12deg-pitch(ramp {r2:.2f}) + 0.3m-height(off {o3:.2f}) rejected -> lidar-only")
 
 
+def test_ring_detects_cable_rejects_floor_noise():
+    d = _mk_dnf()
+    # a 4 cm-tall thin CABLE lying across the path at 1.0 m (points span the cord width)
+    cable = np.array([_pt(1.0 + dx, ly, 0.04, d)
+                      for dx in (-0.01, 0.0, 0.01) for ly in np.arange(-0.15, 0.16, 0.03)],
+                     np.float32)
+    out, _ = d._compute_ring(cable)
+    s = _sector(0.0)
+    assert np.isfinite(out[s]), "4 cm floor cable at 1 m should be detected (ring clearance 3 cm)"
+    assert abs(out[s] - 1.0) < 0.15, f"cable dist {out[s]:.2f} ~ 1.0 m"
+    # floor NOISE just below the ring clearance (<=2 cm) must NOT read as a cable
+    noise = np.array([_pt(fw, ly, 0.02, d)
+                      for fw in np.arange(0.5, 2.0, 0.05) for ly in np.arange(-0.4, 0.4, 0.05)],
+                     np.float32)
+    out2, _ = d._compute_ring(noise)
+    assert np.isnan(out2).all(), "sub-clearance floor noise must not phantom-trigger cables"
+    print(f"PASS  cable: 4cm cable @1m detected ({out[s]:.2f} m); 2cm floor noise rejected")
+
+
 if __name__ == "__main__":
     test_ring_empty_and_floor()
     test_ring_detects_near_obstacle()
     test_ring_fov_clip()
     test_merge_fail_safe_and_monotonic()
     test_frame_check_rejects_bad_frame()
+    test_ring_detects_cable_rejects_floor_noise()
     print("\nALL DEPTH-RING TESTS PASS")
