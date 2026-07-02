@@ -80,6 +80,16 @@ def make_node(overrides=None):
     n.floor_inlier_band = float(cfg.get("floor_inlier_band_m", 0.12))
     n.floor_fit_iters = max(1, int(cfg.get("floor_fit_iters", 3)))
     n.max_above = float(cfg["obstacle_max_above_m"])
+    # QW1 -- per-cell elevation ground seg (mirror __init__; gated on ground.py import)
+    n.ground_elevation = bool(cfg.get("ground_elevation", True)) and mod.ground is not None
+    n.elev_cell = float(cfg.get("elev_cell_m", 0.20))
+    n.elev_floor_pct = float(cfg.get("elev_floor_percentile", 10.0))
+    n.elev_min_cell_pts = max(1, int(cfg.get("elev_min_cell_points", 3)))
+    # QW3 -- range-graded decimation attrs (unused by detect(), set for parity)
+    n.range_graded_decimate = bool(cfg.get("range_graded_decimate", True))
+    n.decimate_budget = max(1000, int(cfg.get("decimate_budget", 8000)))
+    n.decimate_near_full_m = float(cfg.get("decimate_near_full_m", 2.5))
+    n.decimate_parse_cap = max(6000, int(cfg.get("decimate_parse_cap", 45000)))
     n.self_front = float(cfg["self_front_m"])
     n.self_back = float(cfg["self_back_m"])
     n.self_half_w = float(cfg["self_half_width_m"])
@@ -93,6 +103,8 @@ def make_node(overrides=None):
     n.tripwire_min = max(1, int(cfg.get("tripwire_min_points", 1)))
     n.ring_n = max(1, int(round(360.0 / n.ring_bin_deg)))
     n.ring_start_deg = -180.0
+    # QW2 -- range-scaled filters ring (mirror __init__; gated on filters import)
+    n.ring_filter = bool(cfg.get("ring_filter", True)) and mod._filters is not None
     n.floor_abc = None
     n.cfg = cfg
     # precision pipeline attrs (mirror obstacle_node.__init__). Occupancy is stateful

@@ -50,6 +50,14 @@ try:
     from filters import custommsg_to_numpy      # fast CustomMsg->numpy (with per-point times)
 except Exception:                              # pragma: no cover
     custommsg_to_numpy = None
+try:
+    import ground                               # per-cell elevation ground seg (QW1)
+except Exception:                              # pragma: no cover
+    ground = None
+try:
+    import filters as _filters                  # range-scaled ring + graded decimate (QW2/QW3)
+except Exception:                              # pragma: no cover
+    _filters = None
 
 SHM_PATH = "/dev/shm/g1_obstacle.json"
 YAML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "obstacle.yaml")
@@ -74,6 +82,13 @@ DEFAULTS = {
     "floor_inlier_band_m": 0.12,   # robust floor fit: refit inliers within +/- this of the current plane
     "floor_fit_iters": 3,          # robust floor fit: number of seed-then-refit iterations
     "obstacle_max_above_m": 1.9,   # cut points higher than this above the floor (ceiling/overhead)
+    # --- QW1: per-cell elevation ground seg (ground.py). Replaces the single global
+    #     tilted-plane cut for the KEEP decision so small ground objects aren't absorbed
+    #     into a 12 cm inlier band. Global plane still fit for viz/diag/self-mask height. ---
+    "ground_elevation": True,      # true = per-20cm-cell floor (ground.segment_obstacles_elevation)
+    "elev_cell_m": 0.20,           # elevation-grid cell size (m)
+    "elev_floor_percentile": 10.0, # per-cell floor = this z-percentile (low = robust to overhang)
+    "elev_min_cell_points": 3,     # cells below this keep points as obstacles (safety-first)
     "self_front_m": 0.35,          # footprint self-mask: forward extent (covers leg swing)
     "self_back_m": 0.35,           # footprint self-mask: rearward extent
     "self_half_width_m": 0.30,     # footprint self-mask: half-width (covers the leg stance)
@@ -95,6 +110,17 @@ DEFAULTS = {
     "tripwire_range_m": 1.6,       # NEAR-FIELD tripwire: a sector with >=tripwire_min_points within
                                    #   this range reports the nearest one even below ring_min_points
     "tripwire_min_points": 2,      # min returns inside tripwire_range to fire the near-field tripwire
+    # --- QW2: build the ring via filters.sector_kth_nearest (range-scaled required-points)
+    #     + sector_tripwire, instead of the flat inline per-sector logic. Keeps sparse
+    #     thin/far hazards (1-2 pts) while rejecting lone near fliers. ---
+    "ring_filter": True,           # true = range-scaled filters ring; false = legacy inline ring
+    # --- QW3: range-graded decimation. Replaces the blind `point_num//6000` stride
+    #     (which thins already-sparse near objects) with keep-all-near / thin-far under a
+    #     point budget, so small near-ground objects retain their few returns. ---
+    "range_graded_decimate": True, # true = keep-near/thin-far; false = legacy blind stride
+    "decimate_budget": 8000,       # target max points/frame after graded decimation
+    "decimate_near_full_m": 2.5,   # keep ALL points within this range; thin only beyond
+    "decimate_parse_cap": 45000,   # above this raw point_num, fall back to blind stride (perf valve)
     "enabled_default": False,
     "publish_hz": 10,
     # --- obstacle-point export for the dashboard 3D sphere -------------------
@@ -176,6 +202,31 @@ def custom_xyz(msg, decimate):
     return np.array([(p.x, p.y, p.z) for p in pts], dtype=np.float32)
 
 
+def graded_indices(horiz, near_full_m, budget):
+    """QW3: range-graded decimation index set.
+
+    Keep EVERY point within ``near_full_m`` (small near-ground objects have only a few
+    returns -- a blind ``[::stride]`` erases them), then evenly thin the far points to
+    fill the remaining ``budget``. If the near set alone exceeds the budget, the near set
+    itself is strided down. Returns a sorted index array into ``horiz``.
+    """
+    n = int(horiz.shape[0])
+    if n <= budget:
+        return np.arange(n)
+    near_idx = np.nonzero(horiz < near_full_m)[0]
+    far_idx = np.nonzero(horiz >= near_full_m)[0]
+    remaining = budget - near_idx.size
+    if remaining <= 0:                                  # near alone over budget
+        step = int(np.ceil(near_idx.size / float(budget)))
+        return near_idx[::max(1, step)]
+    if far_idx.size > remaining:
+        step = int(np.ceil(far_idx.size / float(remaining)))
+        far_idx = far_idx[::max(1, step)]
+    idx = np.concatenate((near_idx, far_idx))
+    idx.sort()
+    return idx
+
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
@@ -206,6 +257,18 @@ class ObstacleNode(Node):
         self.floor_inlier_band = float(c.get("floor_inlier_band_m", 0.12))
         self.floor_fit_iters = max(1, int(c.get("floor_fit_iters", 3)))
         self.max_above = float(c["obstacle_max_above_m"])
+        # QW1 -- per-cell elevation ground seg (only if ground.py imported)
+        self.ground_elevation = bool(c.get("ground_elevation", True)) and ground is not None
+        self.elev_cell = float(c.get("elev_cell_m", 0.20))
+        self.elev_floor_pct = float(c.get("elev_floor_percentile", 10.0))
+        self.elev_min_cell_pts = max(1, int(c.get("elev_min_cell_points", 3)))
+        # QW2 -- range-scaled filters ring (only if filters imported)
+        self.ring_filter = bool(c.get("ring_filter", True)) and _filters is not None
+        # QW3 -- range-graded decimation
+        self.range_graded_decimate = bool(c.get("range_graded_decimate", True))
+        self.decimate_budget = max(1000, int(c.get("decimate_budget", 8000)))
+        self.decimate_near_full_m = float(c.get("decimate_near_full_m", 2.5))
+        self.decimate_parse_cap = max(6000, int(c.get("decimate_parse_cap", 45000)))
         self.self_front = float(c["self_front_m"])
         self.self_back = float(c["self_back_m"])
         self.self_half_w = float(c["self_half_width_m"])
@@ -343,14 +406,30 @@ class ObstacleNode(Node):
         times = None
         if self.kind == "custom":
             pn = int(getattr(msg, "point_num", 0) or len(msg.points))
-            decimate = max(1, pn // 6000)
-            if self._deskewer is not None and custommsg_to_numpy is not None:
+            # QW3: range-graded decimation -- parse FULL, then keep-all-near / thin-far to
+            # the budget (blind `pn//6000` stride erases already-sparse near objects). Only
+            # on the fast numpy+deskew path, and only under decimate_parse_cap (perf valve);
+            # otherwise fall back to the legacy blind stride below.
+            graded = (self.range_graded_decimate and custommsg_to_numpy is not None
+                      and self._deskewer is not None and 0 < pn <= self.decimate_parse_cap)
+            if graded:
                 try:
-                    pts, times, _ = custommsg_to_numpy(msg, decimate=decimate)
+                    pts, times, _ = custommsg_to_numpy(msg, decimate=1)
+                    h = np.hypot(pts[:, 0], pts[:, 1])
+                    idx = graded_indices(h, self.decimate_near_full_m, self.decimate_budget)
+                    pts = pts[idx]
+                    times = times[idx] if times is not None else None
                 except Exception:
-                    pts, times = custom_xyz(msg, decimate), None
-            else:
-                pts = custom_xyz(msg, decimate)
+                    graded = False
+            if not graded:
+                decimate = max(1, pn // 6000)
+                if self._deskewer is not None and custommsg_to_numpy is not None:
+                    try:
+                        pts, times, _ = custommsg_to_numpy(msg, decimate=decimate)
+                    except Exception:
+                        pts, times = custom_xyz(msg, decimate), None
+                else:
+                    pts = custom_xyz(msg, decimate)
         else:
             pts = pc2_xyz(msg)
         n_raw = len(pts)
@@ -567,6 +646,22 @@ class ObstacleNode(Node):
         center angle = ring_start_deg + (i + 0.5) * ring_bin_deg, same sign
         convention as everything else (atan2(y, x): 0=ahead, +=LEFT, -=RIGHT).
         """
+        if self.ring_filter:
+            # QW2: range-scaled required-points ring. A sector reports its k-th nearest
+            # only if it holds >= required_points(range) points -- so a sparse thin/far
+            # hazard (few returns) survives while a lone near flier is rejected -- then the
+            # same near-field tripwire is merged by nearest. Same sector convention as the
+            # legacy path below (n_sectors=ring_n, start=ring_start_deg, bin=ring_bin_deg).
+            base, _counts = _filters.sector_kth_nearest(
+                ang, horiz, n_sectors=self.ring_n, start_deg=self.ring_start_deg,
+                k=self.ring_min, range_scaled_mincount=True,
+                k0=self.ring_min, r0=1.0, r_max=self.range_m)
+            trip = _filters.sector_tripwire(
+                ang, horiz, n_sectors=self.ring_n, start_deg=self.ring_start_deg,
+                tripwire_range=self.tripwire_range, tripwire_min=self.tripwire_min)
+            merged = np.asarray(_filters.merge_min(base, trip), dtype=float).ravel()
+            return [None if not np.isfinite(v) else float(v) for v in merged]
+
         dist = [None] * self.ring_n
         if len(ang) == 0:
             return dist
@@ -709,8 +804,20 @@ class ObstacleNode(Node):
         a, b, c = self._fit_floor(x[cand], y[cand], z[cand])
         self.floor_abc = (a, b, c)
 
-        above = z - (a * x + b * y + c)   # height of each point above the floor
-        keep_ground = (above > self.ground_clear) & (above < self.max_above)
+        above = z - (a * x + b * y + c)   # height above the GLOBAL plane (viz/diag/self-mask)
+
+        if self.ground_elevation:
+            # QW1: per-cell (20 cm) floor instead of one global tilted plane, so a small
+            # object is measured against its LOCAL floor and not absorbed into the plane's
+            # ~12 cm inlier band. Global plane above/floor_abc kept above for the self-mask
+            # height test, viz and the front-cone diagnostic. True == obstacle (keep).
+            pts = np.column_stack((x, y, z)).astype(np.float32, copy=False)
+            keep_ground = ground.segment_obstacles_elevation(
+                pts, cell=self.elev_cell, ground_clearance=self.ground_clear,
+                max_above=self.max_above, floor_pct=self.elev_floor_pct,
+                min_cell_pts=self.elev_min_cell_pts)
+        else:
+            keep_ground = (above > self.ground_clear) & (above < self.max_above)
 
         # robot footprint self-mask: a box around the base. HEIGHT-LIMITED so it only
         # swallows LOW returns (the robot's own legs/feet) -- a real obstacle at
