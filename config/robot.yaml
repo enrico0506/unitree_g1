@@ -36,11 +36,11 @@ control:
 # response, DOWN for gentler. jerk ~3-4x accel gives a smooth S-curve without feeling soggy.
 motion:
   enabled: true          # false = pass-through (old instant-step behaviour)
-  accel_vx: 1.2          # m/s^2   forward/back acceleration limit (0->1.5 m/s in ~1.3 s)
-  accel_vy: 1.0          # m/s^2   strafe acceleration limit
+  accel_vx: 2.2          # m/s^2   forward/back acceleration limit (0->1.5 m/s in ~0.7 s). Was 1.2 = too soggy/laggy; nav2 diff-drive default is 2.5.
+  accel_vy: 1.6          # m/s^2   strafe acceleration limit (was 1.0)
   accel_vyaw: 4.0        # rad/s^2 yaw acceleration limit
-  jerk_vx: 4.0           # m/s^3   forward/back jerk limit (S-curve sharpness)
-  jerk_vy: 4.0           # m/s^3   strafe jerk limit
+  jerk_vx: 8.0           # m/s^3   forward/back jerk limit (S-curve sharpness; ~3.6x accel keeps it smooth but snappy at onset. Was 4.0)
+  jerk_vy: 8.0           # m/s^3   strafe jerk limit (was 4.0)
   jerk_vyaw: 16.0        # rad/s^3 yaw jerk limit
   normalize_diagonal: true  # cap W+A so diagonal speed stays on the (vx,vy) speed ellipse
 

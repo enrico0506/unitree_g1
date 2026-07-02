@@ -229,11 +229,10 @@ function animate() {
 }
 
 // --- obstacle-guard overlay ----------------------------------------------
-// A visual aid layered on the existing point cloud: the live front depth
-// profile it "tracks" (B), a planned-path arrow toward the chosen gap (A),
-// and subtle side ticks (C). Only visible while the guard is enabled+live.
-// All drawn near the ground plane (z ~ 0.05), robot origin = (0,0). Frame:
-// angle 0 = straight ahead (+X), + = LEFT (+Y), - = RIGHT (-Y).
+// A visual aid layered on the existing point cloud: the 360 deg ring fan +
+// nearest-obstacle marker (B) and subtle side ticks (C). Only visible while the
+// guard is enabled+live. All drawn near the ground plane (z ~ 0.05), robot
+// origin = (0,0). Frame: angle 0 = straight ahead (+X), + = LEFT (+Y), - = RIGHT (-Y).
 const obstacleGroup = new THREE.Group();
 obstacleGroup.visible = false;
 scene.add(obstacleGroup);
@@ -266,15 +265,6 @@ nearMarker.visible = false;
 obstacleGroup.add(nearMarker);
 let nearPulse = false;                  // animate opacity when STOP
 
-// Planned-path arrow (A): a shaft (curved toward the turn) + a cone tip.
-const pathMat = new THREE.LineBasicMaterial({ color: COL_CLEAR, linewidth: 3 });
-const pathLine = new THREE.Line(new THREE.BufferGeometry(), pathMat);
-obstacleGroup.add(pathLine);
-const tipGeo = new THREE.ConeGeometry(0.09, 0.26, 16);
-const tipMat = new THREE.MeshBasicMaterial({ color: COL_CLEAR });
-const pathTip = new THREE.Mesh(tipGeo, tipMat);
-obstacleGroup.add(pathTip);
-
 function distMat(d) {
   if (d == null || d >= SLOW_M) return profileMatClear;
   return d < STOP_M ? profileMatStop : profileMatSlow;
@@ -300,16 +290,13 @@ function updateObstacle(msg) {
   obstacleGroup.visible = visible;
   if (!visible) { nearPulse = false; return; }
 
-  // --- (B) profile fan + nearest obstacle ---------------------------------
+  // --- (B) 360 ring fan + nearest obstacle --------------------------------
   emptyGroup(profileLines);
   const ring = msg.ring;
-  let dists, N, angOf;
+  let dists = [], N = 0, angOf = () => 0;
   if (ring && Array.isArray(ring.dist)) {
     dists = ring.dist; N = dists.length;
     angOf = (i) => (ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI / 180;
-  } else {                                  // legacy front-only fan
-    dists = Array.isArray(msg.profile) ? msg.profile : []; N = dists.length;
-    angOf = (i) => (60 - (i + 0.5) * (120 / N)) * Math.PI / 180;
   }
   let near = null, nearAng = 0;
   for (let i = 0; i < N; i++) {
@@ -339,53 +326,6 @@ function updateObstacle(msg) {
     nearMarker.visible = false;
     nearPulse = false;
   }
-
-  // --- (A) planned-path arrow ---------------------------------------------
-  const gap = msg.gap || {};
-  const passable = gap.passable !== false && gap.state !== "BLOCKED";
-  const arrowCol = passable ? COL_CLEAR : COL_STOP;
-  pathMat.color.setHex(arrowCol);
-  tipMat.color.setHex(arrowCol);
-
-  const aimA = ((gap.center_deg || 0)) * Math.PI / 180;
-  const sScale = (typeof msg.speed_scale === "number") ? msg.speed_scale : 1;
-  const len = 2.0 * (0.4 + 0.6 * Math.max(0, Math.min(1, sScale)));  // shorten if slow
-  const dim = 0.35 + 0.65 * Math.max(0, Math.min(1, sScale));        // dim if slow
-
-  // Shallow quadratic bend toward gap.yaw_cmd (+ = turn left). Build the shaft
-  // as a polyline that curves off the straight aim heading by a small lateral
-  // offset that grows quadratically along its length.
-  const yaw = (typeof gap.yaw_cmd === "number") ? gap.yaw_cmd : 0;
-  const bend = Math.max(-0.5, Math.min(0.5, yaw * 0.4));   // metres of side-shift at tip
-  const fwd = new THREE.Vector2(Math.cos(aimA), Math.sin(aimA));     // aim direction
-  const lat = new THREE.Vector2(-fwd.y, fwd.x);                      // +90 deg = left
-  const STEPS = 12;
-  const pos = new Float32Array((STEPS + 1) * 3);
-  let tipX = 0, tipY = 0, tipPX = 0, tipPY = 0;
-  for (let i = 0; i <= STEPS; i++) {
-    const t = i / STEPS;
-    const off = bend * t * t;            // quadratic lateral bend
-    const px = fwd.x * (len * t) + lat.x * off;
-    const py = fwd.y * (len * t) + lat.y * off;
-    pos[i * 3] = px; pos[i * 3 + 1] = py; pos[i * 3 + 2] = OBS_Z;
-    if (i === STEPS) { tipX = px; tipY = py; }
-    if (i === STEPS - 1) { tipPX = px; tipPY = py; }
-  }
-  const oldPath = pathLine.geometry;
-  pathLine.geometry = new THREE.BufferGeometry();
-  pathLine.geometry.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  if (oldPath) oldPath.dispose();
-  pathMat.opacity = dim; pathMat.transparent = true;
-
-  // Cone tip: oriented along the last segment, pulled back half its height (0.13 m)
-  // so the apex lands exactly at the shaft end instead of overshooting it.
-  const tdx = tipX - tipPX, tdy = tipY - tipPY;
-  const tdLen = Math.hypot(tdx, tdy) || 1;
-  const ux = tdx / tdLen, uy = tdy / tdLen;
-  pathTip.position.set(tipX - ux * 0.13, tipY - uy * 0.13, OBS_Z);
-  // Cone default points +Y; rotate it to face the heading in the XY plane.
-  pathTip.rotation.set(0, 0, Math.atan2(tdy, tdx) - Math.PI / 2);
-  tipMat.opacity = dim; tipMat.transparent = true;
 
   // --- (C) side ticks ------------------------------------------------------
   emptyGroup(sideTicks);

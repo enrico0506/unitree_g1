@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G1 obstacle perception node (Stages 2-4 + Stage 8 gap math).
+"""G1 obstacle perception node (per-direction distances + 360 deg ring).
 
 Reads the Livox Mid-360 cloud (/livox/lidar), already x-fwd / y-left / z-up with
 the origin at the sensor (the driver applies the 180 deg mount roll, so we DO NOT
@@ -8,7 +8,7 @@ frame into the perception contract the dashboard guard consumes:
 
   * per-direction robust nearest distance (front / left / right / back),
   * an EMA-smoothed front distance -> zone (CLEAR/SLOW/STOP) + speed_scale,
-  * a +/- front_sweep_deg depth profile and a chosen "gap" to steer toward.
+  * a full-circle 360 deg ring of per-sector distances (directional gating + viz).
 
 Everything is published atomically to a single shared-memory JSON file
 (/dev/shm/g1_obstacle.json) every frame; the guard reads it by mtime. Mirrors the
@@ -17,14 +17,8 @@ shm + atomic-write pattern of g1_mapping/map_bridge.py.
 Runs under ROS2 Foxy (domain 99) with env.sh sourced. Subscribes with best-effort
 sensor QoS and auto-detects PointCloud2 vs livox CustomMsg at startup.
 
-Profile / sign conventions (the UI must match these):
-  * angle = atan2(y, x): 0 = straight ahead, + = LEFT, - = RIGHT.
-  * profile[] is ordered LEFT -> RIGHT:
-        index 0          = the +front_sweep_deg bin (far LEFT),
-        index len-1      = the -front_sweep_deg bin (far RIGHT).
-    Each entry is that bin's robust-nearest distance in metres, or null when clear.
-  * gap.center_deg follows the same convention: + = steer LEFT, - = steer RIGHT.
-  * gap.yaw_cmd > 0 turns LEFT (CCW); gap.vy_cmd > 0 strafes LEFT.
+Sign convention (the UI must match): angle = atan2(y, x): 0 = straight ahead,
++ = LEFT, - = RIGHT. The ring's sector i center = start_deg + (i+0.5)*bin_deg.
 """
 
 import json
@@ -78,29 +72,12 @@ DEFAULTS = {
     "stale_timeout_s": 1.0,
     "startup_grace_s": 8.0,
     "fault_stop_s": 3.0,
-    "front_sweep_deg": 60,
-    "bin_size_deg": 5,
-    "min_bin_points": 3,
     "ring_bin_deg": 5.0,           # full-circle ring: 360/this = sector count
     "ring_min_points": 3,          # points needed before a ring sector reads a distance
     "tripwire_range_m": 1.6,       # NEAR-FIELD tripwire: a sector with >=tripwire_min_points within
                                    #   this range reports the nearest one even below ring_min_points
     "tripwire_min_points": 2,      # min returns inside tripwire_range to fire the near-field tripwire
-    "robot_half_width_m": 0.25,
-    "clearance_margin_m": 0.10,
-    "gap_standoff_m": 0.9,
-    "steer_gain": 1.0,
-    "max_yaw_rate": 0.6,
-    "steer_deadband_deg": 5,
-    "gap_sticky_margin_m": 0.3,
-    "steer_alpha": 0.4,
-    "centering_gain": 0.5,
-    "max_lateral_speed": 0.2,
-    "turn_factor_min": 0.3,
-    "search_yaw_rate": 0.4,
     "enabled_default": False,
-    "gap_follow_default": False,
-    "recovery_default": False,
     "publish_hz": 10,
     # --- obstacle-point export for the dashboard 3D sphere -------------------
     # Ship the ACTUAL kept obstacle points (post ground/self/range filter) so the
@@ -208,10 +185,7 @@ class ObstacleNode(Node):
         self.ease = bool(c["ease_scale"])
         self.tight_open = float(c["tight_open_m"])
         self.tight_min = float(c["tight_min"])
-        self.sweep = float(c["front_sweep_deg"])
-        self.bin_deg = float(c["bin_size_deg"])
-        self.min_bin = max(1, int(c["min_bin_points"]))
-        # full-circle ring geometry (360 deg sectors, separate from the front sweep)
+        # full-circle ring geometry (360 deg sectors)
         self.ring_bin_deg = float(c["ring_bin_deg"])
         self.ring_min = max(1, int(c["ring_min_points"]))
         self.tripwire_range = float(c.get("tripwire_range_m", 1.6))
@@ -226,17 +200,6 @@ class ObstacleNode(Node):
         self.accum_s = max(0.0, float(c.get("viz_accum_s", 0.0)))
         self.accum_max = max(1, int(c.get("viz_accum_max_frames", 12)))
         self._accum = deque(maxlen=self.accum_max)
-        self.half_w = float(c["robot_half_width_m"])
-        self.margin = float(c["clearance_margin_m"])
-        self.standoff = float(c["gap_standoff_m"])
-        self.steer_gain = float(c["steer_gain"])
-        self.max_yaw = float(c["max_yaw_rate"])
-        self.deadband = float(c["steer_deadband_deg"])
-        self.sticky = float(c["gap_sticky_margin_m"])
-        self.steer_alpha = float(c["steer_alpha"])
-        self.center_gain = float(c["centering_gain"])
-        self.max_vy = float(c["max_lateral_speed"])
-        self.turn_min = float(c["turn_factor_min"])
 
         # --- per-frame state --------------------------------------------------
         self.seq = 0
@@ -244,9 +207,6 @@ class ObstacleNode(Node):
         self.back_filt = None         # EMA of the back distance
         self.left_filt = None         # EMA of the left distance
         self.right_filt = None        # EMA of the right distance
-        self.held_center = 0.0        # sticky gap centre (deg)
-        self.held_width = 0.0         # width (m) of the held gap, for sticky comparison
-        self.yaw_filt = 0.0           # EMA of yaw_cmd
         self.first_frame = True       # gate the one-shot mount-frame sanity check
         self.floor_abc = None         # last fitted floor plane (a, b, c), for the sanity print
 
@@ -262,16 +222,6 @@ class ObstacleNode(Node):
         self._front_diag_last = None
         self._front_diag_log_seq = 0
 
-        # --- bin geometry (precompute the bin edges once) ---------------------
-        # Bins span [-sweep, +sweep]. We store edges low->high (right->left),
-        # then emit profile[] LEFT->RIGHT (reversed) per the documented order.
-        nbins = max(1, int(round((2.0 * self.sweep) / self.bin_deg)))
-        self.nbins = nbins
-        self.bin_edges = np.array(
-            [-self.sweep + i * self.bin_deg for i in range(nbins + 1)], dtype=np.float64)
-        # centre angle of each bin, low->high (right->left)
-        self.bin_centers = 0.5 * (self.bin_edges[:-1] + self.bin_edges[1:])
-
         # --- subscribe (auto-detect message type) -----------------------------
         msg_type, kind = self._resolve_msg_type()
         self.kind = kind  # "pc2" or "custom"
@@ -280,7 +230,7 @@ class ObstacleNode(Node):
 
         self.get_logger().info(
             f"g1_obstacle: {self.topic} ({kind}) -> {SHM_PATH} | range={self.range_m}m "
-            f"slow={self.slow_at} stop={self.stop_at} sweep=+/-{self.sweep}deg")
+            f"slow={self.slow_at} stop={self.stop_at} ring={self.ring_n}sectors")
 
     # ------------------------------------------------------------------ setup
     def _resolve_msg_type(self):
@@ -408,13 +358,10 @@ class ObstacleNode(Node):
         tight_factor = self._tight_factor(
             front_filt, back_filt, left_filt, right_filt)
 
-        # ---- 5. Stage 8: depth profile + gap -------------------------------
-        profile, gap = self._gap_math(ang, horiz, left_m, right_m)
-
         # ---- 5a. rolling accumulation for the RING + 3D-sphere viz ----------
         # Merge the last viz_accum_s of frames so the non-repetitive Mid-360 scan
         # fills the whole circle instead of one sweeping petal. ONLY the ring +
-        # viz points below use these merged arrays; the wedges/zone/gap above are
+        # viz points below use these merged arrays; the wedges/zone above are
         # per-frame, so the safety stop keeps its per-frame latency.
         acc_x, acc_y, acc_z, acc_ang, acc_horiz = self._accumulate(
             x, y, z, ang, horiz)
@@ -443,8 +390,6 @@ class ObstacleNode(Node):
             "scale_right": round(scale_right, 3),
             "tight_factor": round(tight_factor, 3),
             "side": {"left": left_m is not None, "right": right_m is not None},
-            "gap": gap,
-            "profile": profile,
             "ring": {
                 "n": self.ring_n,
                 "bin_deg": self.ring_bin_deg,
@@ -461,7 +406,7 @@ class ObstacleNode(Node):
             out["front_diag"] = self._front_diag_last
         self._write_shm(out)
         self._print_status(n_raw, n_keep, front_m, left_m, right_m, back_m,
-                           zone, speed_scale, tight_factor, gap)
+                           zone, speed_scale, tight_factor)
 
     # ------------------------------------------------------------- helpers
     def _ema(self, state, raw):
@@ -514,7 +459,7 @@ class ObstacleNode(Node):
 
         Bins ALL kept points into self.ring_n sectors over [-180, 180) and takes
         the ring_min-th smallest hypot per sector (robust to one noisy near
-        return), reusing the same np.partition idiom as the wedges / _gap_math.
+        return), reusing the same np.partition idiom as the direction wedges.
         Returns a length-ring_n list, distance (m) or None per sector. Sector i
         center angle = ring_start_deg + (i + 0.5) * ring_bin_deg, same sign
         convention as everything else (atan2(y, x): 0=ahead, +=LEFT, -=RIGHT).
@@ -731,126 +676,6 @@ class ObstacleNode(Node):
             self.get_logger().info(
                 f"first-frame sanity OK: median near-z = {med:+.2f} m{tilt}")
 
-    def _gap_math(self, ang, horiz, left_m, right_m):
-        """Build the LEFT->RIGHT depth profile and choose a gap to steer toward.
-
-        Returns (profile_list, gap_dict). profile is ordered far-left -> far-right.
-        Internally we work low->high (right->left) over self.bin_centers, then
-        reverse for the emitted profile + the sticky-gap comparison stays in
-        signed-degree space so the sign convention (+ = left) is consistent.
-        """
-        nb = self.nbins
-        # nearest distance per bin (low->high = right->left), None when clear.
-        bin_dist = [None] * nb
-        in_front = np.abs(ang) <= self.sweep
-        a = ang[in_front]
-        h = horiz[in_front]
-        if len(a):
-            # bin index 0..nb-1 across [-sweep, +sweep]
-            idx = np.floor((a + self.sweep) / self.bin_deg).astype(np.int64)
-            idx = np.clip(idx, 0, nb - 1)
-            for b in range(nb):
-                d = h[idx == b]
-                if len(d) >= self.min_bin:
-                    bin_dist[b] = float(np.partition(
-                        d, self.min_bin - 1)[self.min_bin - 1])
-
-        # blocked mask: a bin nearer than the standoff blocks gap-finding.
-        blocked = [(bd is not None and bd <= self.standoff) for bd in bin_dist]
-
-        # INFLATE: each blocked bin at distance d shadows neighbours within the
-        # half-angle the robot body subtends at that range.
-        inflated = list(blocked)
-        for b in range(nb):
-            if not blocked[b]:
-                continue
-            d = bin_dist[b] if bin_dist[b] is not None else 0.05
-            half_ang = math.degrees(math.atan2(self.half_w + self.margin, max(d, 0.05)))
-            span_bins = int(math.ceil(half_ang / self.bin_deg))
-            for j in range(max(0, b - span_bins), min(nb, b + span_bins + 1)):
-                inflated[j] = True
-
-        # longest run of clear (not-inflated) bins
-        best_lo, best_hi, best_len = -1, -1, 0
-        run_lo = 0
-        i = 0
-        while i < nb:
-            if inflated[i]:
-                i += 1
-                continue
-            run_lo = i
-            while i < nb and not inflated[i]:
-                i += 1
-            run_hi = i - 1
-            run_len = run_hi - run_lo + 1
-            if run_len > best_len:
-                best_lo, best_hi, best_len = run_lo, run_hi, run_len
-
-        # emit profile LEFT->RIGHT (reverse the low->high right->left order)
-        profile = [_r(bd) for bd in reversed(bin_dist)]
-
-        # default gap when nothing was found
-        if best_len == 0:
-            if all(bd is None for bd in bin_dist):
-                # no points at all in the front sweep -> clear, go straight
-                state, center_deg, passable, rep_d = "FOLLOW", 0.0, True, self.range_m
-            else:
-                # everything blocked -> hold last centre, report blocked
-                state, center_deg, passable, rep_d = "BLOCKED", self.held_center, False, 0.0
-        else:
-            # run midpoint angle (signed degrees, + = left)
-            center_deg = float(0.5 * (self.bin_centers[best_lo] + self.bin_centers[best_hi]))
-            # representative (near) distance of the run -> conservative gap width
-            run_d = [bin_dist[b] for b in range(best_lo, best_hi + 1) if bin_dist[b] is not None]
-            rep_d = min(run_d) if run_d else self.range_m
-            half_ang_w = 0.5 * best_len * math.radians(self.bin_deg)
-            width_m = 2.0 * rep_d * math.sin(half_ang_w)
-            need = 2.0 * self.half_w + 2.0 * self.margin
-            passable = width_m >= need
-            state = "FOLLOW" if passable else "BLOCKED"
-
-            # STICKY: keep the held centre unless the new run is meaningfully wider
-            if passable:
-                if width_m >= self.held_width + self.sticky or self.held_width <= 0:
-                    self.held_center = center_deg
-                    self.held_width = width_m
-                else:
-                    center_deg = self.held_center  # stay on the old gap
-            else:
-                self.held_width = 0.0
-
-        # yaw command: gain * centre angle, deadband, clamp, EMA
-        if abs(center_deg) < self.deadband:
-            raw_yaw = 0.0
-        else:
-            raw_yaw = clamp(self.steer_gain * math.radians(center_deg),
-                            -self.max_yaw, self.max_yaw)
-        self.yaw_filt = (self.steer_alpha * raw_yaw
-                         + (1.0 - self.steer_alpha) * self.yaw_filt)
-        yaw_cmd = clamp(self.yaw_filt, -self.max_yaw, self.max_yaw)
-
-        # turn_factor: lerp 1.0 -> turn_min as |centre|/sweep goes 0->1
-        frac = clamp(abs(center_deg) / self.sweep, 0.0, 1.0) if self.sweep > 0 else 0.0
-        turn_factor = 1.0 + frac * (self.turn_min - 1.0)
-
-        # centering strafe: a null side counts as the full range (open), so we
-        # drift AWAY from the nearer wall. + = left. With left nearer (l_eff small),
-        # we want to move RIGHT (vy_cmd < 0) -> (l_eff - r_eff), NOT (r_eff - l_eff)
-        # which steered TOWARD the near wall.
-        l_eff = left_m if left_m is not None else self.range_m
-        r_eff = right_m if right_m is not None else self.range_m
-        vy_cmd = clamp(self.center_gain * (l_eff - r_eff), -self.max_vy, self.max_vy)
-
-        gap = {
-            "state": state,
-            "center_deg": round(center_deg, 3),
-            "passable": bool(passable),
-            "yaw_cmd": round(yaw_cmd, 3),
-            "vy_cmd": round(vy_cmd, 3),
-            "turn_factor": round(turn_factor, 3),
-        }
-        return profile, gap
-
     def _accumulate(self, x, y, z, ang, horiz):
         """Merge the last viz_accum_s of kept-point frames for the RING + 3D
         sphere, so the Mid-360's non-repetitive scan shows a full circle instead
@@ -919,16 +744,13 @@ class ObstacleNode(Node):
             self.get_logger().warn(f"shm write failed: {e}")
 
     def _print_status(self, n_raw, n_keep, front_m, left_m, right_m, back_m,
-                      zone, scale, tight, gap):
+                      zone, scale, tight):
         """One cheap human-readable line per frame for staged bring-up."""
         def f(v):
             return "clr" if v is None else f"{v:.2f}"
-        g = ("blkd" if gap["state"] == "BLOCKED"
-             else f"{gap['state']}@{gap['center_deg']:+.0f} "
-                  f"{'PASS' if gap['passable'] else 'NOGAP'}")
         print(f"[{self.seq}] pts {n_raw}->{n_keep}  front={f(front_m)} "
               f"left={f(left_m)} right={f(right_m)} back={f(back_m)} "
-              f"zone={zone} scale={scale:.2f} tight={tight:.2f} gap={g}", flush=True)
+              f"zone={zone} scale={scale:.2f} tight={tight:.2f}", flush=True)
 
 
 def _r(v):

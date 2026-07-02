@@ -3,8 +3,8 @@
 The obstacle perception node (obstacle_node.py, ROS2 / domain 99) writes a small
 JSON snapshot to /dev/shm/g1_obstacle.json each frame. This guard runs INSIDE the
 dashboard process (domain 0, Unitree SDK, NO rclpy): it polls that shm file in a
-background thread and, on every commanded velocity, scales / hard-stops / steers
-the command right before it is handed to the robot's Move() RPC.
+background thread and, on every commanded velocity, scales / hard-stops the
+command right before it is handed to the robot's Move() RPC.
 
 Split of concerns:
   - obstacle_node.py  -> perception, writes shm        (CONTRACT 1)
@@ -18,8 +18,7 @@ speaks exactly ONE word -- "on" when enabled, "off" when disabled / auto-disable
 
 shm contract recap (null distance == clear / infinitely far):
   seq, stamp, front_m, front_filt_m, left_m, right_m, back_m, zone, speed_scale,
-  side{left,right}, gap{state,center_deg,passable,yaw_cmd,vy_cmd,turn_factor},
-  profile[...].
+  scale_{front,back,left,right}, tight_factor, side{left,right}, ring{...}, points[...].
 """
 
 import json
@@ -38,6 +37,10 @@ _DEFAULTS = {
     "obstacle_range_m": 3.0,
     "slow_at_m": 1.6,          # only slow within this (keeps speed when it has space)
     "stop_at_m": 0.6,
+    "emergency_stop_m": 0.30,  # inside this (raw, +bubble) a stop SNAPS instantly (bypass); between here
+                               # and stop_at a routine stop RAMPS to zero through the shaper (natural feel)
+    "resume_hysteresis_m": 0.12,  # extra clearance required to RESUME after a stop (anti stop-go chatter)
+    "smooth_stop": True,       # true = ramp routine stops; false = legacy instant snap on every stop
     "safety_bubble_m": 0.35,   # arm-clearance bubble: slow/stop this much EARLIER, all directions
     "slow_min_scale": 0.5,     # node: min speed in the slow zone (keep moving, never freeze)
     "front_blind_zone_m": 1.0, # MEASURED: blind to obstacles closer than this straight ahead
@@ -58,11 +61,6 @@ _DEFAULTS = {
     "stale_timeout_s": 1.0,
     "startup_grace_s": 8.0,
     "fault_stop_s": 3.0,
-    # gap-follow / steering caps (only the ones the guard itself reads)
-    "max_yaw_rate": 0.6,
-    "max_lateral_speed": 0.2,
-    "turn_factor_min": 0.3,
-    "search_yaw_rate": 0.4,
     # 360 ring directional gating (guard consumes the node's "ring"; falls back
     # to the 4-wedge per-axis logic whenever a "ring" key is absent).
     "ring_gating": True,
@@ -74,8 +72,6 @@ _DEFAULTS = {
     "clearance_margin_m": 0.10,
     # initial flags
     "enabled_default": False,
-    "gap_follow_default": False,
-    "recovery_default": False,
 }
 
 SHM_PATH = "/dev/shm/g1_obstacle.json"
@@ -121,6 +117,14 @@ class ObstacleGuard:
         self.slow_at = float(cfg["slow_at_m"]) + self.bubble
         self.stop_at = float(cfg["stop_at_m"]) + self.bubble
         self.slow_min = float(cfg.get("slow_min_scale", 0.5))
+        # Graduated stop: only obstacles inside emergency_at snap instantly (bypass the
+        # shaper); a stop between emergency_at and stop_at zeroes the target and lets the
+        # downstream shaper ramp it to 0 (jerk-limited) so a routine wall-approach eases to
+        # a halt instead of slamming. resume_hyst is the Schmitt-trigger band: once stopped,
+        # a direction stays stopped until it clears past stop_at + this (kills stop-go chatter).
+        self.emergency_at = float(cfg.get("emergency_stop_m", 0.30)) + self.bubble
+        self.resume_hyst = float(cfg.get("resume_hysteresis_m", 0.0))
+        self.smooth_stop = bool(cfg.get("smooth_stop", True))
         # Predictive blind-zone memory: dead-reckon a front wall through the ~blind cone.
         self.blind_zone = float(cfg.get("front_blind_zone_m", 1.0))
         self.predict_blind = bool(cfg.get("predict_blind_zone", True))
@@ -139,9 +143,6 @@ class ObstacleGuard:
         self.stale_timeout_s = float(cfg["stale_timeout_s"])
         self.startup_grace_s = float(cfg["startup_grace_s"])
         self.fault_stop_s = float(cfg["fault_stop_s"])
-        self.max_yaw_rate = float(cfg["max_yaw_rate"])
-        self.max_lateral_speed = float(cfg["max_lateral_speed"])
-        self.search_yaw_rate = float(cfg["search_yaw_rate"])
         self.scale_slew_per_s = float(cfg["scale_slew_per_s"])
         self.announce_cooldown_s = float(cfg["announce_cooldown_s"])
         self.speaker_id = int(cfg["speaker_id"])
@@ -156,10 +157,8 @@ class ObstacleGuard:
         self.robot_half_w = float(cfg.get("robot_half_width_m", 0.25))
         self.clearance_margin = float(cfg.get("clearance_margin_m", 0.10))
 
-        # --- operator toggles (initial values from *_default) ---
+        # --- operator toggle (initial value from enabled_default) ---
         self.enabled = bool(cfg["enabled_default"])
-        self.gap_follow = bool(cfg["gap_follow_default"])
-        self.recovery = bool(cfg["recovery_default"])
 
         # --- fault state machine ---
         # If enabled at construction, behave as if just enabled -> STARTING.
@@ -184,6 +183,11 @@ class ObstacleGuard:
         # (so a hard stop / FAULT is instantaneous) while still smoothing the gentle
         # slow-zone scale-down. Same thread as apply(), so no lock needed.
         self._hard = [False, False, False]
+        # Per-direction stop LATCH for hysteresis ('fwd','back','left','right','trans').
+        # A direction latches True on a stop and only releases once its distance recovers
+        # past stop_at + resume_hyst -- so a jittery reading near the threshold can't make
+        # the robot stop-go chatter. Same thread as apply(), no lock. Cleared on enable/disable.
+        self._stop_latch = {}
         self._last_apply_t = 0.0           # monotonic time of last slew step
 
         # --- cached shm state (under lock; None until first good frame) ---
@@ -266,7 +270,7 @@ class ObstacleGuard:
     def _num(value):
         """Coerce a JSON value to a FINITE float, treating null/missing/non-finite
         as None (clear). Rejecting NaN/inf here stops a corrupt shm value (e.g. a
-        NaN tight_factor or gap.vy_cmd) from poisoning the velocity downstream."""
+        NaN tight_factor or front_m) from poisoning the velocity downstream."""
         if value is None:
             return None
         try:
@@ -331,6 +335,7 @@ class ObstacleGuard:
         self._ay = 1.0
         self._ayaw = 1.0
         self._at = 1.0
+        self._stop_latch = {}          # drop stop-hysteresis latches (re-enable starts clean)
         self._last_apply_t = 0.0
         self._pred_front = None        # drop any stale dead-reckoned wall
         self._pred_age = 0.0
@@ -340,12 +345,6 @@ class ObstacleGuard:
         """Register a callable -> nearest forward near-ground depth distance (m) or
         None (D435i fusion). apply() mixes it into front_eff. Pass None to clear."""
         self._depth_fn = fn if callable(fn) else None
-
-    def set_gap_follow(self, on):
-        self.gap_follow = bool(on)
-
-    def set_recovery(self, on):
-        self.recovery = bool(on)
 
     # -----------------------------------------------------------------
     # Speech / LED feedback (always off-thread, never blocks apply())
@@ -506,6 +505,17 @@ class ObstacleGuard:
         if front_eff is not None:
             scale_front = min(scale_front, self._front_scale(front_eff))
 
+        # --- graded, hysteretic per-direction stop decisions -----------------
+        # Computed ONCE from the effective distances so the legacy 4-wedge block and the
+        # final per-axis safety stop (which also runs in the ring path) share ONE latched
+        # result -- no double-latching. (stop, emergency): emergency -> instant snap;
+        # else a soft, shaper-ramped stop. Front uses front_eff (incl. the dead-reckoned
+        # blind-zone / depth estimate). Evaluated every cycle so latches release when clear.
+        s_fwd, e_fwd = self._stop_check("fwd", front_eff)
+        s_back, e_back = self._stop_check("back", back_raw)
+        s_left, e_left = self._stop_check("left", left_raw)
+        s_right, e_right = self._stop_check("right", right_raw)
+
         # --- choose gating path: ring (360 travel-direction) or legacy 4-wedge ---
         ring = data.get("ring") if self.ring_gating else None
         use_ring = self._ring_usable(ring)
@@ -532,6 +542,7 @@ class ObstacleGuard:
                     scale_trans = 1.0 if gate_d is None else self._front_scale(gate_d)
                 else:
                     scale_trans = 1.0    # no travel direction -> no ring gating
+                    self._stop_latch["trans"] = False   # not travelling -> clear the ring latch
                 tgt_trans = scale_trans * tight_factor
                 tgt_yaw = tight_factor
                 self._at = self._ramp(self._at, tgt_trans, dt, rate)
@@ -539,12 +550,16 @@ class ObstacleGuard:
                 vx *= self._at
                 vy *= self._at
                 vyaw *= self._ayaw
-                # hard stop in the travel direction (RAW ring distance, no slew)
-                if trans_mag >= self.ring_min_motion and gate_d is not None \
-                        and gate_d < self.stop_at:
-                    vx = 0.0
-                    vy = 0.0
-                    self._hard[0] = self._hard[1] = True
+                # stop in the travel direction (RAW ring distance, no slew). Graded +
+                # hysteretic via _stop_check: a routine approach zeroes the target and lets
+                # the shaper ramp it down; only an obstacle inside emergency_at snaps (bypass).
+                if trans_mag >= self.ring_min_motion:
+                    stop, emerg = self._stop_check("trans", gate_d)
+                    if stop:
+                        vx = 0.0
+                        vy = 0.0
+                        if emerg:
+                            self._hard[0] = self._hard[1] = True
             except Exception:
                 use_ring = False        # any ring error -> fall through to legacy
 
@@ -567,21 +582,25 @@ class ObstacleGuard:
             vy *= self._ay
             vyaw *= self._ayaw
 
-            # 3) PER-DIRECTION HARD STOP -- independent of EMA/slew, RAW distances.
-            # Front uses front_eff (raw, or the dead-reckoned estimate) so a wall
-            # that vanished into the blind zone still stops the robot.
-            if vx > 0.0 and front_eff is not None and front_eff < self.stop_at:
+            # 3) PER-DIRECTION STOP -- graded (soft ramp vs emergency snap) + hysteretic,
+            #    from the decisions computed above. Only the travel direction is gated.
+            #    front_eff feeds s_fwd so a blind-zone wall still stops the robot.
+            if vx > 0.0 and s_fwd:
                 vx = 0.0
-                self._hard[0] = True
-            if vx < 0.0 and back_raw is not None and back_raw < self.stop_at:
+                if e_fwd:
+                    self._hard[0] = True
+            if vx < 0.0 and s_back:
                 vx = 0.0
-                self._hard[0] = True
-            if vy > 0.0 and left_raw is not None and left_raw < self.stop_at:
+                if e_back:
+                    self._hard[0] = True
+            if vy > 0.0 and s_left:
                 vy = 0.0
-                self._hard[1] = True
-            if vy < 0.0 and right_raw is not None and right_raw < self.stop_at:
+                if e_left:
+                    self._hard[1] = True
+            if vy < 0.0 and s_right:
                 vy = 0.0
-                self._hard[1] = True
+                if e_right:
+                    self._hard[1] = True
 
         # --- update the blind-zone predictor for the NEXT cycle -----------
         # Dead-reckons a forward obstacle through the ~1 m front blind cone. Seeded and
@@ -632,54 +651,23 @@ class ObstacleGuard:
                     self._pred_front = None
                     self._pred_age = 0.0
 
-        # 4) Stage 8: gap-follow auto steering (only when the operator is
-        #    actively commanding forward AND gap_follow is on). Applies AFTER the
-        #    directional scaling above, on the already-scaled vx.
-        gap = data.get("gap")
-        if not isinstance(gap, dict):     # a non-dict truthy (string/int/list) in shm
-            gap = {}                       # would crash gap.get() and kill the command thread
-        gap_state = gap.get("state", "SEARCH")
-        if self.gap_follow and desired[0] > 0.05:
-            yaw_cmd = self._num(gap.get("yaw_cmd")) or 0.0
-            vy_cmd = self._num(gap.get("vy_cmd")) or 0.0
-            turn_factor = self._num(gap.get("turn_factor"))
-            if turn_factor is None:
-                turn_factor = 1.0
-            # Add the steering ONTO the already-governed (slew-scaled, post-hard-stop)
-            # vy/vyaw -- NOT onto the raw operator command -- so we keep the directional
-            # + tight-space scaling instead of discarding it. The hard-stop re-enforce
-            # below then guarantees a safety-stopped axis stays zeroed.
-            vyaw = vyaw + yaw_cmd              # additive auto-steer toward gap
-            vy = vy + vy_cmd                   # additive corridor centering
-            vx *= turn_factor                  # slow down when turning hard
-
-        # 5) Recovery: boxed in with no gap -> turn in place toward open side.
-        #    Only when recovery is on, the gap is BLOCKED, and the operator is
-        #    commanding forward.
-        if self.recovery and gap_state == "BLOCKED" and desired[0] > 0.05:
+        # 4) PER-DIRECTION STOP on the FINAL velocity -- graded + hysteretic, REUSING the
+        # decisions from above (no re-latch). In the RING path this is the ONLY per-axis
+        # front/back/left/right stop (the ring block gates only the TRAVEL direction), so it
+        # runs for both paths; in the wedge path it re-affirms the stops already applied.
+        # A soft stop zeroes the target (shaper ramps it); only an emergency sets _hard (snap).
+        if vx > 0.0 and s_fwd:
             vx = 0.0
-            self._hard[0] = True               # boxed-in stop is immediate
-            left_m = self._num(data.get("left_m"))
-            right_m = self._num(data.get("right_m"))
-            # null == infinitely far == most open. Turn toward the more-open side
-            # (+ = left). If right is more open, turn right (negative).
-            l = float("inf") if left_m is None else left_m
-            r = float("inf") if right_m is None else right_m
-            vyaw = self.search_yaw_rate if l >= r else -self.search_yaw_rate
-
-        # SAFETY re-enforce: gap-follow may INJECT a vy_cmd strafe (or vyaw) AFTER the
-        # hard-stop checks, into an axis the operator wasn't commanding -- so re-run the
-        # per-direction hard stops on the FINAL velocity. An injected strafe/forward into
-        # anything within stop_at is zeroed (and flagged), and any prior hard-stop is
-        # kept. The recovery turn-in-place yaw survives (yaw has no distance gate here).
-        if vx > 0.0 and front_eff is not None and front_eff < self.stop_at:
-            vx = 0.0; self._hard[0] = True
-        if vx < 0.0 and back_raw is not None and back_raw < self.stop_at:
-            vx = 0.0; self._hard[0] = True
-        if vy > 0.0 and left_raw is not None and left_raw < self.stop_at:
-            vy = 0.0; self._hard[1] = True
-        if vy < 0.0 and right_raw is not None and right_raw < self.stop_at:
-            vy = 0.0; self._hard[1] = True
+            if e_fwd: self._hard[0] = True
+        if vx < 0.0 and s_back:
+            vx = 0.0
+            if e_back: self._hard[0] = True
+        if vy > 0.0 and s_left:
+            vy = 0.0
+            if e_left: self._hard[1] = True
+        if vy < 0.0 and s_right:
+            vy = 0.0
+            if e_right: self._hard[1] = True
         if self._hard[0]:
             vx = 0.0
         if self._hard[1]:
@@ -758,6 +746,32 @@ class ObstacleGuard:
                 best = d
         return best
 
+    def _stop_check(self, key, d):
+        """Decide whether an obstacle at effective distance `d` (m; None = clear) in
+        direction `key` should STOP that direction, and whether the stop is an
+        EMERGENCY (instant snap via the shaper bypass) or a routine SOFT stop (target
+        zeroed, shaper ramps it to 0 -- the natural, un-jarring stop).
+
+        Schmitt-trigger hysteresis: once a direction is latched-stopped it stays stopped
+        until `d` recovers past stop_at + resume_hyst, so a reading jittering across the
+        threshold cannot make the robot stop-go chatter. Returns (stop, emergency).
+
+        smooth_stop=False restores the legacy behaviour (every stop is an emergency
+        snap); resume_hyst=0 disables the hysteresis band independently.
+        """
+        if d is None:                          # clear in this direction
+            self._stop_latch[key] = False
+            return (False, False)
+        latched = self._stop_latch.get(key, False)
+        # release threshold rises once stopped (hysteresis); the stop threshold is stop_at.
+        thresh = self.stop_at + (self.resume_hyst if latched else 0.0)
+        if d < thresh:
+            self._stop_latch[key] = True
+            emergency = (not self.smooth_stop) or (d < self.emergency_at)
+            return (True, emergency)
+        self._stop_latch[key] = False
+        return (False, False)
+
     def _front_scale(self, d):
         """Forward speed scale for a (predicted) front distance -- mirrors the
         node's _dist_scale: smoothstep over [stop_at, slow_at] with the slow_min
@@ -788,8 +802,8 @@ class ObstacleGuard:
 
     def hard_stop_flags(self):
         """Per-axis (vx, vy, vyaw) emergency-stop flags from the LAST apply() call.
-        True means the guard forced that axis to zero for safety (hard stop / FAULT /
-        recovery), as opposed to a gentle slow-zone scale-down. A downstream output
+        True means the guard forced that axis to zero for safety (hard stop / FAULT),
+        as opposed to a gentle slow-zone scale-down. A downstream output
         smoother bypasses its ramp on these axes so a safety stop stays instantaneous.
         Read on the same thread immediately after apply()."""
         return tuple(self._hard)
@@ -823,11 +837,6 @@ class ObstacleGuard:
             scale_front = scale_back = scale_left = scale_right = 1.0
             tight_factor = 1.0
             side = {"left": False, "right": False}
-            gap = {
-                "state": "SEARCH", "center_deg": 0.0, "passable": False,
-                "yaw_cmd": 0.0, "vy_cmd": 0.0, "turn_factor": 1.0,
-            }
-            profile = []
             ring = None
             points = []
         else:
@@ -839,7 +848,6 @@ class ObstacleGuard:
             back_filt_m = self._num(data.get("back_filt_m"))
             left_filt_m = self._num(data.get("left_filt_m"))
             right_filt_m = self._num(data.get("right_filt_m"))
-            profile = data.get("profile") or []
             ring = data.get("ring")
             pts = data.get("points")
             points = pts if isinstance(pts, list) else []
@@ -866,18 +874,6 @@ class ObstacleGuard:
                 raw_side = {}
             side = {"left": bool(raw_side.get("left")),
                     "right": bool(raw_side.get("right"))}
-            raw_gap = data.get("gap")
-            if not isinstance(raw_gap, dict):
-                raw_gap = {}
-            gap = {
-                "state": raw_gap.get("state", "SEARCH"),
-                "center_deg": self._num(raw_gap.get("center_deg")) or 0.0,
-                "passable": bool(raw_gap.get("passable")),
-                "yaw_cmd": self._num(raw_gap.get("yaw_cmd")) or 0.0,
-                "vy_cmd": self._num(raw_gap.get("vy_cmd")) or 0.0,
-                "turn_factor": (self._num(raw_gap.get("turn_factor"))
-                                if raw_gap.get("turn_factor") is not None else 1.0),
-            }
 
         return {
             "type": "obstacle",
@@ -899,23 +895,17 @@ class ObstacleGuard:
             "scale_right": scale_right,
             "tight_factor": tight_factor,
             "side": side,
-            "gap": gap,
-            "profile": profile,
             "ring": ring,
             "points": points,
             "fault": self.mode == "FAULT",
             "auto_disabled": bool(self.auto_disabled),
             "live": bool(live),
-            "gap_follow": bool(self.gap_follow),
-            "recovery": bool(self.recovery),
         }
 
     def ui_config(self):
         """Initial flags for the connect 'config' message (CONTRACT 5/6)."""
         return {
             "enabled": bool(self.enabled),
-            "gap_follow": bool(self.gap_follow),
-            "recovery": bool(self.recovery),
         }
 
     def is_active_ui(self):

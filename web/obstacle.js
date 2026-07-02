@@ -117,14 +117,6 @@
   }
   .obs-side.hit { color: #2A1300; background: var(--caution, #FF8636); border-color: var(--caution, #FF8636); }
 
-  .obs-gap {
-    font-family: var(--font-data, ui-monospace, monospace);
-    font-size: 12px; color: var(--steel, #8A93A6);
-  }
-  .obs-gap b { color: var(--chalk, #E9EDF6); }
-  .obs-gap .pass  { color: var(--live, #3FD39B); }
-  .obs-gap .block { color: var(--stop, #FF4747); }
-
   .obs-muted { color: var(--steel-dim, #7E879B); }
   `;
 
@@ -157,12 +149,6 @@
       // Optimistic visual; server telemetry is authoritative and will correct.
       send({ type: "obstacle", action: enabled ? "disable" : "enable" });
     });
-    el.gapBtn = makeBtn("obs-btn sub", "Gap-follow steering", () => {
-      send({ type: "obstacle", action: "gap_follow", on: !btnOn(el.gapBtn) });
-    });
-    el.recBtn = makeBtn("obs-btn sub", "Search recovery", () => {
-      send({ type: "obstacle", action: "recovery", on: !btnOn(el.recBtn) });
-    });
     // Depth fusion is independent of the motion guard (toggle it to VALIDATE the D435i
     // near-ground reading even with the guard off) -- so it is never greyed out.
     el.depthBtn = makeBtn("obs-btn sub", "Depth fusion (D435i)", () => {
@@ -170,8 +156,6 @@
     });
 
     toggles.appendChild(el.primary);
-    toggles.appendChild(el.gapBtn);
-    toggles.appendChild(el.recBtn);
     toggles.appendChild(el.depthBtn);
     root.appendChild(toggles);
 
@@ -220,12 +204,6 @@
 
     root.appendChild(ro);
 
-    // Gap line (full width).
-    el.gap = document.createElement("div");
-    el.gap.className = "obs-gap obs-muted";
-    el.gap.textContent = "gap: --";
-    root.appendChild(el.gap);
-
     // No in-panel visualizations: the 2D ring and 3D sphere live in the top-right
     // LiDAR window's feed toggle (drawn big into #bigRadar / #bigSphere). The panel
     // still feeds those big views via drawRadar() + Obstacle3D.update() in render().
@@ -271,9 +249,6 @@
     if (!el.primary) return;
     el.primary.textContent = "Obstacle Guard: " + (on ? "On" : "Off");
     el.primary.classList.toggle("on", on);
-    // Sub-toggles only make sense while the guard is enabled.
-    el.gapBtn.classList.toggle("disabled", !on);
-    el.recBtn.classList.toggle("disabled", !on);
   }
 
   // -------------------------------------------------------------------- render
@@ -377,15 +352,11 @@
     const live = msg.live === undefined ? true : !!msg.live;
 
     // Operator toggle state. On the connect "config" message mode is absent, so
-    // fall back to the explicit enabled / gap_follow / recovery flags.
+    // fall back to the explicit enabled flag.
     const isEnabled = (msg.enabled !== undefined)
       ? !!msg.enabled
       : (mode !== "DISABLED" && mode !== "FAULT");
     setEnabledVisual(isEnabled);
-
-    // Sub-toggle states.
-    if (msg.gap_follow !== undefined) el.gapBtn.classList.toggle("on", !!msg.gap_follow);
-    if (msg.recovery   !== undefined) el.recBtn.classList.toggle("on", !!msg.recovery);
 
     // Depth fusion (D435i): toggle state + the validation readout (distance + pts).
     const depth = msg.depth;
@@ -450,26 +421,6 @@
     const side = msg.side || {};
     el.left.classList.toggle("hit", !!side.left);
     el.right.classList.toggle("hit", !!side.right);
-
-    // --- gap line ---
-    const gap = msg.gap || {};
-    if (gap.state) {
-      const state = String(gap.state).toUpperCase();
-      const center = num(gap.center_deg) ? gap.center_deg.toFixed(0) : "--";
-      // sign: + = left, - = right (angle = atan2(y,x), y = LEFT).
-      const dirTxt = num(gap.center_deg)
-        ? (gap.center_deg > 0 ? center + "° L" : center.replace("-", "") + "° R")
-        : "--";
-      const passable = gap.passable;
-      const passHtml = passable === undefined ? ""
-        : passable ? ' <span class="pass">PASS</span>'
-                   : ' <span class="block">BLOCK</span>';
-      el.gap.classList.remove("obs-muted");
-      el.gap.innerHTML = "gap: <b>" + state + "</b> @ " + dirTxt + passHtml;
-    } else {
-      el.gap.classList.add("obs-muted");
-      el.gap.textContent = "gap: --";
-    }
 
     drawRadar(msg);
   }

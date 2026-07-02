@@ -232,7 +232,7 @@ def scenarios():
 
 
 # ------------------------------------------------------------------------ runner
-def run(scn, noise=0.0, decimate=1, el_lo=-16.0, gap_follow=False, recovery=False,
+def run(scn, noise=0.0, decimate=1, el_lo=-16.0,
         seed=0, sway_amp=0.0, sway_freq=1.2, dropout=0.0):
     rng = np.random.RandomState(seed)
     clock = _SimClock(); _gm.time = clock
@@ -240,7 +240,6 @@ def run(scn, noise=0.0, decimate=1, el_lo=-16.0, gap_follow=False, recovery=Fals
     shaper = CommandShaper(cfg=CFG["motion"], max_speeds=MAXES)
     guard = ObstacleGuard(os.path.join(ROOT, "obstacle", "obstacle.yaml"), audio=None, limits=MAXES)
     guard.enabled = True; guard.mode = "ACTIVE"
-    guard.set_gap_follow(gap_follow); guard.set_recovery(recovery)
     sensor_h = node.sensor_h
 
     x, y, theta = scn["start"]
@@ -273,9 +272,7 @@ def run(scn, noise=0.0, decimate=1, el_lo=-16.0, gap_follow=False, recovery=Fals
         intent = policy(x, y, theta, goal) if t < release_at else (0.0, 0.0, 0.0)
         intent = shaper.normalize(tuple(_clamp(intent[i], -MAXES[i], MAXES[i]) for i in range(3)))
         data = {"ring": ring, "front_m": res["front"], "left_m": res["left"],
-                "right_m": res["right"], "back_m": res["back"], "tight_factor": 1.0,
-                "gap": {"state": "FOLLOW", "center_deg": 0.0, "passable": True,
-                        "yaw_cmd": 0.0, "vy_cmd": 0.0, "turn_factor": 1.0}}
+                "right_m": res["right"], "back_m": res["back"], "tight_factor": 1.0}
         with guard._lock:
             guard._data = data; guard._last_fresh = clock.monotonic(); guard._live = True
         governed = guard.apply(intent)
@@ -436,7 +433,6 @@ def main():
     ap.add_argument("--el-lo", type=float, default=-16.0, help="lowest ray elevation (deg); raise to model the front blind cone")
     ap.add_argument("--sway", type=float, default=0.0, help="gait sway amplitude (deg pitch/roll)")
     ap.add_argument("--dropout", type=float, default=0.0, help="random sensor return dropout fraction 0..1")
-    ap.add_argument("--gap", action="store_true"); ap.add_argument("--recovery", action="store_true")
     ap.add_argument("--ascii", action="store_true"); ap.add_argument("--json", action="store_true")
     ap.add_argument("--all", action="store_true"); ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--list", action="store_true"); ap.add_argument("--scenario-file")
@@ -455,7 +451,6 @@ def main():
         else:
             scn = dict(scns[name]); scn["name"] = name
         m = run(scn, noise=args.noise, decimate=args.decimate, el_lo=args.el_lo,
-                gap_follow=args.gap, recovery=args.recovery,
                 sway_amp=args.sway, dropout=args.dropout)
         out.append((scn, m))
     if args.json:

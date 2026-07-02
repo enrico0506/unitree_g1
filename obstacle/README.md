@@ -1,8 +1,8 @@
 # Obstacle avoidance — LiDAR proximity guard
 
-A self-contained slow-down / stop / gap-following layer for the G1, driven by the
-head **Livox Mid-360**. It is **opt-in** (off by default) and never replaces the
-operator: it only *trims* the velocity the operator already commands.
+A self-contained slow-down / stop / 360° directional-gating layer for the G1, driven
+by the head **Livox Mid-360**. It is **opt-in** (off by default) and never replaces
+the operator: it only *trims* the velocity the operator already commands.
 
 ## The one-number idea
 
@@ -23,8 +23,9 @@ speed_scale = clamp((front_filt_m - stop_at_m) / (slow_at_m - stop_at_m), 0, 1)
 
 Reverse, yaw and strafe are **never** blocked by the slow/stop logic — you can
 always back away. Side wedges (left / right) raise indicator flags and spoken
-warnings but do not brake. Optional **gap-following** and **search recovery**
-layers add autonomous steering toward open space (both off until tuned).
+warnings but do not brake. A full-circle **360° ring** of per-sector distances lets
+the guard brake in the actual **travel direction** (not just the four wedges); the
+robot only ever *slows or stops* — it never autonomously steers.
 
 ## Architecture — two halves and a shared-memory bridge
 
@@ -41,7 +42,7 @@ they talk through one atomically-written JSON file in `/dev/shm`:
    │   ground-plane removal +  │         │  ObstacleGuard (guard.py)          │
    │   footprint mask, robust  │         │   reads shm ~20 Hz, caches it,      │
    │   nearest, per-dir dist,  │  write  │   guard.apply(vx,vy,vyaw) trims     │
-   │   gap profile + steer cmd │ ──────▶ │   the command at 30 Hz before it    │
+   │   360° ring distances     │ ──────▶ │   the command at 30 Hz before it    │
    │                           │  shm    │   reaches the Unitree SDK.          │
    └──────────────────────────┘    │    └────────────────────────────────────┘
                                     ▼
@@ -54,7 +55,7 @@ they talk through one atomically-written JSON file in `/dev/shm`:
   process; it does all the geometry and is the **source of truth** for the JSON
   contract and every sign convention below.
 * **`guard.py` (`ObstacleGuard`)** — runs *inside* the dashboard (domain 0,
-  Unitree SDK, **no** rclpy). It only reads the shm file and scales/steers the
+  Unitree SDK, **no** rclpy). It only reads the shm file and scales / hard-stops the
   commanded velocity. It also runs the fail-safe state machine and the spoken /
   LED warnings.
 * **`manager.py` (`ObstacleManager`)** — starts/stops `obstacle_node.py` as a
@@ -78,7 +79,7 @@ The feature was built in checkpoints, each independently testable:
 | **5** | Spoken announcements + LED warnings (cooldown-gated, off-thread). |
 | **6** | Fail-safe state machine: STARTING → ACTIVE → FAULT → auto-disable. |
 | **7** | Dashboard wiring: WebSocket protocol, `ObstacleManager`, mutual-exclusion with mapping, the `web/obstacle.js` UI. |
-| **8** | Gap-following: depth `profile`, gap selection + `center_deg`, additive `yaw_cmd` steering, corridor `vy_cmd` centering, `turn_factor`, and (8f) turn-in-place **search recovery** when boxed in. |
+| **8** | Full-circle **360° ring** (`ring_bin_deg` sectors) with a near-field tripwire. The guard gates vx/vy by the ring in the **travel direction** (`ring_gating`), a strict superset of the four wedges. Drives the dashboard 2D radar + 3D sphere. |
 
 ## How to run
 
@@ -101,12 +102,12 @@ dashboard:
 2. Toggle **Obstacle Guard: On**. The dashboard launches `obstacle_node.py`
    (via `ObstacleManager`) and the guard begins trimming velocity. Mapping is
    forced off while the guard is on.
-3. Optionally enable **Gap-follow steering** and/or **Search recovery** (greyed
-   out until the guard is on).
+3. Optionally enable **Depth fusion (D435i)** to add the near-ground blind-zone
+   fill (independent of the guard; toggle it to validate the reading).
 
 The panel shows live front distance, a coloured zone chip (CLEAR/SLOW/STOP), a
-speed-scale bar, L/R side indicators, the chosen gap, and a prominent banner on
-FAULT or auto-disable.
+speed-scale bar, L/R side indicators, and a prominent banner on FAULT or
+auto-disable.
 
 ## Ground-plane removal + footprint self-mask (the point filter)
 
@@ -151,7 +152,7 @@ pole just outside it that sticks up from the floor is **kept**, even when it is 
 and close — exactly the case the old height band could not handle.
 
 The final keep mask is `in_range & keep_ground & ~in_self`. Everything downstream
-(the wedge robust-nearest, EMA, scales, `tight_factor`, the gap math, the shm
+(the wedge robust-nearest, EMA, scales, `tight_factor`, the 360° ring, the shm
 write) is **unchanged** — only the set of kept points differs.
 
 > ⚠ **Measure the footprint for the real robot.** `self_front_m`, `self_back_m` and
@@ -205,24 +206,16 @@ also has a baked-in default in code, so a missing key never crashes a consumer.
 | `stale_timeout_s` | `1.0` | No fresh frame for this long while enabled → FAULT. |
 | `startup_grace_s` | `8.0` | After enabling, wait this long for the first frame before faulting. |
 | `fault_stop_s` | `3.0` | On FAULT: stop forward for this long, announce, then auto-disable. |
-| `front_sweep_deg` | `60` | Build the depth profile over ±this in front. |
-| `bin_size_deg` | `5` | Profile angular resolution. |
-| `min_bin_points` | `3` | Points before a profile bin counts as a real obstacle. |
-| `robot_half_width_m` | `0.25` | Half the G1 body width — **measure**; inflates obstacles. |
-| `clearance_margin_m` | `0.10` | Extra room demanded on each side of a gap. |
-| `gap_standoff_m` | `0.9` | A bin nearer than this is "blocked" for gap-finding. |
-| `steer_gain` | `1.0` | `yaw_cmd = gain · gap_centre_angle`. |
-| `max_yaw_rate` | `0.6` | Cap on auto-steer yaw (rad/s). |
-| `steer_deadband_deg` | `5` | Gap centre within this of straight-ahead → no turn. |
-| `gap_sticky_margin_m` | `0.3` | A new gap must beat the held one by this (m) to switch. |
-| `steer_alpha` | `0.4` | EMA on the steering command. |
-| `centering_gain` | `0.5` | `vy_cmd = gain · (right_dist − left_dist)` corridor centering. |
-| `max_lateral_speed` | `0.2` | Cap on centering strafe (m/s). |
-| `turn_factor_min` | `0.3` | Forward-speed multiplier at full steering sweep. |
-| `search_yaw_rate` | `0.4` | Turn-in-place rate when boxed in (recovery). |
+| `ring_bin_deg` | `5.0` | Ring angular resolution → 360/this sectors. |
+| `ring_min_points` | `3` | Points before a ring sector reads a distance. |
+| `tripwire_range_m` | `1.6` | Near-field only: fire the tripwire for returns within this range. |
+| `tripwire_min_points` | `2` | Min returns inside `tripwire_range_m` to report a sector's nearest point. |
+| `ring_gating` | `true` | Guard gates vx/vy by the ring in the travel direction (`false` → legacy 4-wedge). |
+| `direction_cone_deg` | `25.0` | Min half-angle of the travel-direction gating cone (floor). |
+| `direction_cone_max_deg` | `70.0` | Cap on the auto-widened cone half-angle. |
+| `robot_half_width_m` | `0.25` | Half the G1 body width — **measure**; sizes the swept corridor. |
+| `clearance_margin_m` | `0.10` | Extra room demanded on each side of the travel corridor. |
 | `enabled_default` | `false` | Guard off until the operator turns it on. |
-| `gap_follow_default` | `false` | Autonomous steering off until tuned. |
-| `recovery_default` | `false` | Turn-in-place search off until tuned. |
 | `publish_hz` | `10` | Node processing / shm-write rate. |
 
 ## Fail-safe behaviour
@@ -284,15 +277,13 @@ distance*.
   "scale_right": 1.0,       // 0..1 smoothstep scale from right_filt_m
   "tight_factor": 1.0,      // 0..1 global multiplier (1 = open, → tight_min when boxed in)
   "side": { "left": false, "right": false },   // real obstacle in the L/R wedge
-  "gap": {
-    "state": "FOLLOW",      // "FOLLOW" | "SEARCH" | "BLOCKED"
-    "center_deg": 0.0,      // chosen gap centre angle (see sign convention)
-    "passable": true,
-    "yaw_cmd": 0.0,         // rad/s, clamped ±max_yaw_rate, EMA-smoothed
-    "vy_cmd": 0.0,          // m/s, clamped ±max_lateral_speed (centering)
-    "turn_factor": 1.0      // 0..1 forward-speed multiplier (lower = harder turn)
+  "ring": {
+    "n": 72,                // sector count (360 / bin_deg)
+    "bin_deg": 5.0,         // sector angular width
+    "start_deg": -180.0,    // sector i center = start_deg + (i + 0.5) * bin_deg
+    "dist": [null, null]    // per-sector robust-nearest distance (m), or null = clear
   },
-  "profile": [null, null]   // per-bin nearest distance, LEFT→RIGHT across ±front_sweep_deg
+  "points": [ /* x0,y0,z0, x1,y1,z1, ... */ ]  // decimated kept obstacle points (3D sphere viz)
 }
 ```
 
@@ -302,12 +293,10 @@ distance*.
   −`sensor_height_m`.
 * `angle = atan2(y, x)`: **0° = straight ahead, +90° = left, −90° = right,
   ±180° = behind.**
-* **`gap.center_deg`** follows the same convention: **positive = the gap is to the
-  LEFT, negative = to the right.**
-* **`gap.yaw_cmd`** / **`gap.vy_cmd`**: positive = turn / strafe **left** (CCW),
-  matching the dashboard's velocity convention (vy>0 left, vyaw>0 left).
-* **`profile`** is ordered **left → right** across the front sweep; index 0 is the
-  leftmost bin. A `null` entry means that bin is clear.
+* **`ring.dist[i]`** is the nearest obstacle in sector `i`, whose center angle is
+  `start_deg + (i + 0.5) * bin_deg` in the same convention (+ = left).
+* **`points`** is a flat `[x,y,z, …]` list in the viz frame (x fwd, y left, z =
+  height above the fitted floor), decimated to `viz_max_points`.
 
 The Livox driver already applies the 180° mount roll before publishing, so
 `/livox/lidar` is **already** x-fwd / y-left / z-up — the node must **not**

@@ -5,7 +5,7 @@ so its detection math can be unit-tested / fuzzed against synthetic point clouds
 obstacle_node imports rclpy at module load; we stub the three ROS modules it needs,
 then build a BARE ObstacleNode via __new__ (skipping __init__/super) and set exactly
 the tuning attributes its pure-math methods read. This exercises the ACTUAL
-_ground_mask / _fit_floor / _robust_nearest / _ring_distances / _gap_math code paths
+_ground_mask / _fit_floor / _robust_nearest / _ring_distances code paths
 -- the ones that decide whether an obstacle is detected -- not a reimplementation.
 
 Use:
@@ -94,28 +94,6 @@ def make_node(overrides=None):
     n.ring_n = max(1, int(round(360.0 / n.ring_bin_deg)))
     n.ring_start_deg = -180.0
     n.floor_abc = None
-    # gap-math attrs (so _gap_math is callable too)
-    n.sweep = float(cfg["front_sweep_deg"])
-    n.bin_deg = float(cfg["bin_size_deg"])
-    n.min_bin = max(1, int(cfg["min_bin_points"]))
-    n.half_w = float(cfg["robot_half_width_m"])
-    n.margin = float(cfg["clearance_margin_m"])
-    n.standoff = float(cfg["gap_standoff_m"])
-    n.steer_gain = float(cfg["steer_gain"])
-    n.max_yaw = float(cfg["max_yaw_rate"])
-    n.deadband = float(cfg["steer_deadband_deg"])
-    n.sticky = float(cfg["gap_sticky_margin_m"])
-    n.steer_alpha = float(cfg["steer_alpha"])
-    n.center_gain = float(cfg["centering_gain"])
-    n.max_vy = float(cfg["max_lateral_speed"])
-    n.turn_min = float(cfg["turn_factor_min"])
-    nb = max(1, int(round((2.0 * n.sweep) / n.bin_deg)))
-    n.nbins = nb
-    n.bin_edges = np.array([-n.sweep + i * n.bin_deg for i in range(nb + 1)], dtype=np.float64)
-    n.bin_centers = 0.5 * (n.bin_edges[:-1] + n.bin_edges[1:])
-    n.held_center = 0.0
-    n.held_width = 0.0
-    n.yaw_filt = 0.0
     n.cfg = cfg
     return n
 

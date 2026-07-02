@@ -1023,8 +1023,8 @@ async def lifespan(app: FastAPI):
     lidar.start()
 
     # Obstacle feature: AudioClient for TTS warnings (optional), the perception-node
-    # manager (subprocess, started on toggle), and the guard that scales/steers the
-    # commanded velocity. Guard starts disabled -- pure pass-through until toggled.
+    # manager (subprocess, started on toggle), and the guard that scales / hard-stops
+    # the commanded velocity. Guard starts disabled -- pure pass-through until toggled.
     try:
         audio = AudioClient(); audio.SetTimeout(3.0); audio.Init()
         print("G1 AudioClient ready (TTS).", flush=True)
@@ -1378,7 +1378,7 @@ async def ws_endpoint(ws: WebSocket):
         "slow_scale": SLOW_SCALE,
         # which whole-body combos have a captured FSM id (-> button enabled)
         "mode_combos": {name: (fsm is not None) for name, fsm in MODE_COMBOS.items()},
-        # initial obstacle-guard UI flags (enabled / gap_follow / recovery [+ depth])
+        # initial obstacle-guard UI flags (enabled [+ depth])
         "obstacle": (dict(guard.ui_config(), depth=depth_nf.telemetry())
                      if guard is not None and depth_nf is not None
                      else (guard.ui_config() if guard is not None else {})),
@@ -1472,10 +1472,6 @@ async def ws_endpoint(ws: WebSocket):
                     # Motion governing OFF only -- the perception node KEEPS running so
                     # the 2D/3D views stay live (it is paused solely for mapping).
                     if guard is not None: guard.set_enabled(False)
-                elif action == "gap_follow" and guard is not None:
-                    guard.set_gap_follow(bool(msg.get("on")))
-                elif action == "recovery" and guard is not None:
-                    guard.set_recovery(bool(msg.get("on")))
                 elif action == "depth_fusion" and depth_nf is not None:
                     depth_nf.set_enabled(bool(msg.get("on")))
                 if guard is not None:

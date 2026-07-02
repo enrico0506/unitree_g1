@@ -18,7 +18,7 @@ as the achieved velocity, which is conservative for collision: a commanded stop
 stops the robot).
 
 Usage:
-    python3 scripts/sim_walk.py <scenario> [--ascii] [--json] [--gap] [--recovery]
+    python3 scripts/sim_walk.py <scenario> [--ascii] [--json]
     python3 scripts/sim_walk.py --list
     python3 scripts/sim_walk.py --scenario-file foo.json [...]
 
@@ -209,13 +209,12 @@ def scenarios():
 
 
 # ------------------------------------------------------------------------ runner
-def run(scn, gap_follow=False, recovery=False):
+def run(scn):
     clock = _SimClock()
     _gm.time = clock            # virtualize the guard's wall clock for this run
     shaper = CommandShaper(cfg=CFG["motion"], max_speeds=MAXES)
     guard = ObstacleGuard(os.path.join(ROOT, "obstacle", "obstacle.yaml"), audio=None, limits=MAXES)
     guard.enabled = True; guard.mode = "ACTIVE"
-    guard.set_gap_follow(gap_follow); guard.set_recovery(recovery)
 
     x, y, theta = scn["start"]
     goal = scn.get("goal", (1e9, 0))
@@ -243,9 +242,7 @@ def run(scn, gap_follow=False, recovery=False):
 
         # inject synthetic perception, run the REAL guard + shaper
         data = {"ring": ring, "front_m": fr, "left_m": lf, "right_m": rt, "back_m": bk,
-                "tight_factor": 1.0,
-                "gap": {"state": "FOLLOW", "center_deg": 0.0, "passable": True,
-                        "yaw_cmd": 0.0, "vy_cmd": 0.0, "turn_factor": 1.0}}
+                "tight_factor": 1.0}
         with guard._lock:
             guard._data = data; guard._last_fresh = clock.monotonic(); guard._live = True
         governed = guard.apply(intent)
@@ -374,8 +371,6 @@ def main():
     ap.add_argument("scenario", nargs="?", default="head_on_wall")
     ap.add_argument("--ascii", action="store_true")
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--gap", action="store_true", help="enable gap-follow steering")
-    ap.add_argument("--recovery", action="store_true", help="enable turn-in-place recovery")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--scenario-file")
     ap.add_argument("--all", action="store_true", help="run every built-in scenario")
@@ -397,7 +392,7 @@ def main():
             if name not in scns:
                 print(f"unknown scenario '{name}' (try --list)"); return 2
             scn = dict(scns[name]); scn["name"] = name
-        m = run(scn, gap_follow=args.gap, recovery=args.recovery)
+        m = run(scn)
         ok, notes = verdict(m)
         overall_ok = overall_ok and ok
         results.append((scn, m, ok, notes))

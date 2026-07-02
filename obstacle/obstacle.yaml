@@ -1,4 +1,4 @@
-# Obstacle slow-down / stop / gap-following -- single source of tuning.
+# Obstacle slow-down / stop / 360 deg directional gating -- single source of tuning.
 # Read by BOTH obstacle_node.py (ROS2, domain 99) and guard.py (dashboard,
 # domain 0). Kept OUT of config/robot.yaml on purpose: load_config there
 # silently drops unknown sections, and this feature is self-contained.
@@ -24,7 +24,18 @@ sensor_height_m: 1.20        # Mid-360 height above the floor the robot STANDS o
 obstacle_range_m: 3.0        # farthest point we keep (horizontal). MUST be >= slow_at_m, else a
                              # fully-open direction relaxes only to this and never reaches CLEAR / full speed.
 slow_at_m: 1.6               # only slow within this -- keeps full speed when it has space (less sensitive)
-stop_at_m: 0.6               # hard stop at/under this distance (per direction)
+stop_at_m: 0.6               # stop at/under this distance (per direction). +safety_bubble = effective ~0.75 m.
+# --- graduated / natural stop (feel) --------------------------------------
+# The slow zone already eases the robot down to ~slow_min*max before it reaches stop_at, so a
+# routine wall-approach does NOT need to slam to zero. A stop between emergency_stop_m and
+# stop_at now ZEROES the target and lets the jerk/accel shaper ramp it to 0 (smooth, like a
+# careful human). Only an obstacle INSIDE emergency_stop_m (fast/sudden/blind approach) keeps
+# the instant snap (shaper bypass). FAULT / auto-disable stops stay instant regardless.
+emergency_stop_m: 0.30       # raw; +safety_bubble = effective ~0.45 m. Below this a stop SNAPS instantly.
+                             # Raise for a firmer/earlier hard stop; lower for a gentler ramp deeper in.
+resume_hysteresis_m: 0.12    # once stopped, a direction stays stopped until it clears past
+                             # stop_at + this (~0.87 m effective). Kills stop-go chatter at the edge. 0 = off.
+smooth_stop: true            # false = legacy behaviour (every stop is an instant snap)
 slow_min_scale: 0.18         # MIN speed in the slow zone -> "little steps" when an obstacle is near. As a
                              # direction closes from slow_at down to stop_at the speed eases toward this
                              # floor (~0.18*max = a slow shuffle), so the robot keeps creeping in small
@@ -96,30 +107,16 @@ stale_timeout_s: 1.0         # no fresh frame for this long while enabled -> FAU
 startup_grace_s: 8.0         # after enabling, wait this long for the first frame before faulting
 fault_stop_s: 3.0            # on FAULT: stop forward for this long, announce, then auto-disable
 
-# --- Stage 8: gap-following / steering ------------------------------------
-front_sweep_deg: 60          # build the depth profile over +/- this, in front
-bin_size_deg: 5              # profile angular resolution
-min_bin_points: 3            # points needed before a profile bin counts as a real obstacle
-robot_half_width_m: 0.25     # half the G1 body width -- MEASURE. Used to inflate obstacles.
-clearance_margin_m: 0.10     # extra room demanded on each side of a gap
-gap_standoff_m: 0.9          # a bin nearer than this is "blocked" for gap-finding (>= stop_at)
-steer_gain: 1.0              # yaw_cmd = gain * gap_centre_angle (rad)
-max_yaw_rate: 0.6            # cap on the auto steering yaw (rad/s)
-steer_deadband_deg: 5        # gap centre within this of straight-ahead -> no turn
-gap_sticky_margin_m: 0.3     # a new gap must beat the held one by this (metres) to switch
-steer_alpha: 0.4             # EMA on the steering command (same idea as filter_alpha)
-centering_gain: 0.5          # vy_cmd = gain * (right_dist - left_dist), corridor centering
-max_lateral_speed: 0.2       # cap on the centering strafe (m/s)
-turn_factor_min: 0.3         # forward-speed multiplier at full steering sweep (Stage 8c)
-search_yaw_rate: 0.4         # turn-in-place rate when boxed in with no gap (Stage 8f)
+# --- ring-corridor geometry (used by the guard's 360 deg directional gating) ---
+robot_half_width_m: 0.25     # half the G1 body width -- MEASURE. Sizes the swept corridor.
+clearance_margin_m: 0.10     # extra room demanded on each side of the travel corridor
 
 # --- full-circle 360 deg ring ---------------------------------------------
 # A self-describing per-sector distance ring over the WHOLE circle, ADDED to the
-# contract alongside the 4 wedges + the front profile[] (both untouched). The
-# obstacle node bins ALL kept points into 360/ring_bin_deg sectors and writes
-# ring={n,bin_deg,start_deg,dist[]} (angle=atan2(y,x): 0=ahead, +=LEFT, -=RIGHT).
-# Consumed by the guard's 360 deg directional braking (below) + the dashboard
-# polar radar / 3D fan. PERCEPTION keys (read by the obstacle node):
+# contract alongside the 4 wedges. The obstacle node bins ALL kept points into
+# 360/ring_bin_deg sectors and writes ring={n,bin_deg,start_deg,dist[]}
+# (angle=atan2(y,x): 0=ahead, +=LEFT, -=RIGHT). Consumed by the guard's 360 deg
+# directional braking (below) + the dashboard polar radar. PERCEPTION keys:
 ring_bin_deg: 5.0            # ring angular resolution -> 72 sectors over 360 deg
 ring_min_points: 3           # LiDAR: points needed before a sector reads a distance
                              # (the costmap node uses its own ring_min_cells: 1 -- one lethal cell = real)
@@ -143,10 +140,8 @@ front_blind_compose_deg: 30.0 # travel headings within this of straight-ahead AL
                              # blind-zone predictor: gate on min(ring_cone_min, predicted_front).
 ring_min_motion: 0.03        # |translational command| below this -> no ring gating (no direction to aim)
 
-# --- defaults (all opt-in; flipped from the dashboard at runtime) ----------
+# --- defaults (opt-in; flipped from the dashboard at runtime) --------------
 enabled_default: false       # obstacle guard OFF until the operator turns it on
-gap_follow_default: false    # autonomous yaw/strafe steering OFF until tuned
-recovery_default: false      # turn-in-place search OFF until tuned
 publish_hz: 10               # node processing / shm-write rate (matches LiDAR)
 
 # --- dashboard 3D obstacle sphere -----------------------------------------
