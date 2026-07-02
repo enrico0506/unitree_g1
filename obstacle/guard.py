@@ -136,6 +136,11 @@ class ObstacleGuard:
         # forward near-ground obstacle distance (m) or None. Set by the dashboard from
         # DepthNearField; mixed into front_eff so low things the Mid-360 missed brake too.
         self._depth_fn = None
+        # Optional per-sector depth ring (DepthNearField.front_ring): a dict matching the
+        # lidar ring schema. Min-merged into the lidar ring so depth fills the front blind
+        # wedge across ALL forward sectors -- and can only make a sector CLOSER, never clear
+        # a lidar reading (a depth hole -> None -> no override).
+        self._depth_ring_fn = None
         # After the guard auto-disables itself (perception fault), latch forward at 0
         # until the operator RELEASES the forward command -- so a held W doesn't lurch
         # the robot blind through whatever stopped it the instant control hands back.
@@ -346,6 +351,39 @@ class ObstacleGuard:
         None (D435i fusion). apply() mixes it into front_eff. Pass None to clear."""
         self._depth_fn = fn if callable(fn) else None
 
+    def set_depth_ring_source(self, fn):
+        """Register a callable -> per-sector depth ring dict (DepthNearField.front_ring)
+        or None. apply() NaN-aware-min-merges it into the lidar ring (depth only lowers a
+        sector -> fail-safe). Pass None to clear."""
+        self._depth_ring_fn = fn if callable(fn) else None
+
+    @staticmethod
+    def _merge_depth_ring(ring, dring):
+        """NaN-aware min-merge the depth ring into the lidar ring. Returns a NEW ring dict
+        (never mutates the shm-backed input). Fails safe: on any None / geometry mismatch
+        (n, bin_deg, start_deg) the lidar ring is returned UNCHANGED. Depth can only make a
+        sector's distance SMALLER (more conservative); it never clears a lidar reading."""
+        if not isinstance(ring, dict) or not isinstance(dring, dict):
+            return ring
+        ld = ring.get("dist")
+        dd = dring.get("dist")
+        if not isinstance(ld, (list, tuple)) or not isinstance(dd, (list, tuple)):
+            return ring
+        if (len(ld) != len(dd)
+                or ring.get("n") != dring.get("n")
+                or float(ring.get("bin_deg", 0)) != float(dring.get("bin_deg", -1))
+                or float(ring.get("start_deg", 0)) != float(dring.get("start_deg", -1))):
+            return ring                                  # geometry mismatch -> lidar only
+        merged = list(ld)
+        for i, dv in enumerate(dd):
+            if dv is None:
+                continue                                 # no depth reading -> keep lidar
+            lv = merged[i]
+            merged[i] = dv if lv is None else min(lv, dv)
+        out = dict(ring)
+        out["dist"] = merged
+        return out
+
     # -----------------------------------------------------------------
     # Speech / LED feedback (always off-thread, never blocks apply())
     # -----------------------------------------------------------------
@@ -518,6 +556,14 @@ class ObstacleGuard:
 
         # --- choose gating path: ring (360 travel-direction) or legacy 4-wedge ---
         ring = data.get("ring") if self.ring_gating else None
+        # D435i near-ground depth ring: min-merge into the lidar ring so depth fills the
+        # front blind wedge across ALL forward sectors (not just the forward scalar above).
+        # Fail-safe: depth only lowers a sector; None/mismatch leaves the lidar ring intact.
+        if ring is not None and self._depth_ring_fn is not None:
+            try:
+                ring = self._merge_depth_ring(ring, self._depth_ring_fn())
+            except Exception:
+                pass                                     # never let depth break the guard
         use_ring = self._ring_usable(ring)
 
         # slew timing (shared by both paths)

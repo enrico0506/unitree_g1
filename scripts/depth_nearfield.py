@@ -39,6 +39,13 @@ _DEFAULTS = {
     "min_points": 8,           # need >= this many near points before reporting (robust to noise)
     "kth": 4,                  # report the k-th nearest forward distance (reject a single flier)
     "poll_hz": 15.0,           # sampling rate of the depth cloud
+    # --- per-sector ring (fills the front blind wedge across ALL forward sectors, not
+    #     just the single forward corridor). Merged into the guard ring by NaN-aware min,
+    #     so depth can only make a sector CLOSER, never clear a lidar reading (UNKNOWN-safe:
+    #     a depth hole yields no points -> NaN -> no override). ---
+    "ring_bin_deg": 5.0,       # MUST match the lidar ring (obstacle.yaml ring_bin_deg) to merge
+    "ring_fov_half_deg": 43.0, # D435i horizontal half-FOV (~87 deg HFOV) the camera actually sees
+    "ring_min_points": 2,      # min near points in a 5 deg sector before it reports (per-sector)
 }
 
 
@@ -71,9 +78,16 @@ class DepthNearField:
         self.min_points = max(1, int(cfg["min_points"]))
         self.kth = max(1, int(cfg["kth"]))
         self.period = 1.0 / max(1.0, float(cfg["poll_hz"]))
+        # per-sector ring geometry (must match the lidar ring to merge)
+        self.ring_bin_deg = float(cfg.get("ring_bin_deg", 5.0))
+        self.ring_n = max(1, int(round(360.0 / self.ring_bin_deg)))
+        self.ring_start_deg = -180.0                         # shared convention with the node/guard
+        self.ring_fov_half = float(cfg.get("ring_fov_half_deg", 43.0))
+        self.ring_min_pts = max(1, int(cfg.get("ring_min_points", 2)))
 
         self._lock = threading.Lock()
         self._front = None         # last computed nearest forward distance (m) or None
+        self._ring = None          # last per-sector ring (np (ring_n,), NaN = no reading) or None
         self._n_near = 0           # qualifying point count (for telemetry / validation)
         self._live = False
         self._stamp = 0.0
@@ -132,6 +146,53 @@ class DepthNearField:
         nearest = float(np.partition(f, k - 1)[k - 1])
         return nearest, n
 
+    def _compute_ring(self, cloud):
+        """cloud -> per-sector nearest HORIZONTAL distance over the camera's forward FOV.
+
+        Same validated derotation as ``_compute`` but, instead of one forward corridor,
+        bins the near-ground points into the lidar ring's sectors and reports each
+        sector's k-th nearest horizontal range. Returns (dist, n_near) where ``dist`` is
+        (ring_n,) float64 with NaN == "no reading" (never emitted as clear -- absence of a
+        near obstacle, or a depth hole, leaves NaN so the guard merge keeps the lidar value).
+        """
+        out = np.full(self.ring_n, np.nan, dtype=np.float64)
+        if cloud is None or len(cloud) == 0:
+            return out, 0
+        X = cloud[:, 0]
+        Y = cloud[:, 1]
+        Zc = cloud[:, 2] - self.ls_mount_height
+        fwd = X * self._ct + Zc * self._st
+        up = -X * self._st + Zc * self._ct
+        left = Y
+        height = up + self.cam_h
+        ang = np.degrees(np.arctan2(left, fwd))          # 0 ahead, + left (node/guard convention)
+        horiz = np.hypot(fwd, left)
+        keep = (
+            (height > self.ground_clear) & (height < self.max_height)
+            & (fwd > self.min_range) & (fwd < self.max_range)
+            & (np.abs(ang) < self.ring_fov_half)         # only where the camera actually sees
+        )
+        n = int(np.count_nonzero(keep))
+        if n == 0:
+            return out, 0
+        a = ang[keep]
+        h = horiz[keep]
+        sector = (np.floor((a - self.ring_start_deg) / self.ring_bin_deg)
+                  .astype(np.int64) % self.ring_n)
+        counts = np.bincount(sector, minlength=self.ring_n)
+        populated = counts >= self.ring_min_pts
+        if not populated.any():
+            return out, n
+        # k-th nearest per sector via one lexsort (sector, then range) + block starts.
+        order = np.lexsort((h, sector))
+        h_sorted = h[order]
+        starts = np.zeros(self.ring_n, dtype=np.int64)
+        starts[1:] = np.cumsum(counts)[:-1]
+        kth_rank = np.minimum(self.kth, counts)          # clamp k to the sector's count
+        kth_idx = starts + (kth_rank - 1)
+        out[populated] = h_sorted[kth_idx[populated]]
+        return out, n
+
     def _run(self):
         while not self._stop.is_set():
             t0 = time.monotonic()
@@ -139,19 +200,23 @@ class DepthNearField:
                 try:
                     cloud = self.lidar.get_cloud()
                     front, n = self._compute(cloud)
+                    ring, _nr = self._compute_ring(cloud)
                     with self._lock:
                         self._front = front
+                        self._ring = ring
                         self._n_near = n
                         self._live = cloud is not None
                         self._stamp = time.monotonic()
                 except Exception as e:
                     with self._lock:
                         self._front = None
+                        self._ring = None
                         self._n_near = 0
                     print(f"[DEPTH] compute error: {e}", flush=True)
             else:
                 with self._lock:
                     self._front = None
+                    self._ring = None
             dt = time.monotonic() - t0
             if dt < self.period:
                 self._stop.wait(self.period - dt)
@@ -164,6 +229,24 @@ class DepthNearField:
             return None
         with self._lock:
             return self._front
+
+    def front_ring(self):
+        """Per-sector near-ground depth ring, or None. Same schema/geometry as the lidar
+        ring so the guard can NaN-aware-min-merge it: {n, bin_deg, start_deg, dist:[...]}
+        with dist[i]=None where the camera saw no near obstacle (never emitted as clear).
+        The ObstacleGuard calls this on its hot path -- keep it cheap."""
+        if not self.enabled:
+            return None
+        with self._lock:
+            ring = self._ring
+        if ring is None:
+            return None
+        return {
+            "n": self.ring_n,
+            "bin_deg": self.ring_bin_deg,
+            "start_deg": self.ring_start_deg,
+            "dist": [None if not np.isfinite(v) else round(float(v), 3) for v in ring],
+        }
 
     def telemetry(self):
         with self._lock:

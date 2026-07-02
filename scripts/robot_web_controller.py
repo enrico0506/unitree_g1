@@ -1211,6 +1211,7 @@ async def lifespan(app: FastAPI):
                               ls_mount_height=LIDAR_CAMERA_HEIGHT)
     depth_nf.start()
     guard.set_depth_source(depth_nf.front_near_m)
+    guard.set_depth_ring_source(depth_nf.front_ring)   # per-sector ring -> merged into lidar ring
     print(f"Depth near-field fusion ready ({'ON' if depth_nf.enabled else 'OFF'}; D435i).",
           flush=True)
 

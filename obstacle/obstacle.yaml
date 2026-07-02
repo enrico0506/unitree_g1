@@ -191,7 +191,7 @@ use_deskew: true             # IMU-gyro motion-compensate the cloud (needs /livo
 # distance (slow + stop). DEFAULT OFF: a wrong pitch/height would false-stop or
 # miss, so VALIDATE on the robot (watch depth.front_near in the telemetry) first.
 depth_fusion:
-  enabled: false             # turn ON only after validating the frame on the robot
+  enabled: true              # ON: validate the depth frame on the robot; a bad frame = false stops
   pitch_deg: 47.6            # D435i downward mount tilt (URDF d435_joint = 0.83078 rad)
   camera_height_m: 1.30      # real D435i height above the floor -- MEASURE (head ~1.27 m)
   corridor_half_m: 0.35      # forward corridor half-width (robot half-width + margin)
@@ -202,3 +202,8 @@ depth_fusion:
   min_points: 8              # need >= this many near points before reporting (anti-noise)
   kth: 4                     # report the k-th nearest forward distance (reject a lone flier)
   poll_hz: 15                # depth sampling rate
+  # per-sector depth ring -- fills the front blind wedge across ALL forward sectors, merged
+  # into the lidar ring by NaN-aware min (depth only lowers a sector, never clears it).
+  ring_bin_deg: 5.0          # MUST equal the lidar ring_bin_deg above, or the merge is skipped
+  ring_fov_half_deg: 43.0    # D435i horizontal half-FOV (~87 deg HFOV) actually imaged
+  ring_min_points: 2         # min near points in a 5 deg sector before it reports
