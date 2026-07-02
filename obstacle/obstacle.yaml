@@ -157,6 +157,16 @@ publish_hz: 10               # node processing / shm-write rate (matches LiDAR)
 viz_points: true             # false = stop exporting points (saves a little WLAN/CPU)
 viz_max_points: 3000         # cap on exported points (~2.5k kept/frame -> 3000 sends all).
                              # Lower if the dashboard lags over WiFi; raise for max density.
+# Rolling accumulation (fixes the "radar sweep"): the Mid-360 scans NON-REPETITIVELY,
+# so a single ~100 ms frame paints only a thin "petal" -- per-frame the 2D ring + 3D
+# sphere show a sparse arc that SWEEPS the circle and flickers. Merging the last
+# viz_accum_s of frames before building the ring + points yields a full, steady cloud.
+# The front/left/right/back SAFETY wedges + zone stay per-frame (the hard stop keeps its
+# latency); only the ring + sphere use the merged window. NOTE: the ring feeds the guard's
+# 360 deg gating, so this ALSO densifies that gating -- fail-safe: a cleared sector lingers
+# up to viz_accum_s (conservative directional braking, never blind).
+viz_accum_s: 0.6             # merge window (s); 0 = off (old per-frame sweep). ~0.6 = full circle.
+viz_accum_max_frames: 12     # hard cap on buffered frames (memory/CPU; ~1.2 s @ 10 Hz)
 
 # --- D435i depth fusion (fills the Mid-360's near-GROUND blind zone) -------
 # The head RealSense D435i is tilted ~47 deg DOWN, so it sees the floor ~0.5-2 m

@@ -31,6 +31,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -109,6 +110,18 @@ DEFAULTS = {
     "viz_points": True,            # write the "points" array into the shm contract
     "viz_max_points": 3000,        # cap (strided decimation) -> bounded JSON/WS payload
                                    #   (~2.5k kept/frame here, so 3000 sends them all = densest)
+    # --- rolling accumulation for the RING + 3D sphere -----------------------
+    # The Mid-360 scans NON-REPETITIVELY: one ~100 ms frame paints only a thin
+    # "petal", so per-frame the 2D ring + 3D sphere show a sparse arc that SWEEPS
+    # the circle like radar (and flickers as near-empty petals arrive). Merge the
+    # last viz_accum_s of frames before computing the ring + viz points so both
+    # show a full, steady cloud. The 4 safety wedges + zone stay PER-FRAME (front
+    # stop latency unchanged); only the ring + points use the merged set. The ring
+    # feeds the guard's 360 deg gating, so this ALSO densifies that gating --
+    # fail-safe: a cleared sector lingers up to viz_accum_s (conservative, never
+    # blind). 0 = off (old per-frame sweeping behaviour).
+    "viz_accum_s": 0.6,            # rolling merge window in seconds (0 disables)
+    "viz_accum_max_frames": 12,    # hard cap on buffered frames (memory/CPU bound)
 }
 
 
@@ -208,6 +221,11 @@ class ObstacleNode(Node):
         # obstacle-point export for the dashboard 3D sphere
         self.viz_points = bool(c.get("viz_points", True))
         self.viz_max_points = max(0, int(c.get("viz_max_points", 1500)))
+        # rolling accumulation window (RING + viz points only; see DEFAULTS). The
+        # deque holds (stamp, x, y, z, ang, horiz) per frame; maxlen bounds memory.
+        self.accum_s = max(0.0, float(c.get("viz_accum_s", 0.0)))
+        self.accum_max = max(1, int(c.get("viz_accum_max_frames", 12)))
+        self._accum = deque(maxlen=self.accum_max)
         self.half_w = float(c["robot_half_width_m"])
         self.margin = float(c["clearance_margin_m"])
         self.standoff = float(c["gap_standoff_m"])
@@ -393,8 +411,16 @@ class ObstacleNode(Node):
         # ---- 5. Stage 8: depth profile + gap -------------------------------
         profile, gap = self._gap_math(ang, horiz, left_m, right_m)
 
-        # ---- 5b. full-circle 360 deg ring (additive; same kept-point arrays) -
-        ring_dist = self._ring_distances(ang, horiz)
+        # ---- 5a. rolling accumulation for the RING + 3D-sphere viz ----------
+        # Merge the last viz_accum_s of frames so the non-repetitive Mid-360 scan
+        # fills the whole circle instead of one sweeping petal. ONLY the ring +
+        # viz points below use these merged arrays; the wedges/zone/gap above are
+        # per-frame, so the safety stop keeps its per-frame latency.
+        acc_x, acc_y, acc_z, acc_ang, acc_horiz = self._accumulate(
+            x, y, z, ang, horiz)
+
+        # ---- 5b. full-circle 360 deg ring (additive; merged-window points) --
+        ring_dist = self._ring_distances(acc_ang, acc_horiz)
 
         # ---- 6. write the contract -----------------------------------------
         self.seq += 1
@@ -426,9 +452,10 @@ class ObstacleNode(Node):
                 "dist": [_r(d) for d in ring_dist],
             },
         }
-        # Actual kept obstacle points (what the guard perceives) for the 3D sphere.
+        # Actual kept obstacle points (what the guard perceives) for the 3D sphere,
+        # merged over the accumulation window (matches the ring above).
         if self.viz_points:
-            out["points"] = self._viz_points(x, y, z)
+            out["points"] = self._viz_points(acc_x, acc_y, acc_z)
         # opt-in front-cone filter-stage trace (G1_OBS_FRONT_DIAG=1).
         if self.front_diag and self._front_diag_last is not None:
             out["front_diag"] = self._front_diag_last
@@ -823,6 +850,33 @@ class ObstacleNode(Node):
             "turn_factor": round(turn_factor, 3),
         }
         return profile, gap
+
+    def _accumulate(self, x, y, z, ang, horiz):
+        """Merge the last viz_accum_s of kept-point frames for the RING + 3D
+        sphere, so the Mid-360's non-repetitive scan shows a full circle instead
+        of one sweeping petal (and stops flickering on near-empty frames).
+
+        Points are stored in the SENSOR frame at capture time, so fast robot
+        rotation smears older points by up to ~yaw_rate * viz_accum_s -- this is
+        fail-safe (a stale return lingers, it never invents a gap). The 4 safety
+        wedges + zone are computed on the CURRENT frame by the caller, so the
+        front stop keeps its per-frame latency. viz_accum_s <= 0 disables the
+        window (returns the current frame -> old per-frame behaviour).
+        """
+        if self.accum_s <= 0.0:
+            return x, y, z, ang, horiz
+        now = time.time()
+        self._accum.append((now, x, y, z, ang, horiz))
+        # drop frames older than the window (keep >= 1 so we never empty it out)
+        cutoff = now - self.accum_s
+        while len(self._accum) > 1 and self._accum[0][0] < cutoff:
+            self._accum.popleft()
+        if len(self._accum) == 1:
+            return x, y, z, ang, horiz
+        cols = list(zip(*self._accum))   # cols[1..5] = the x/y/z/ang/horiz arrays
+        return (np.concatenate(cols[1]), np.concatenate(cols[2]),
+                np.concatenate(cols[3]), np.concatenate(cols[4]),
+                np.concatenate(cols[5]))
 
     def _viz_points(self, x, y, z):
         """Decimated kept-obstacle points for the dashboard 3D sphere.
