@@ -25,7 +25,7 @@ from gesture_reactor import (
 import sim_gestures as sg
 from sim_gestures import (
     make_skeleton, feed, fired_gestures, wave_sequence, raise_sequence,
-    both_arms_up_sequence, idle_sequence, walking_sequence, reach_sequence,
+    idle_sequence, walking_sequence, reach_sequence,
     DT, CX, CY, SW,
 )
 
@@ -65,10 +65,6 @@ def test_raise_hand_classifies():
     assert classify(history_from(raise_sequence(), CFG), CFG) == "raise_hand"
 
 
-def test_both_arms_up_classifies():
-    assert classify(history_from(both_arms_up_sequence(), CFG), CFG) == "both_arms_up"
-
-
 def test_idle_classifies_none():
     assert classify(history_from(idle_sequence(), CFG), CFG) is None
 
@@ -103,8 +99,7 @@ def test_reactor_fires_wave_once():
 
 def test_reactor_fires_each_gesture():
     for seq, want in ((wave_sequence(), "wave"),
-                      (raise_sequence(), "raise_hand"),
-                      (both_arms_up_sequence(), "both_arms_up")):
+                      (raise_sequence(), "raise_hand")):
         assert fired_gestures(feed(GestureReactor(CFG), seq)) == [want]
 
 
@@ -251,7 +246,7 @@ def test_gesture_to_robot_mapping_complete():
     # response must be a cmd the controller's apply_cmd already knows (guards silent typos).
     known_cmds = {"wave", "shake", "high_five", "hug", "heart", "clap", "high_wave",
                   "kiss", "hands_up", "release_arm"}
-    assert set(GESTURE_TO_ROBOT) == {"wave", "raise_hand", "both_arms_up"}
+    assert set(GESTURE_TO_ROBOT) == {"wave", "raise_hand"}
     for robot_cmd in GESTURE_TO_ROBOT.values():
         assert robot_cmd in known_cmds
 

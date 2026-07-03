@@ -8,8 +8,7 @@ IMAGE pixels, y DOWN, conf 0-1) and classifies a small, DELIBERATELY SMALL set o
 robust human gestures:
 
     WAVE          a wrist held ABOVE its shoulder AND oscillating horizontally ~1 s
-    RAISE_HAND    a wrist held ABOVE the head (still, not oscillating)
-    BOTH_ARMS_UP  both wrists held above both shoulders
+    RAISE_HAND    a wrist held around HEAD LEVEL or above (still, not oscillating)
 
 Design priorities (in order): ROBUSTNESS, FEW FALSE POSITIVES, simplicity. A reliable
 wave-back in front of a client beats six flaky gestures. Everything here is temporal
@@ -50,21 +49,18 @@ KP_MIN_CONF = 0.3   # matches pose_service.KP_MIN_CONF: below this a joint is "m
 
 # --- human gesture -> robot response ---------------------------------------
 # The mapping is intentionally "impressive but calm": the hero is wave->wave (the G1's
-# native LocoClient.WaveHand). raise_hand -> high_five reads as "up top!"; both_arms_up
-# -> hug is the big celebratory one. Swap both_arms_up to "heart" for a softer look.
+# native LocoClient.WaveHand). raise_hand -> high_five reads as "up top!".
 # Values are cmd names the controller's apply_cmd() already knows (see ARM_GESTURES +
 # the wave/shake branches), so firing reuses the EXISTING serialized execution path.
 GESTURE_TO_ROBOT = {
     "wave":         "wave",       # LocoClient.WaveHand() -- native two-way wave (the hero)
     "raise_hand":   "high_five",  # arm action 18 (auto-releases) -- "up top!"
-    "both_arms_up": "hug",        # arm action 19 (auto-releases); alt: "heart" (20)
 }
 
 # Short human-readable feedback for the dashboard ("saw wave -> waving back").
 GESTURE_HUMAN = {
     "wave":         "wave",
     "raise_hand":   "raised hand",
-    "both_arms_up": "both arms up",
 }
 
 
@@ -92,13 +88,15 @@ class ReactorConfig:
 
         # RAISE_HAND: wrist above the head, held STILL
         self.hold_min_frames = 4
-        self.raise_min_span_s = 0.4
-        self.raise_up_frac = 0.7       # fraction of frames: wrist above head-top
+        self.raise_min_span_s = 0.9    # hold ~1 s: long enough that a WAVE accumulates its 2
+                                       #   reversals and wins precedence before this completes
+                                       #   (so a wave is never mis-fired as a raise)
+        self.raise_up_frac = 0.7       # fraction of frames: wrist at head level or above
+        self.raise_head_band_frac = 0.25  # "head area" = up to this many shoulder-widths BELOW
+                                       #   the head-top still counts as raised, so a high-five
+                                       #   hand around head height fires -- but a mid-chest reach
+                                       #   (~0.3 sw above the shoulder) stays BELOW and does not.
         self.raise_max_reversals = 1   # must be still-ish (else it's a wave)
-
-        # BOTH_ARMS_UP: both wrists above both shoulders, held
-        self.both_min_span_s = 0.35
-        self.both_up_frac = 0.6
 
         # oscillation deadband: wrist-x moves smaller than this (shoulder-widths) are jitter
         self.deadband_frac = 0.06
@@ -209,7 +207,9 @@ def _arm_metrics(history, wri_idx, sho_idx, cfg):
         ups.append(1 if w[1] < s[1] else 0)          # wrist ABOVE shoulder (smaller y)
         ht = _head_top_y(joints)
         if ht is not None:
-            head_ups.append(1 if w[1] < ht else 0)    # wrist ABOVE head top
+            # "at head level or above": within a band BELOW the head-top still counts,
+            # so a high-five hand around head height fires (not only strictly above).
+            head_ups.append(1 if w[1] < ht + cfg.raise_head_band_frac * scale else 0)
         scales.append(scale)
     if len(ts) < 2:
         return None
@@ -226,42 +226,20 @@ def _arm_metrics(history, wri_idx, sho_idx, cfg):
     }
 
 
-def _both_up(history, cfg):
-    """True if BOTH wrists are above their shoulders for a sustained fraction of frames."""
-    ts, ups = [], []
-    for (t, joints, _scale) in history:
-        lw, ls = joints.get(L_WRI), joints.get(L_SHO)
-        rw, rs = joints.get(R_WRI), joints.get(R_SHO)
-        if not (lw and ls and rw and rs):
-            continue
-        ts.append(t)
-        ups.append(1 if (lw[1] < ls[1] and rw[1] < rs[1]) else 0)
-    if len(ts) < cfg.hold_min_frames:
-        return False
-    if (ts[-1] - ts[0]) < cfg.both_min_span_s:
-        return False
-    return (sum(ups) / len(ups)) >= cfg.both_up_frac
-
-
 def classify(history, cfg=DEFAULT_CFG):
     """PURE classifier: a track's recent (t, joints, scale) history -> gesture name or None.
 
-    Order matters and encodes precedence: BOTH_ARMS_UP (needs both wrists up) is checked
-    first; then WAVE (one wrist up AND oscillating); then RAISE_HAND (one wrist above the
-    HEAD and STILL). A single-arm wave can't trip both_arms_up (the other wrist is down),
-    and an oscillating hand is a wave, not a raise -- so the three are mutually exclusive
-    in practice."""
+    Order matters and encodes precedence: WAVE (one wrist up AND oscillating) is checked
+    first; then RAISE_HAND (one wrist around HEAD LEVEL or above, held STILL). An
+    oscillating hand is a wave, not a raise -- so the two are mutually exclusive in
+    practice."""
     if len(history) < 2:
         return None
-
-    # 1) BOTH ARMS UP -- the big celebratory pose.
-    if _both_up(history, cfg):
-        return "both_arms_up"
 
     la = _arm_metrics(history, L_WRI, L_SHO, cfg)
     ra = _arm_metrics(history, R_WRI, R_SHO, cfg)
 
-    # 2) WAVE -- pick whichever arm is more raised; require oscillation + amplitude.
+    # 1) WAVE -- pick whichever arm is more raised; require oscillation + amplitude.
     for m in _best_first(la, ra, key="up_frac"):
         if (m["n"] >= cfg.wave_min_frames
                 and m["span"] >= cfg.wave_min_span_s
@@ -621,12 +599,6 @@ def selftest():
     raise_seq = [person(ldown, (cx + 0.5 * sw, cy - 0.95 * sw)) for _ in range(16)]
     f = run(raise_seq)
     c("raise_hand fires", "raise_hand" in f and f.count("raise_hand") == 1)
-
-    # BOTH_ARMS_UP: both wrists above both shoulders, held
-    both = [person((cx - 0.5 * sw, cy - 0.5 * sw), (cx + 0.5 * sw, cy - 0.5 * sw))
-            for _ in range(14)]
-    f = run(both)
-    c("both_arms_up fires", "both_arms_up" in f and f.count("both_arms_up") == 1)
 
     # IDLE: both wrists hanging at the hips -> NOTHING
     idle = [person(ldown, down) for _ in range(20)]

@@ -112,13 +112,6 @@ def raise_sequence(n=18, arm="right", **kw):
     return seq
 
 
-def both_arms_up_sequence(n=16, **kw):
-    """BOTH_ARMS_UP: both wrists held above both shoulders (the celebratory pose)."""
-    lu = (CX - 0.5 * SW, CY - 0.55 * SW)
-    ru = (CX + 0.5 * SW, CY - 0.55 * SW)
-    return [make_skeleton(lu, ru, **kw) for _ in range(n)]
-
-
 def idle_sequence(n=22, **kw):
     """NEGATIVE: both wrists resting at the hips, nothing moving. Must fire NOTHING."""
     return [make_skeleton(REST_L, REST_R, **kw) for _ in range(n)]
@@ -191,7 +184,6 @@ def selftest():
     for label, seq, want in (
         ("wave",         wave_sequence(),          "wave"),
         ("raise_hand",   raise_sequence(),         "raise_hand"),
-        ("both_arms_up", both_arms_up_sequence(),  "both_arms_up"),
     ):
         f = run(seq)
         check(f"{label} fires", want in f)
