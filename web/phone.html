@@ -16,7 +16,7 @@
   <title>G1 · Phone Teleop</title>
   <link rel="manifest" href="/static/phone.webmanifest">
   <link rel="apple-touch-icon" href="/static/phone-icon.svg">
-  <link rel="stylesheet" href="/static/phone.css?v=11">
+  <link rel="stylesheet" href="/static/phone.css?v=12">
   <!-- three.js (shared vendored copy) for the LiDAR cloud feed + 3D obstacle sphere -->
   <script type="importmap">
   {
@@ -57,6 +57,11 @@
     <button class="ph-mbtn" data-mode="damp" type="button">Damp</button>
     <button class="ph-mbtn" data-mode="stand" type="button">Stand</button>
     <button class="ph-mbtn ph-walk" data-mode="walk" type="button">Walk</button>
+    <!-- Drive | Actions surface selector: Actions dims the deck + opens gestures -->
+    <div class="ph-surfsel" role="tablist" aria-label="surface">
+      <button class="ph-surfbtn current" data-surf="drive" type="button" role="tab">Drive</button>
+      <button class="ph-surfbtn" data-surf="actions" type="button" role="tab">Actions</button>
+    </div>
   </nav>
 
   <!-- ================= driving deck: stick | center | stick ============== -->
@@ -109,6 +114,45 @@
     <div class="ph-deck-hint" id="phDeckHint" hidden>Switch to <b>Walk</b> to drive</div>
   </main>
 
+  <!-- ================= ACTIONS surface (gestures + whole-body) ============== -->
+  <!-- Overlays the deck; opening it zeroes the sticks + makes the deck inert. A STOP
+       stays live in its header. Arm gestures are gated on Stand/Walk; Dance/Climb are
+       hold-to-fire and gated on the server's captured FSM ids (mode_combos). -->
+  <section class="ph-actions" id="phActions" hidden aria-label="actions">
+    <div class="ph-actions-head">
+      <span class="ph-actions-title">Actions</span>
+      <span class="ph-actions-hint" id="phActionsHint">—</span>
+      <button class="ph-actions-stop" id="phActionsStop" type="button">STOP</button>
+      <button class="ph-actions-x" id="phActionsX" type="button" aria-label="back to drive">✕ Drive</button>
+    </div>
+
+    <div class="ph-gest-grid" id="phGestGrid">
+      <button class="ph-gest" data-cmd="high_wave" data-arm="1" type="button"><span>👋</span><small>Wave</small></button>
+      <button class="ph-gest" data-cmd="high_five" data-arm="1" type="button"><span>✋</span><small>High Five</small></button>
+      <button class="ph-gest" data-cmd="clap"      data-arm="1" type="button"><span>👏</span><small>Clap</small></button>
+      <button class="ph-gest" data-cmd="shake"                 type="button"><span>🤝</span><small>Shake</small></button>
+      <button class="ph-gest" data-cmd="hug"       data-arm="1" type="button"><span>🤗</span><small>Hug</small></button>
+      <button class="ph-gest" data-cmd="heart"     data-arm="1" type="button"><span>❤️</span><small>Heart</small></button>
+      <button class="ph-gest" data-cmd="kiss"      data-arm="1" type="button"><span>😘</span><small>Kiss</small></button>
+      <button class="ph-gest" data-cmd="hands_up"  data-arm="1" data-toggle="1" type="button"><span>🙌</span><small>Hands Up</small></button>
+      <button class="ph-gest ph-gest-wide" data-cmd="release_arm" data-arm="1" type="button"><span>💪</span><small>Release Arms</small></button>
+    </div>
+
+    <div class="ph-wholebody">
+      <span class="ph-wb-label">Whole-body — takes over the robot</span>
+      <div class="ph-wb-row">
+        <button class="ph-wb" data-combo="dance" type="button">
+          <span class="ph-wb-fill"></span><span class="ph-wb-txt">💃 Dance <small>hold to start</small></span>
+        </button>
+        <button class="ph-wb" data-combo="climb" type="button">
+          <span class="ph-wb-fill"></span><span class="ph-wb-txt">🧗 Climb <small>hold · Stand→Walk to exit</small></span>
+        </button>
+      </div>
+    </div>
+
+    <div class="ph-actions-status" id="phActionsStatus" aria-live="polite"></div>
+  </section>
+
   <!-- exit forced-landscape (only visible in landscape; the ⤢ toggle lives in the
        header, which is hidden in the joysticks-only landscape view). -->
   <button class="ph-land-exit" id="phLandExit" type="button" title="Exit landscape" aria-label="exit landscape">✕</button>
@@ -155,7 +199,7 @@
     </div>
   </div>
 
-  <script src="/static/phone.js?v=11"></script>
+  <script src="/static/phone.js?v=12"></script>
   <!-- viz modules (ES modules, deferred): render on the PHONE's GPU; phone.js feeds
        them obstacle frames + drives the feed switch. -->
   <script type="module" src="/static/obstacle3d.js?v=10"></script>

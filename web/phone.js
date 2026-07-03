@@ -42,6 +42,9 @@
   const axes = { fwd: 0, strafe: 0, turn: 0 };
   let uiMode = "damp", transitioning = false;
   let hasControl = false, ownerLabel = null;
+  let actionsOpen = false;                 // Actions surface shown -> deck inert
+  let comboReady = { dance: false, climb: false };   // server-captured whole-body FSM ids
+  let gestureBusyUntil = 0;                // optimistic double-fire lock (monotonic ms)
   let obstacleEnabled = false;
   let connected = false, ws = null;
   let lastObs = null;          // last obstacle frame, for on-demand radar redraw
@@ -63,6 +66,9 @@
     sheet: $("phSheet"), sheetTitle: $("phSheetTitle"), sheetNote: $("phSheetNote"),
     sheetX: $("phSheetX"), swipe: $("phSwipe"), swipeKnob: $("phSwipeKnob"),
     swipeFill: $("phSwipeFill"), swipeHint: $("phSwipeHint"),
+    actions: $("phActions"), actionsX: $("phActionsX"), actionsStop: $("phActionsStop"),
+    actionsHint: $("phActionsHint"), actionsStatus: $("phActionsStatus"),
+    gestGrid: $("phGestGrid"), deck: $("phDeck"),
   };
 
   // =====================================================================
@@ -109,6 +115,12 @@
     if (typeof msg.max_vyaw === "number") MAX_VYAW = msg.max_vyaw;
     if (msg.obstacle && typeof msg.obstacle.enabled === "boolean") setObstacle(msg.obstacle.enabled);
     if (msg.step && msg.step.mode) applyStep(msg.step.mode);
+    // whole-body Dance/Climb are only replayable once the server captured their FSM id
+    if (msg.mode_combos && typeof msg.mode_combos === "object") {
+      comboReady.dance = !!msg.mode_combos.dance;
+      comboReady.climb = !!msg.mode_combos.climb;
+      renderActions();
+    }
   }
 
   function applyFsm(msg) {
@@ -120,6 +132,9 @@
     if (el.transit) el.transit.hidden = !transitioning;
     renderModes();
     renderDeckHint();
+    renderActions();                  // arm-gating + whole-body status track the mode
+    if (msg.fsm_id === 503) setActionStatus("Dancing… (Stand→Walk to exit)");
+    else if (msg.fsm_id === 812) setActionStatus("Climbing… (Stand→Walk to exit)");
     if (!drivable()) resetSticks();   // left walk (or transition began) -> drop velocity
   }
 
@@ -172,8 +187,9 @@
       if (el.overlaySub)
         el.overlaySub.textContent = free ? "Tap below to take control." : "Tap below to drive from this phone.";
     }
-    if (changed && !mine) { resetSticks(); closeSheet(); }
+    if (changed && !mine) { resetSticks(); closeSheet(); closeActions(); }
     renderDeckHint();
+    renderActions();          // arm/whole-body gating follows the control lock
   }
 
   function requestControl() { send({ type: "take_control", client_id: CLIENT_ID }); }
@@ -455,9 +471,101 @@
     return { x: nx * s, y: ny * s };
   }
 
-  // Sticks bite only in live walk AND while this phone owns the control lock.
+  // ---- Actions surface: gestures + whole-body --------------------------------
+  const GEST_LABEL = {
+    high_wave: "Waving", high_five: "High-fiving", clap: "Clapping", shake: "Shaking hand",
+    hug: "Hugging", heart: "Heart", kiss: "Kiss", hands_up: "Hands up", release_arm: "Releasing arms",
+    dance: "Dancing", climb: "Climb mode",
+  };
+  function setActionStatus(txt) { if (el.actionsStatus) el.actionsStatus.textContent = txt || ""; }
+  function armReady() { return uiMode === "stand" || uiMode === "walk"; }
+
+  // Repaint tile enabled/greyed state: arm gestures need the robot up (mirror the desktop
+  // guard -- the server's apply_cmd does NOT mode-check); whole-body needs its FSM id captured.
+  function renderActions() {
+    if (el.actionsHint) {
+      el.actionsHint.textContent = !hasControl ? "Tap a tile to take control"
+        : armReady() ? "Robot is up — OK" : "Stand first for arm gestures";
+    }
+    document.querySelectorAll("#phGestGrid .ph-gest").forEach((b) =>
+      b.classList.toggle("disabled", !!b.dataset.arm && !armReady()));
+    document.querySelectorAll(".ph-wb").forEach((b) => {
+      const ready = !!comboReady[b.dataset.combo];
+      b.classList.toggle("disabled", !ready);
+      b.title = ready ? "" : b.dataset.combo + ": FSM id not captured yet";
+    });
+  }
+
+  function openActions() {
+    if (actionsOpen) return;
+    actionsOpen = true;
+    resetSticks(); send({ type: "stop" });            // nothing translates while gesturing
+    if (el.actions) el.actions.hidden = false;
+    if (el.deck) el.deck.classList.add("inert");
+    document.querySelectorAll(".ph-surfbtn").forEach((b) =>
+      b.classList.toggle("current", b.dataset.surf === "actions"));
+    setActionStatus(""); renderActions();
+  }
+  function closeActions() {
+    if (!actionsOpen) return;
+    actionsOpen = false;
+    if (el.actions) el.actions.hidden = true;
+    if (el.deck) el.deck.classList.remove("inert");
+    document.querySelectorAll(".ph-surfbtn").forEach((b) =>
+      b.classList.toggle("current", b.dataset.surf === "drive"));
+  }
+
+  // one-shot gesture (mirrors controller.js): take control if we don't own it, else send
+  // the cmd. Arm-gated tiles need the robot up; a short busy-lock stops double-fire.
+  function fireGesture(name, isArm) {
+    if (!hasControl) { requestControl(); setActionStatus("Requesting control…"); return; }
+    if (isArm && !armReady()) { setActionStatus("Stand first for arm gestures"); return; }
+    const now = performance.now();
+    if (now < gestureBusyUntil) return;
+    gestureBusyUntil = now + 900;
+    send({ type: "cmd", name });
+    setActionStatus("→ " + (GEST_LABEL[name] || name));
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+
+  // whole-body hold-to-fire: press-and-hold ~1.3 s (progress fill); release early aborts.
+  function wireHold(btn) {
+    const HOLD_MS = 1300;
+    const fill = btn.querySelector(".ph-wb-fill"), name = btn.dataset.combo;
+    let raf = null, t0 = 0;
+    function cancel() {
+      if (raf) cancelAnimationFrame(raf); raf = null;
+      btn.classList.remove("holding"); if (fill) fill.style.width = "0%";
+    }
+    function tick() {
+      const p = Math.min(1, (performance.now() - t0) / HOLD_MS);
+      if (fill) fill.style.width = (p * 100) + "%";
+      if (p >= 1) {
+        cancel();
+        resetSticks(); send({ type: "stop" });
+        send({ type: "cmd", name });
+        setActionStatus("→ " + (GEST_LABEL[name] || name));
+        if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    }
+    btn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      if (btn.classList.contains("disabled")) { setActionStatus(name + ": not captured yet"); return; }
+      if (!hasControl) { requestControl(); setActionStatus("Requesting control…"); return; }
+      t0 = performance.now(); btn.classList.add("holding");
+      try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+      raf = requestAnimationFrame(tick);
+    });
+    ["pointerup", "pointercancel", "lostpointercapture"].forEach((ev) =>
+      btn.addEventListener(ev, cancel));
+  }
+
+  // Sticks bite only in live walk AND while this phone owns the control lock AND the
+  // Actions surface is closed (opening it makes the deck inert + zeroes velocity).
   function drivable() {
-    return hasControl && uiMode === "walk" && !transitioning;
+    return hasControl && uiMode === "walk" && !transitioning && !actionsOpen;
   }
 
   function makeStick(base, onChange) {
@@ -570,6 +678,15 @@
         openSheet(btn.dataset.mode);
       });
     });
+
+    // Drive | Actions surface selector + the Actions surface controls
+    document.querySelectorAll(".ph-surfbtn").forEach((b) =>
+      b.addEventListener("click", () => (b.dataset.surf === "actions" ? openActions() : closeActions())));
+    if (el.actionsX) el.actionsX.addEventListener("click", closeActions);
+    if (el.actionsStop) el.actionsStop.addEventListener("click", () => { resetSticks(); send({ type: "stop" }); });
+    document.querySelectorAll("#phGestGrid .ph-gest").forEach((b) =>
+      b.addEventListener("click", () => fireGesture(b.dataset.cmd, !!b.dataset.arm)));
+    document.querySelectorAll(".ph-wb").forEach(wireHold);
 
     // obstacle toggle (needs control)
     if (el.obsBtn) el.obsBtn.addEventListener("click", () => {
