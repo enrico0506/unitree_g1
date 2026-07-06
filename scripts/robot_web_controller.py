@@ -1319,12 +1319,10 @@ async def lifespan(app: FastAPI):
         on_event=_greeting_on_event, on_skip=_greeting_on_skip)
     greeting.start()
     print("Greeting service ready (wave-back demo; OFF until toggled).", flush=True)
-    # TODO(dashboard): add a "Greeting mode" toggle button to web/ (near the gesture
-    # buttons). Wiring is just one WS message in each direction:
-    #   ON/OFF:  ws.send(JSON.stringify({type: "greeting", on: <bool>}))
-    #   state:   every make_state_msg carries {greeting_mode, greeting_status} -> light the
-    #            button when greeting_mode is true and show greeting_status as a caption
-    #            (e.g. "saw wave -> waving back"). The "greeting" WS handler is below.
+    # Dashboard toggle: the "🤖 Greet" button (web/index.html, controller.js) sends
+    # {type:"greeting", on:<bool>} -> the "greeting" WS handler below sets state.greeting_mode;
+    # every make_state_msg carries {greeting_mode, greeting_status} back so the button lights
+    # and shows the last feedback line (e.g. "saw wave -> waving back").
 
     task = asyncio.create_task(broadcast_loop())
     print(f"Web controller live at http://<robot-ip>:{PORT}", flush=True)

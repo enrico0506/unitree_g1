@@ -12,10 +12,7 @@
 # mapping before enabling obstacle detection.
 set -e
 source /home/unitree/g1_mapping_ws/env.sh
-# --- TEMP DIAGNOSTIC (remove this line when done) -------------------------------
-# Traces the front cone through each filter stage to see why a near wall reads
-# clear. Adds a 'front_diag' key to /dev/shm/g1_obstacle.json + a ~1 Hz log line.
-# Changes NO perception/safety logic. Delete to turn the diagnostic off.
-export G1_OBS_FRONT_DIAG=1
-# -------------------------------------------------------------------------------
+# Front-cone filter-stage tracer (adds a 'front_diag' key to /dev/shm/g1_obstacle.json
+# + a ~1 Hz log line; changes NO perception/safety logic). Off by default now the near-wall
+# issue is resolved; set G1_OBS_FRONT_DIAG=1 in the environment to re-enable when debugging.
 exec ros2 launch /home/unitree/projects/g1/obstacle/launch/obstacle.launch.py "$@"
