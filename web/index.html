@@ -21,7 +21,7 @@
   })();
   </script>
   <title>G1 Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=20">
+  <link rel="stylesheet" href="/static/style.css?v=21">
   <script type="importmap">
   {
     "imports": {
@@ -83,6 +83,12 @@
       <option value="shake">Shake Hand</option>
       <option value="release_arm">Release Arms</option>
     </select>
+    <!-- Auto "wave back": when ON the robot mirrors a person's wave/high-five on its own
+         (pose reactor + safety gate; robot_web_controller lifespan). OFF by default —
+         needs control, and only fires while upright in Walk and not otherwise busy. -->
+    <button id="greetingToggle" class="gesture-select greeting-toggle" type="button"
+            aria-pressed="false" title="Auto wave-back: robot greets a person who waves at it">🤖 Greet: off</button>
+    <span id="greetingStatus" class="greeting-status" aria-live="polite"></span>
     <div class="gesture-src" hidden>
       <button data-cmd="clap" data-arm="1">Clap</button>
       <button data-cmd="high_wave" data-arm="1">Wave</button>
@@ -252,7 +258,7 @@
   <script src="/static/obstacle.js?v=8"></script>
   <script src="/static/step_mode.js?v=3"></script>
   <script src="/static/drive_mode.js?v=5"></script>
-  <script src="/static/controller.js?v=21"></script>
+  <script src="/static/controller.js?v=22"></script>
   <script src="/static/camera.js?v=4"></script>
   <script src="/static/cam-overlay.js?v=6"></script>
   <script src="/static/hands.js?v=1"></script>

@@ -128,6 +128,7 @@ connect();
 let uiMode = "damp";
 let fsmId = null;
 let transitioning = false;
+let greetingOn = false;   // auto wave-back master toggle (mirrors server greeting_mode)
 let slowMode = false;   // Shift = precise slow control (~40% speed)
 
 function speedScale() { return slowMode ? SLOW_SCALE : 1.0; }
@@ -225,6 +226,20 @@ function updateFsmState(msg) {
     // message): zero any thumbstick deflected during the change so the first
     // 30 Hz tick can't fire a stale full-speed command.
     window.DriveMode.reset();
+  }
+
+  // Greeting mode (auto wave-back): reflect the server's truth on the toggle + caption,
+  // so the button state is authoritative even if another device flipped it.
+  if (msg.greeting_mode !== undefined) {
+    greetingOn = !!msg.greeting_mode;
+    const gt = document.getElementById("greetingToggle");
+    if (gt) {
+      gt.classList.toggle("on", greetingOn);
+      gt.setAttribute("aria-pressed", greetingOn ? "true" : "false");
+      gt.textContent = greetingOn ? "🤖 Greet: ON" : "🤖 Greet: off";
+    }
+    const gs = document.getElementById("greetingStatus");
+    if (gs) gs.textContent = greetingOn ? (msg.greeting_status || "watching for a wave…") : "";
   }
 }
 
@@ -529,6 +544,13 @@ if (_gestureSelect) {
     const btn = document.querySelector(`.gesture-src button[data-cmd="${name}"]`);
     if (btn) btn.click();
   });
+}
+
+// Greeting toggle: flip the server's auto wave-back mode. send() gates it on control,
+// so a read-only device can't enable it; updateFsmState() repaints the button state.
+const _greetingToggle = document.getElementById("greetingToggle");
+if (_greetingToggle) {
+  _greetingToggle.addEventListener("click", () => send({ type: "greeting", on: !greetingOn }));
 }
 
 // =========================================================================

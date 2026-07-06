@@ -423,3 +423,23 @@ input:focus-visible { outline-offset: 0; }
   border-color: color-mix(in srgb, var(--caution, #FF8636) 50%, var(--line, #232C3E));
 }
 .control-chip.theirs:hover { color: var(--chalk, #E9EDF6); }
+
+/* --- Greeting (auto wave-back) toggle — sits by the gesture picker in the header.
+   Reuses .gesture-select sizing; .on lights it so the operator always sees when the
+   robot is allowed to greet on its own. .greeting-status is the live caption. --- */
+.greeting-toggle { cursor: pointer; white-space: nowrap; }
+.greeting-toggle.on {
+  background: #123b28;
+  border-color: #2ecc71;
+  color: #7bffb0;
+  box-shadow: 0 0 0 1px #2ecc71 inset, 0 0 12px -2px #2ecc71;
+}
+.greeting-status {
+  font-size: 12px;
+  opacity: .75;
+  margin-left: 6px;
+  max-width: 20ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

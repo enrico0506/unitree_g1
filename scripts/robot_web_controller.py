@@ -57,6 +57,9 @@ from lidar_source import LidarSource, pack_cloud, OdomReader
 from map_builder import MapBuilder
 from cmd_shaper import CommandShaper
 from step_pacer import StepPacer
+# Interactive "wave back" demo: the pose->gesture reactor + its safety-gated robot bridge.
+# All robot coupling in GreetingService is via callbacks, so it imports nothing back here.
+from gesture_reactor import GreetingService, describe as greeting_describe
 
 
 # --- Paths ---
@@ -305,6 +308,12 @@ class ControlState:
         self.gait_enabled = False
         # True while an arm gesture is holding the arms raised (hands_up toggle)
         self.arm_raised = False
+        # --- Greeting mode (interactive "wave back" demo; see the wiring block in
+        # lifespan). Master opt-in toggle: OFF by default, because auto-moving the arms
+        # near clients must be deliberately enabled. greeting_status is dashboard feedback.
+        self.greeting_mode = False
+        self.greeting_status = ""    # e.g. "saw wave -> waving back"
+        self.greeting_busy_until = 0.0   # wall-clock until which a greeting gesture is mid-motion
         # Battery (from rt/lf/bmsstate; None until the first BMS message arrives)
         self.battery_soc = None      # % state-of-charge
         self.battery_v = None        # pack volts
@@ -340,6 +349,7 @@ depth_nf: DepthNearField = None
 shaper: CommandShaper = None
 pacer: StepPacer = None
 audio = None
+greeting: GreetingService = None   # safety-gated wave-back bridge (created in lifespan)
 
 _mode_lock = threading.Lock()
 _arm_lock = threading.Lock()   # serialize arm-action RPCs (and the hands_up toggle)
@@ -901,6 +911,10 @@ def make_state_msg():
         "fsm_name": state.fsm_name,
         "ui_mode": state.mode,
         "transitioning": state.transitioning,
+        # Greeting-mode toggle + last feedback line ("saw wave -> waving back"), so the
+        # dashboard button reflects reality and shows what the robot just reacted to.
+        "greeting_mode": state.greeting_mode,
+        "greeting_status": state.greeting_status,
     }
 
 
@@ -1111,7 +1125,7 @@ async def broadcast_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf
-    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher
+    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -1240,12 +1254,86 @@ async def lifespan(app: FastAPI):
     cmd_thread.start()
     print("Command loop started (robot RPCs off the event loop).", flush=True)
 
+    # =========================================================================
+    # Interactive "wave back" greeting demo (gesture_reactor.GreetingService).
+    # OPTIONAL and OFF by default. The service runs its own daemon thread that reads the
+    # pose container's per-person skeletons from POSE_TRACKS, classifies human gestures,
+    # and -- ONLY while greeting mode is ON *and* it is safe right now -- fires the mapped
+    # robot gesture through the EXISTING serialized command path (it sets state.pending_cmd,
+    # which command_loop drains into apply_cmd under _arm_lock). No deep surgery: every
+    # robot coupling below is a small callback, so gesture_reactor stays controller-agnostic
+    # and unit-testable (scripts/test_gesture_reactor.py).
+    #
+    # SAFETY GATE (_greeting_safe) -- an arm gesture auto-fires near a client ONLY when ALL:
+    #   * the arm + loco clients are up;
+    #   * the robot is in normal balance-standing ("walk" FSM) -- upright and controllable
+    #     (never while damped/zero-torque/stand-up transitioning or in a whole-body combo);
+    #   * it is NOT actively driving (is_moving), NOT mid mode-change (transitioning), and
+    #     NOT already holding an arm up (hands_up);
+    #   * no command is already queued (don't stomp an operator's button press);
+    #   * a previous greeting gesture has physically FINISHED (greeting_busy_until) -- the
+    #     arm actions auto-release after ~4 s but don't hold _arm_lock across that hold, so
+    #     we track their motion window explicitly to honour "never fire mid-gesture".
+    # The reactor adds its own debounce on top (per-gesture cooldown + a global refractory),
+    # so a continuous wave fires exactly once and gestures can never machine-gun.
+    #
+    # Conservative upper bounds on how long each robot response keeps the arms in motion
+    # (WaveHand is self-completing; the arm actions hold for their auto_release then settle).
+    _GREETING_BUSY_S = {"wave": 3.5, "high_five": 5.0, "hug": 5.0, "heart": 5.0}
+
+    def _greeting_enabled():
+        return state.greeting_mode
+
+    def _greeting_safe():
+        return (arm_client is not None and client is not None
+                and state.mode == "walk"          # upright, balancing, ready -- not damped
+                and not state.is_moving            # not translating right now
+                and not state.transitioning        # not mid mode-change
+                and not state.arm_raised            # arms not already raised (hands_up)
+                and state.pending_cmd is None       # nothing already queued to run
+                and time.time() >= state.greeting_busy_until)   # last greeting finished
+
+    def _greeting_fire(robot_gesture):
+        # Reuse the operator path: command_loop picks up pending_cmd and runs apply_cmd in
+        # its own thread under _arm_lock. Never clobber a command already queued, and mark
+        # the arm busy for the gesture's duration so nothing else fires mid-motion.
+        if robot_gesture and state.pending_cmd is None:
+            state.pending_cmd = robot_gesture
+            state.greeting_busy_until = time.time() + _GREETING_BUSY_S.get(robot_gesture, 4.0)
+
+    def _greeting_on_event(ev):
+        # Every classified gesture updates the dashboard feedback line (surfaced by
+        # make_state_msg on the next broadcast tick), fired-or-not.
+        state.greeting_status = greeting_describe(ev)
+        print(f"[GREETING] {state.greeting_status}", flush=True)
+
+    def _greeting_on_skip(ev):
+        # Classified but gated out by _greeting_safe -> tell the operator we saw it and why
+        # nothing moved, rather than silently swallowing it.
+        state.greeting_status = f"saw {ev.get('human', ev['gesture'])} -- holding (not safe)"
+        print(f"[GREETING] skipped {ev['gesture']}: not safe right now", flush=True)
+
+    greeting = GreetingService(
+        tracks_path=POSE_TRACKS, demand_path=POSE_DEMAND,
+        enabled_fn=_greeting_enabled, safe_fn=_greeting_safe, fire_fn=_greeting_fire,
+        on_event=_greeting_on_event, on_skip=_greeting_on_skip)
+    greeting.start()
+    print("Greeting service ready (wave-back demo; OFF until toggled).", flush=True)
+    # TODO(dashboard): add a "Greeting mode" toggle button to web/ (near the gesture
+    # buttons). Wiring is just one WS message in each direction:
+    #   ON/OFF:  ws.send(JSON.stringify({type: "greeting", on: <bool>}))
+    #   state:   every make_state_msg carries {greeting_mode, greeting_status} -> light the
+    #            button when greeting_mode is true and show greeting_status as a caption
+    #            (e.g. "saw wave -> waving back"). The "greeting" WS handler is below.
+
     task = asyncio.create_task(broadcast_loop())
     print(f"Web controller live at http://<robot-ip>:{PORT}", flush=True)
 
     yield
 
     task.cancel()
+    if greeting is not None:
+        greeting.stop()
     try:
         client.StopMove()
     except Exception:
@@ -1664,6 +1752,18 @@ async def ws_endpoint(ws: WebSocket):
 
             elif mtype == "cmd":
                 state.pending_cmd = msg.get("name", "")
+
+            elif mtype == "greeting":
+                # Master toggle for the interactive wave-back demo. Turning it OFF resets
+                # the reactor so a pose held during the OFF window can't fire the instant it
+                # flips back ON. The service thread itself does the shm reading + gating.
+                on = bool(msg.get("on"))
+                state.greeting_mode = on
+                if not on:
+                    state.greeting_status = ""
+                    if greeting is not None:
+                        greeting.reactor.reset()
+                await broadcast(make_state_msg())
 
             elif mtype == "map" and mapper is not None:
                 action = msg.get("action", "")
