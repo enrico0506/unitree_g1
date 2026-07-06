@@ -170,24 +170,20 @@
     hasControl = mine;
     ownerLabel = label;
 
-    const free = !mine && !label;   // nobody is driving right now
     // chip
     if (el.chip) {
       el.chip.classList.toggle("mine", mine);
       el.chip.classList.toggle("theirs", !mine);
       el.chip.textContent = mine
         ? "● You have control"
-        : (label ? `○ ${label} has control` : "○ Take control");
+        : (label ? `○ ${label} driving — tap to take` : "○ Take control");
     }
-    // full-screen overlay blocks driving whenever this phone is read-only
-    if (el.takeOverlay) el.takeOverlay.hidden = mine;
-    if (!mine) {
-      if (el.overlayTitle)
-        el.overlayTitle.textContent = free ? "No device is driving" : `${label} has control`;
-      if (el.overlaySub)
-        el.overlaySub.textContent = free ? "Tap below to take control." : "Tap below to drive from this phone.";
-    }
-    if (changed && !mine) { resetSticks(); closeSheet(); closeActions(); }
+    // Grab-on-first-tap model: the read-only overlay must NEVER block the deck, or you
+    // couldn't tap a control to grab. Keep it hidden; the chip shows who drives, and any
+    // stick/gesture/mode tap takes control (steals) via withControl().
+    if (el.takeOverlay) el.takeOverlay.hidden = true;
+    if (changed && !mine) { resetSticks(); closeSheet(); closeActions(); pendingAction = null; }
+    if (changed && mine) runPending();   // grab-on-first-tap: fire the queued action now
     renderDeckHint();
     renderActions();          // arm/whole-body gating follows the control lock
   }
@@ -515,17 +511,32 @@
       b.classList.toggle("current", b.dataset.surf === "drive"));
   }
 
-  // one-shot gesture (mirrors controller.js): take control if we don't own it, else send
-  // the cmd. Arm-gated tiles need the robot up; a short busy-lock stops double-fire.
+  // Grab-on-first-tap: if we already own control run fn now; otherwise take control
+  // (steals the lock) and run fn the moment the grant lands. A phone left idle never
+  // steals -- only an actual tap/stick grabs control. Pending action expires in 3 s.
+  let pendingAction = null, pendingUntil = 0;
+  function withControl(fn) {
+    if (hasControl) { fn(); return; }
+    pendingAction = fn; pendingUntil = performance.now() + 3000;
+    requestControl(); setActionStatus("Taking control…");
+  }
+  function runPending() {
+    const p = pendingAction; pendingAction = null;
+    if (p && performance.now() <= pendingUntil) p();
+  }
+
+  // one-shot gesture (mirrors controller.js). Arm-gated tiles need the robot up;
+  // a short busy-lock stops double-fire.
   function fireGesture(name, isArm) {
-    if (!hasControl) { requestControl(); setActionStatus("Requesting control…"); return; }
-    if (isArm && !armReady()) { setActionStatus("Stand first for arm gestures"); return; }
-    const now = performance.now();
-    if (now < gestureBusyUntil) return;
-    gestureBusyUntil = now + 900;
-    send({ type: "cmd", name });
-    setActionStatus("→ " + (GEST_LABEL[name] || name));
-    if (navigator.vibrate) navigator.vibrate(15);
+    withControl(() => {
+      if (isArm && !armReady()) { setActionStatus("Stand first for arm gestures"); return; }
+      const now = performance.now();
+      if (now < gestureBusyUntil) return;
+      gestureBusyUntil = now + 900;
+      send({ type: "cmd", name });
+      setActionStatus("→ " + (GEST_LABEL[name] || name));
+      if (navigator.vibrate) navigator.vibrate(15);
+    });
   }
 
   // whole-body hold-to-fire: press-and-hold ~1.3 s (progress fill); release early aborts.
@@ -542,10 +553,12 @@
       if (fill) fill.style.width = (p * 100) + "%";
       if (p >= 1) {
         cancel();
-        resetSticks(); send({ type: "stop" });
-        send({ type: "cmd", name });
-        setActionStatus("→ " + (GEST_LABEL[name] || name));
-        if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+        withControl(() => {
+          resetSticks(); send({ type: "stop" });
+          send({ type: "cmd", name });
+          setActionStatus("→ " + (GEST_LABEL[name] || name));
+          if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+        });
         return;
       }
       raf = requestAnimationFrame(tick);
@@ -553,7 +566,7 @@
     btn.addEventListener("pointerdown", (e) => {
       e.preventDefault();
       if (btn.classList.contains("disabled")) { setActionStatus(name + ": not captured yet"); return; }
-      if (!hasControl) { requestControl(); setActionStatus("Requesting control…"); return; }
+      if (!hasControl) requestControl();          // kick off the grab; the hold proceeds
       t0 = performance.now(); btn.classList.add("holding");
       try { btn.setPointerCapture(e.pointerId); } catch (_) {}
       raf = requestAnimationFrame(tick);
@@ -596,6 +609,7 @@
     }
     base.addEventListener("pointerdown", (e) => {
       if (pointerId !== null) return;
+      if (!hasControl) requestControl();   // grab-on-first-touch (drives once the grant lands)
       if (!drivable()) return;
       pointerId = e.pointerId;
       originX = e.clientX; originY = e.clientY;   // anchor neutral to the touch-down point
@@ -673,10 +687,7 @@
 
     // mode ladder -> swipe sheet (needs control; otherwise prompt for it)
     document.querySelectorAll(".ph-mbtn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        if (!hasControl) { requestControl(); return; }
-        openSheet(btn.dataset.mode);
-      });
+      btn.addEventListener("click", () => withControl(() => openSheet(btn.dataset.mode)));
     });
 
     // Drive | Actions surface selector + the Actions surface controls
