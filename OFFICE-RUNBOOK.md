@@ -1,6 +1,21 @@
 # Unitree G1 — Office Runbook (arriving with the real robot)
 
-Branch `home`, HEAD `b12d341`. 6 commits this cycle, pushed to `origin/main` + `origin/home`. At home there is no robot/camera/arm, so every on-robot item below is UNVERIFIED here — the `(VERIFY)` markers flag what to confirm live before trusting it.
+Branch `home`, pushed to `origin/main` + `origin/home` + `origin/office` (all aligned — at the office just `git checkout office && git pull`). At home there is no robot/camera/arm, so every on-robot item below is UNVERIFIED here — the `(VERIFY)` markers flag what to confirm live before trusting it.
+
+> ## Update — changes after this runbook was first written
+> - **"Greet" is now "🤝 Interaction" mode** (same toggle, same place). When ON the robot
+>   responds to a person's gesture: **wave → waves back**, **hand up → high-fives**. Every
+>   detected gesture is **labelled on the camera feed** (a "👋 wave" chip on that person) and
+>   **written to the dashboard log** (`👋 #3 wave → robot wave`, or "held — not safe"). Still
+>   OFF by default; only fires upright in Walk, not moving, not busy. (`e58f133`)
+> - **Multi-client access model** (`24536e0`): multiple phones/sites can connect at once.
+>   Driving (joysticks) + modes + Dance/Climb + hands_up/release_arm stay exclusive to ONE
+>   lock owner; **arm greetings (wave/high-five/clap/shake/hug/heart/kiss) can be fired by
+>   anyone**. Take-over is gated: you can only seize the drive lock when the robot is stopped
+>   ("driving · stop to take"), never mid-walk. Server-enforced.
+> - **Handshake ("gives hand")**: auto-detect is NOT shipped (unreliable from a single camera
+>   — would false-fire on a casual reach). `shake` is available as a **tap** (any device) →
+>   robot offers its hand. Decision to attempt a measured auto-detector is still open.
 
 ---
 
