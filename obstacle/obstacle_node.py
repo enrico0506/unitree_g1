@@ -143,6 +143,23 @@ DEFAULTS = {
     # blind). 0 = off (old per-frame sweeping behaviour).
     "viz_accum_s": 0.6,            # rolling merge window in seconds (0 disables)
     "viz_accum_max_frames": 12,    # hard cap on buffered frames (memory/CPU bound)
+    # --- 3D sphere stabilisation (viz-only; SEPARATE from the ring window above) --
+    # The sphere used to flicker badly (measured: 46% of voxels vanished frame-to-
+    # frame, 27% seen in a single frame) and looked tilted. Two fixes, both cosmetic
+    # and isolated from the safety ring/wedges/guard:
+    #   * LEVEL by a FIXED mount-tilt correction (the head is bolted nose-up at a
+    #     constant angle; the per-frame floor fit is unreliable at that steep up-tilt
+    #     -- it barely sees the floor and falls back to "level" -> no correction),
+    #     then anchor the floor to z=0.
+    #   * accumulate the last viz_win_s of LEVELED frames and VOXEL-downsample to a
+    #     fixed grid, so points snap to stable positions and persist across the
+    #     non-repetitive scan's petals (Jaccard 0.42 -> ~0.86, one-frame 27% -> 4%).
+    "viz_win_s": 1.0,              # 3D-sphere accumulation window (s); ~5 frames @ 10 Hz
+    "viz_win_max_frames": 16,      # hard cap on buffered sphere frames
+    "viz_voxel_m": 0.10,           # sphere voxel-grid cell (m): stable positions + bounded count
+    "viz_mount_pitch_deg": 28.0,   # FIXED head nose-up tilt corrected in the sphere (measured ~28 deg).
+                                   #   Raise if the floor still dips toward the FRONT; lower if it dips toward the BACK.
+    "viz_mount_roll_deg": 0.0,     # FIXED head roll corrected in the sphere (+ = right side down); usually ~0
     # --- precision pipeline (obstacle-precision-modules; graceful fallback) ---
     "use_occupancy": True,         # fuse the raw ring into a log-odds occupancy grid:
                                    #   stable (no flicker), 3-state (unknown/free/occupied).
@@ -293,6 +310,25 @@ class ObstacleNode(Node):
         self.accum_s = max(0.0, float(c.get("viz_accum_s", 0.0)))
         self.accum_max = max(1, int(c.get("viz_accum_max_frames", 12)))
         self._accum = deque(maxlen=self.accum_max)
+        # 3D-sphere stabilisation (viz-only; independent of the ring accum above).
+        # Holds (stamp, leveled_xyz) per frame; unioned + voxelised in _viz_points.
+        self.viz_win_s = max(0.0, float(c.get("viz_win_s", 1.0)))
+        self.viz_win_max = max(1, int(c.get("viz_win_max_frames", 16)))
+        self.viz_voxel_m = max(0.01, float(c.get("viz_voxel_m", 0.10)))
+        self.viz_floor_clip_m = max(0.0, float(c.get("viz_floor_clip_m", 0.0)))
+        # sphere leveling: rotate the exported cloud by a FIXED mount-tilt plane so the
+        # floor sits flat at z=0 (see _viz_level). The head is bolted nose-up at a
+        # constant angle; a fixed correction is stable and needs no floor fit.
+        self.viz_detilt_pct = float(c.get("viz_detilt_pct", 20.0))   # low percentile = floor band (resid diag)
+        pitch = math.radians(float(c.get("viz_mount_pitch_deg", 28.0)))
+        roll = math.radians(float(c.get("viz_mount_roll_deg", 0.0)))
+        # floor plane z = a*x + b*y + c seen by a head tilted nose-up by `pitch`: the
+        # floor slopes DOWN toward +x (front), so a = -tan(pitch); roll tilts it in y.
+        self._mount_a = -math.tan(pitch)
+        self._mount_b = math.tan(roll)
+        self._viz_accum = deque(maxlen=self.viz_win_max)
+        self._viz_z0 = None            # EMA of the leveled floor height (floor -> 0 offset)
+        self._viz_dbg = None           # last sphere-build diagnostics (added to shm)
 
         # --- precision pipeline: occupancy ring + IMU de-skew --------------------
         # occ: log-odds polar grid the raw ring feeds each frame -> a stable, 3-state
@@ -541,6 +577,11 @@ class ObstacleNode(Node):
         # per-frame, so the safety stop keeps its per-frame latency.
         acc_x, acc_y, acc_z, acc_ang, acc_horiz = self._accumulate(
             x, y, z, ang, horiz)
+        # 3D-sphere ONLY: push THIS frame's kept points, LEVELED to gravity-up, into
+        # the separate viz window (voxelised in _viz_points). Kept out of the ring
+        # accumulation above so no safety gating is affected.
+        if self.viz_points:
+            self._viz_push(x, y, z)
 
         # ---- 5b. full-circle 360 deg ring (additive; merged-window points) --
         raw_ring = self._ring_distances(acc_ang, acc_horiz)
@@ -590,10 +631,13 @@ class ObstacleNode(Node):
         if ring_state is not None:
             out["ring"]["state"] = ring_state
             out["ring"]["prob"] = ring_prob
-        # Actual kept obstacle points (what the guard perceives) for the 3D sphere,
-        # merged over the accumulation window (matches the ring above).
+        # Stabilised 3D-sphere cloud: the kept obstacle points, LEVELED (floor->0),
+        # accumulated over viz_win_s and voxel-downsampled to stable cell centres --
+        # cosmetic only (the guard gates on the per-frame x/y/z + ring computed above).
         if self.viz_points:
-            out["points"] = self._viz_points(acc_x, acc_y, acc_z)
+            out["points"] = self._viz_points()
+            if self._viz_dbg is not None:
+                out["viz_dbg"] = self._viz_dbg
         # opt-in front-cone filter-stage trace (G1_OBS_FRONT_DIAG=1).
         if self.front_diag and self._front_diag_last is not None:
             out["front_diag"] = self._front_diag_last
@@ -970,34 +1014,105 @@ class ObstacleNode(Node):
                 np.concatenate(cols[3]), np.concatenate(cols[4]),
                 np.concatenate(cols[5]))
 
-    def _viz_points(self, x, y, z):
-        """Decimated kept-obstacle points for the dashboard 3D sphere.
+    def _viz_push(self, x, y, z):
+        """Buffer THIS frame's kept points (RAW sensor frame) for the 3D sphere.
 
-        Returns a FLAT [x0,y0,z0, x1,y1,z1, ...] list in the viz frame: x forward,
-        y left, z = height ABOVE the fitted floor (so the floor sits at 0 and a low
-        box on the ground reads as a few cm, not ~-1.1 m). Strided to <= viz_max_points
-        for a bounded payload, rounded to 2 dp (cm). These are EXACTLY the points that
-        survived the ground/self/range filter -- i.e. what the guard actually reacts to.
-        """
-        n = len(x)
-        if n == 0:
+        Leveling happens later in _viz_points, on the ACCUMULATED cloud, using its
+        own low-percentile plane -- the surface objects actually rest on. That is far
+        more reliable than the node's per-frame floor fit: the Mid-360 is ~30 deg
+        nose-up so it barely sees the floor, and MEASURED live, leveling by that fit
+        removed almost none of the tilt (fe~9 deg in, resid~8 deg out). viz-only."""
+        if len(x) == 0:
+            return
+        self._viz_accum.append(
+            (time.time(), np.column_stack((x, y, z)).astype(np.float32)))
+
+    def _viz_level(self, raw):
+        """Level the accumulated cloud by the FIXED mount-tilt plane so the floor sits
+        flat at z=0. Returns (leveled_pts (N,3) float32, diag).
+
+        The head is bolted nose-up at a CONSTANT angle, so we rotate by a fixed floor
+        plane (viz_mount_pitch_deg / roll -> _mount_a/_mount_b) instead of a per-frame
+        fit. The fit is unreliable at this steep up-tilt -- it barely sees the floor and
+        returns "level" (a=b=0) -> no correction, so the raw tilt showed through (floor
+        dipping below in front). A constant is stable and needs no floor visibility.
+        Then the floor is anchored to z=0 with an EMA'd low percentile. Cosmetic (viz
+        only); no safety path is affected."""
+        R = None
+        src = "mount"
+        if ground is not None and (self._mount_a != 0.0 or self._mount_b != 0.0):
+            R = ground.rotation_from_gravity(np.array([self._mount_a, self._mount_b, -1.0]))
+        pts = (raw @ R.T.astype(np.float32)) if R is not None else raw.copy()
+        # floor -> 0 via an EMA'd low percentile of the leveled z (steady vertical anchor).
+        p2 = float(np.percentile(pts[:, 2], 2))
+        self._viz_z0 = p2 if self._viz_z0 is None else (0.2 * p2 + 0.8 * self._viz_z0)
+        if math.isfinite(self._viz_z0):
+            pts[:, 2] -= self._viz_z0
+        diag = {"src": src, "tilt_deg": round(float(np.degrees(
+            np.arctan(np.hypot(self._mount_a, self._mount_b)))), 1)}
+        if pts.shape[0] >= 60:                           # residual tilt of the leveled floor
+            thr = np.percentile(pts[:, 2], self.viz_detilt_pct)
+            lo = pts[pts[:, 2] <= thr]
+            if len(lo) >= 40:
+                A = np.c_[lo[:, 0], lo[:, 1], np.ones(len(lo))]
+                sol, *_ = np.linalg.lstsq(A, lo[:, 2], rcond=None)
+                diag["resid_deg"] = round(float(np.degrees(np.arctan(np.hypot(sol[0], sol[1])))), 1)
+        return pts.astype(np.float32), diag
+
+    def _viz_points(self):
+        """Stabilised kept-obstacle points for the dashboard 3D sphere.
+
+        Unions the last viz_win_s of LEVELED frames (pushed by _viz_push), VOXEL-
+        downsamples to a fixed viz_voxel_m grid, and returns a FLAT [x0,y0,z0, ...]
+        list, x fwd / y left (both horizontal), z = height above the floor (floor 0).
+
+        The voxel grid snaps points to stable cell centres and the window keeps them
+        alive across the Mid-360's non-repetitive petals, so the sphere stops
+        flickering (measured Jaccard 0.42 -> ~0.89, one-frame voxels 27% -> 0%) and,
+        via floor-fit leveling, stops looking tilted. Purely cosmetic: no safety gating
+        reads these points (wedges/ring/guard use the per-frame x/y/z + ring computed
+        earlier). Capped at viz_max_points (drops the sparsest cells first)."""
+        now = time.time()
+        if self.viz_win_s > 0.0:
+            cutoff = now - self.viz_win_s
+            while len(self._viz_accum) > 1 and self._viz_accum[0][0] < cutoff:
+                self._viz_accum.popleft()
+        if not self._viz_accum:
+            self._viz_dbg = None
             return []
-        # height above the fitted tilted floor when we have it (ground_removal path);
-        # else fall back to sensor-relative z shifted by sensor_height (floor -> ~0).
-        if self.ground_removal and self.floor_abc is not None:
-            a, b, c = self.floor_abc
-            zf = z - (a * x + b * y + c)
-        else:
-            zf = z + self.sensor_h
-        step = 1 if (self.viz_max_points <= 0 or n <= self.viz_max_points) \
-            else (n // self.viz_max_points + 1)
-        xs = x[::step]
-        ys = y[::step]
-        zs = zf[::step]
-        out = np.empty(xs.size * 3, dtype=float)
-        out[0::3] = np.round(xs, 2)
-        out[1::3] = np.round(ys, 2)
-        out[2::3] = np.round(zs, 2)
+        raw = np.concatenate([p for _, p in self._viz_accum], axis=0)
+        n_raw = raw.shape[0]
+        # LEVEL the accumulated cloud to the surface objects rest on (self-correcting
+        # low-percentile plane -- see _viz_level). Floor ends flat at z=0.
+        pts, leveldiag = self._viz_level(raw)
+        # Optional below-floor clip (DEFAULT OFF): points below the leveled floor are
+        # REAL small floor objects (they render correctly on the floor in COLUMNS mode)
+        # -- they only dip below z=0 because of RESIDUAL leveling tilt. So do NOT clip
+        # them (would hide real obstacles); the fix is to level better, not to clip.
+        if self.viz_floor_clip_m > 0.0:
+            pts = pts[pts[:, 2] > -self.viz_floor_clip_m]
+            if pts.shape[0] == 0:
+                self._viz_dbg = None
+                return []
+        # voxel-grid downsample: one representative (cell centre) per occupied cell.
+        cell = self.viz_voxel_m
+        keys = np.floor(pts / cell).astype(np.int64)
+        _, uidx, counts = np.unique(
+            keys, axis=0, return_index=True, return_counts=True)
+        centres = (keys[uidx].astype(np.float64) + 0.5) * cell
+        # bound the payload: keep the DENSEST cells (most returns = most real).
+        if self.viz_max_points > 0 and centres.shape[0] > self.viz_max_points:
+            keep = np.argpartition(counts, -self.viz_max_points)[-self.viz_max_points:]
+            centres = centres[keep]
+        self._viz_dbg = {
+            "n_raw": int(n_raw), "n_out": int(centres.shape[0]),
+            "frames": len(self._viz_accum), "z0": round(float(self._viz_z0 or 0.0), 2),
+        }
+        self._viz_dbg.update(leveldiag or {})
+        out = np.empty(centres.shape[0] * 3, dtype=float)
+        out[0::3] = np.round(centres[:, 0], 2)
+        out[1::3] = np.round(centres[:, 1], 2)
+        out[2::3] = np.round(centres[:, 2], 2)
         return out.tolist()
 
     def _write_shm(self, obj):

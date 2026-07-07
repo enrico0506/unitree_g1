@@ -166,6 +166,36 @@ viz_accum_s: 0.6             # merge window (s); 0 = off (old per-frame sweep). 
                              #   better solved by occ_l_high noise-rejection than a wider window.)
 viz_accum_max_frames: 12     # hard cap on buffered frames (memory/CPU; ~1.2 s @ 10 Hz)
 
+# --- 3D sphere stabilisation (viz-only; SEPARATE from the ring window above) ------
+# The sphere flickered badly (MEASURED live: 46% of voxels vanished frame-to-frame,
+# 27% seen in a single frame -> "appear/disappear") and looked tilted. Fixed WITHOUT
+# touching the safety ring/wedges/guard:
+#   * LEVEL each frame by the IMU-gravity vector (absolute vertical + EMA-smoothed ->
+#     stable; removes the ~12 deg mount tilt without the per-frame floor-fit wobble),
+#     then anchor the fitted floor to z=0.
+#   * accumulate the last viz_win_s of LEVELED frames and VOXEL-downsample to a fixed
+#     grid so points snap to stable cell centres and persist across the non-repetitive
+#     scan's petals (MEASURED: Jaccard 0.42 -> ~0.86, one-frame voxels 27% -> 4%).
+# Emits a small "viz_dbg" into the shm (src / n_raw / n_out / frames / z0) so the
+# leveling source + density are observable on the dashboard.
+viz_win_s: 1.0               # 3D-sphere accumulation window (s); ~5 frames @ 10 Hz. Bigger
+                             #   = steadier + denser but smears more while WALKING (viz only).
+viz_win_max_frames: 16       # hard cap on buffered sphere frames (memory/CPU)
+viz_voxel_m: 0.10            # sphere voxel-grid cell (m): stable positions + bounded count.
+                             #   Smaller = finer/denser (more points); 0.10 balances detail vs steadiness.
+# Sphere leveling = FIXED mount-tilt correction. The head/Mid-360 is bolted nose-up at
+# a CONSTANT angle, so the sphere just rotates the cloud by that fixed plane. We do NOT
+# use the per-frame floor fit: MEASURED, at this steep up-tilt the sensor barely sees
+# the floor, so the fit returns "level" (a=b=0) and applies NO correction -> the raw
+# tilt showed through (floor dipping below in front, rising behind). A constant is
+# stable and needs no floor visibility. Tune the two angles until the floor looks flat.
+viz_mount_pitch_deg: 28.0    # head nose-up tilt removed in the sphere (MEASURED ~28deg). If the floor
+                             #   still dips toward the FRONT raise this; if it dips toward the BACK lower it.
+viz_mount_roll_deg: 0.0      # head roll removed in the sphere (+ = right side down); usually ~0
+viz_detilt_pct: 20.0         # low z-percentile used only to REPORT the residual floor tilt (diagnostic)
+viz_floor_clip_m: 0.0        # drop sphere points more than this BELOW the leveled floor (0 = keep all;
+                             #   real floor objects sit at ~z=0, so leave OFF now that leveling is fixed).
+
 # --- log-odds occupancy ring (obstacle-precision: stable + 3-state) ---------
 # The raw per-sector ring feeds a log-odds occupancy grid so the ring is stable
 # (no flicker), self-clears, and reports honest occupied / free / UNKNOWN. The
