@@ -22,6 +22,7 @@ import asyncio
 import json
 import math
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -94,6 +96,14 @@ else:
     OBSTACLE_RUN_CMD = BASE_DIR / "obstacle" / "run_obstacle.sh"
 print(f"Obstacle source: {OBSTACLE_SOURCE} -> {OBSTACLE_RUN_CMD}", flush=True)
 CAMERA_SHM = "/dev/shm/g1_camera.jpg"   # frames written here by camera_service.py
+
+# Depth-for-map handoff: the web process (this file) owns the D435i cloud and, while
+# mapping is active, dumps DepthNearField's full leveled cloud here for map_bridge
+# (domain 99, g1_mapping_ws) to fuse into the point-cloud map. Contract (both sides
+# MUST match): little-endian <double t_epoch><uint32 N><N*3 float32>, BODY frame
+# (x-fwd, y-left, z = height above floor). Written atomically (tmp + os.replace)
+# ~10 Hz ONLY while mapper.active; removed the moment mapping stops.
+DEPTH_MAP_SHM = "/dev/shm/g1_depth_for_map.bin"
 
 # Pose lane (people skeletons). Produced by the separate pose container
 # (~/perception/pose/pose_service.py); we only read/write these shm files.
@@ -190,6 +200,16 @@ _last_swing = None   # last value sent to SET_SWING_HEIGHT (dedupe the blocking 
 FSM_POLL_HZ = 2.0          # GetFsmId is a blocking RPC; keep it light
 FSM_BROADCAST_HZ = 2.0
 
+# --- Auto-climb suppression (flat-ground / presentation mode) ---------------
+# The onboard firmware sometimes spontaneously flips 802 (main_control) -> 812
+# (climb) -> 802 in ~1s with the remote OFF and no dashboard command. There is
+# no SDK call to disable that behaviour, so when the operator arms the flat-
+# ground toggle we detect the un-commanded jump into 812 and re-command 802.
+FSM_CLIMB = 812            # onboard climb FSM (matches FSM_NAMES[812] / MODE_COMBOS['climb'])
+SUPPRESS_POLL_HZ = 8.0     # while armed, sample fast enough to catch the ~1s climb flip
+SUPPRESS_WINDOW_S = 10.0   # anti-oscillation observation window
+SUPPRESS_MAX_IN_WINDOW = 5 # this many reversals in-window -> auto-disable (likely a REAL climb)
+
 CAMERA_STREAM_HZ = CFG["camera"]["stream_hz"]
 LIDAR_STREAM_HZ = CFG["lidar"]["stream_hz"]
 LIDAR_MAX_POINTS = CFG["lidar"]["max_points"]
@@ -233,6 +253,107 @@ MODE_COMBO_FSM_TO_NAME = {fsm: name for name, fsm in MODE_COMBOS.items()
                           if fsm is not None}
 MODE_COMBO_FSMS = set(MODE_COMBO_FSM_TO_NAME)
 
+# --- Named dance catalog (config/dances.yaml) ---------------------------------
+# A list of selectable whole-body routines [{name, fsm_id, space_m, note}]. Kept
+# in its OWN file (not mapping.yaml) because the dashboard's Dance Lab writes it
+# back on Save, and we don't want to clobber mapping.yaml's hand-written comments.
+DANCES_PATH = BASE_DIR / "config" / "dances.yaml"
+
+# FSM ids that are the robot's BASE modes (zero_torque / damp / ready_stand /
+# main_control). A dance can never be one of these, and registering one as a
+# "routine" would corrupt enter_mode's exit logic (a later Stand/Walk from that
+# base id would mis-fire an immediate SetFsmId(802)). So they are rejected
+# everywhere a dance/probe id is accepted. Literal (not UI_TO_FSM) because this
+# block runs at import BEFORE UI_TO_FSM is defined; asserted equal below.
+_BASE_FSM_IDS = {0, 1, 4, 802}
+_FSM_ID_MAX = 9999   # sane upper bound for a probe/dance id
+
+
+def _valid_dance_id(fsm):
+    """True if fsm is an int in range and NOT a base mode id -> safe to fire/store."""
+    try:
+        fsm = int(fsm)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= fsm <= _FSM_ID_MAX and fsm not in _BASE_FSM_IDS
+
+
+def load_dances(path=DANCES_PATH):
+    """Read the named-dance catalog. Returns [{name, fsm_id, space_m, note, verified}].
+
+    Malformed/missing file -> []. Each entry must have a valid (non-base) int
+    fsm_id; name/space_m/verified default sensibly. De-duplicated by fsm_id.
+    """
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        raw = data.get("dances", []) or []
+    except (OSError, ValueError, TypeError):
+        return []
+    out, seen = [], set()
+    for d in raw:
+        if not isinstance(d, dict):
+            continue
+        fsm = d.get("fsm_id")
+        if not _valid_dance_id(fsm):     # skip garbage AND base-mode ids
+            continue
+        fsm = int(fsm)
+        if fsm in seen:
+            continue
+        seen.add(fsm)
+        name = (str(d.get("name") or f"FSM {fsm}").strip() or f"FSM {fsm}")[:40]
+        try:
+            space = float(d.get("space_m", 2.0))
+        except (TypeError, ValueError):
+            space = 2.0
+        out.append({"name": name, "fsm_id": fsm,
+                    "space_m": round(max(0.0, space), 1),
+                    "note": str(d.get("note") or "")[:200],
+                    "verified": bool(d.get("verified", True))})
+    return out
+
+
+def save_dances(dances, path=DANCES_PATH):
+    """Persist the dance catalog back to config/dances.yaml (Dance Lab Save)."""
+    payload = {"dances": [{"name": d["name"], "fsm_id": int(d["fsm_id"]),
+                           "space_m": float(d["space_m"]), "note": d.get("note", ""),
+                           "verified": bool(d.get("verified", True))}
+                          for d in dances]}
+    tmp = Path(str(path) + ".tmp")
+    header = ("# G1 DANCE CATALOG — named whole-body FSM routines (see git history\n"
+              "# for the full guide). Auto-written by the dashboard's Dance Lab.\n")
+    with open(tmp, "w") as f:
+        f.write(header)
+        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+    os.replace(tmp, path)
+
+
+DANCES = load_dances()   # [{name, fsm_id, space_m, note}], seeded with 503
+
+# Every dance FSM is a "routine" the robot only exits back through main_control
+# (802) -- same contract as the climb/dance mode_combos. These runtime-mutable
+# maps union the combo FSMs with the catalog's, and the Dance Lab adds a probed
+# id here the instant it fires so Stand/Walk can always recover the robot.
+ROUTINE_FSM_TO_NAME = dict(MODE_COMBO_FSM_TO_NAME)
+for _d in DANCES:
+    ROUTINE_FSM_TO_NAME.setdefault(_d["fsm_id"], _d["name"])
+ROUTINE_FSMS = set(ROUTINE_FSM_TO_NAME)
+
+
+def register_routine_fsm(fsm_id, name="routine"):
+    """Mark an FSM id as a whole-body routine so enter_mode() exits it via 802.
+
+    Called when firing a catalog dance or a Dance Lab probe -- a just-probed id
+    is otherwise unknown to the exit logic, which would leave Stand/Walk unable
+    to recover the robot from it. Base-mode ids (0/1/4/802) are NEVER registered
+    -- doing so would corrupt enter_mode's ordinary transitions."""
+    if not _valid_dance_id(fsm_id):
+        return
+    fsm_id = int(fsm_id)
+    ROUTINE_FSMS.add(fsm_id)
+    ROUTINE_FSM_TO_NAME.setdefault(fsm_id, name)
+
+
 VALID_MODES = {"zero_torque", "damp", "stand", "walk"}
 INITIAL_MODE = "damp"
 
@@ -260,6 +381,11 @@ UI_TO_FSM = {
     "walk":        FSM_MAIN_CONTROL,
 }
 
+# The dance-catalog base-id blocklist (_BASE_FSM_IDS, defined earlier as a literal
+# because it runs at import before this point) must exactly match the base modes,
+# or a dance could shadow one. Assert it here now that UI_TO_FSM exists.
+assert _BASE_FSM_IDS == set(UI_TO_FSM.values()), _BASE_FSM_IDS
+
 # Reverse map: robot FSM id -> UI mode. Lets us reconcile the displayed mode to
 # the robot's ACTUAL state (read by the FSM poller) so the dashboard reflects
 # reality after a page reload or a dashboard restart -- not just the last command.
@@ -284,6 +410,34 @@ ARM_GESTURES = {
     "hug":       (19, 4.0),
     "heart":     (20, 4.0),
 }
+
+
+# --- Persisted UI settings (small writable JSON; survives service restart AND a
+# power cycle, unlike /dev/shm). Config proper stays read-only YAML; this tiny
+# store only holds operator UI toggles that must persist across sessions
+# (currently: suppress_autoclimb). Atomic write, modeled on the POSE_LABELS writer.
+SETTINGS_PATH = BASE_DIR / "state" / "ui_settings.json"
+
+
+def load_ui_settings():
+    """Return the persisted UI-settings dict ({} if missing/unreadable)."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ui_settings(d):
+    """Atomically persist the UI-settings dict. Creates state/ on first write."""
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(SETTINGS_PATH) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, str(SETTINGS_PATH))   # atomic -> never a partial read
+    except OSError as e:
+        print(f"[SETTINGS] save failed: {e}", flush=True)
 
 
 # --- Shared state ---
@@ -316,6 +470,11 @@ class ControlState:
         # lifespan). Master opt-in toggle: OFF by default, because auto-moving the arms
         # near clients must be deliberately enabled. greeting_status is dashboard feedback.
         self.greeting_mode = False
+        # Flat-ground/presentation opt-in: when True, fsm_poll_loop reverses an
+        # un-commanded firmware climb (802->812) back to 802. Default OFF; loaded
+        # from persisted UI settings just after construction. A real climb/stairs
+        # will NOT happen while this is on -- see _suppress_autoclimb.
+        self.suppress_autoclimb = False
         self.greeting_status = ""    # e.g. "saw wave -> waving back"
         self.greeting_busy_until = 0.0   # wall-clock until which a greeting gesture is mid-motion
         # Discrete gesture events handed from the greeting daemon thread to broadcast_loop
@@ -329,6 +488,9 @@ class ControlState:
 
 
 state = ControlState()
+# Restore the persisted flat-ground toggle (default OFF -> only ever armed by a
+# deliberate operator choice; the value persists across restarts/power cycles).
+state.suppress_autoclimb = bool(load_ui_settings().get("suppress_autoclimb", False))
 client: LocoClient = None
 reader: H2LocoClient = None
 arm_client: G1ArmActionClient = None   # gesture/arm-action service ("arm")
@@ -393,6 +555,7 @@ mapper: MapBuilder = None
 guard: ObstacleGuard = None
 obstacle_mgr: ObstacleManager = None
 depth_nf: DepthNearField = None
+depth_dumper = None
 shaper: CommandShaper = None
 pacer: StepPacer = None
 audio = None
@@ -431,7 +594,9 @@ def send_velocity(vx, vy, vyaw, duration):
 def fsm_name(fsm_id):
     if fsm_id is None:
         return "unknown"
-    return FSM_NAMES.get(fsm_id, f"fsm_{fsm_id}")
+    return (FSM_NAMES.get(fsm_id)
+            or ROUTINE_FSM_TO_NAME.get(fsm_id)
+            or f"fsm_{fsm_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +664,44 @@ def fsm_change_is_ours(fsm_id):
     return t is not None and (time.monotonic() - t) <= _FSM_INTENT_WINDOW_S
 
 
+# Monotonic times of recent forced climb->802 reversals, for the oscillation cap.
+_suppress_hist = deque(maxlen=16)
+
+
+def _suppress_autoclimb(old, fsm):
+    """Reverse an un-commanded firmware climb (802->812) back to main_control (802).
+
+    Called EDGE-triggered from fsm_poll_loop's external branch ONLY, so it fires
+    once per observed un-commanded jump into 812 -- never on a commanded climb
+    (that reads as ours) and never continuously. note_fsm_intent(802) is recorded
+    FIRST so our forced return reads as OURS and is not itself re-flagged/re-
+    suppressed. SetFsmId(802) is the identical base FSM Walk mode commands -- no
+    novel motion, just pinning the normal upright locomotion base.
+
+    Anti-oscillation: if the firmware re-triggers SUPPRESS_MAX_IN_WINDOW times
+    within SUPPRESS_WINDOW_S, suppression auto-disables (persisted + broadcast by
+    the caller path) on the assumption this may be a REAL climb/stairs.
+    """
+    note_fsm_intent(FSM_MAIN_CONTROL)     # our forced return is OURS, not external
+    try:
+        client.SetFsmId(FSM_MAIN_CONTROL)
+    except Exception as e:
+        print(f"[SUPPRESS] SetFsmId({FSM_MAIN_CONTROL}) failed: {e}", flush=True)
+    print(f"[SUPPRESS] external climb {old} ({fsm_name(old)}) -> {fsm} "
+          f"({fsm_name(fsm)}) reversed -> {FSM_MAIN_CONTROL} (main_control); "
+          f"flat-ground mode", flush=True)
+    now = time.monotonic()
+    _suppress_hist.append(now)
+    recent = sum(1 for t in _suppress_hist if now - t <= SUPPRESS_WINDOW_S)
+    if recent >= SUPPRESS_MAX_IN_WINDOW:
+        state.suppress_autoclimb = False
+        d = load_ui_settings()
+        d["suppress_autoclimb"] = False
+        save_ui_settings(d)
+        print("[SUPPRESS] firmware re-triggering repeatedly -- disabling "
+              "(possible REAL climb/stairs); check the robot", flush=True)
+
+
 class RemoteWatcher:
     """Caches the physical remote's latest button state (rt/wirelesscontroller) so an
     un-commanded FSM change can be attributed to a remote press -- or, when the remote
@@ -547,9 +750,66 @@ class RemoteWatcher:
                 "the dashboard issued no command")
 
 
+class DepthMapDumper(threading.Thread):
+    """While mapping is active, dumps DepthNearField's full leveled D435i cloud to
+    DEPTH_MAP_SHM at ~hz so map_bridge (domain 99) can fuse it into the point-cloud
+    map -- fills the Mid-360's near-ground blind zone in the saved map too. Self-gates
+    on mapper.active: writes nothing (and removes any stale file) while not mapping,
+    so a consumer that opens the path mid-mapping never sees a leftover cloud from a
+    previous session. Runs continuously from startup; cheap no-op while not mapping."""
+
+    def __init__(self, depth_nf, mapper, shm_path=DEPTH_MAP_SHM, hz=10.0):
+        super().__init__(name="depth-map-dumper", daemon=True)
+        self._depth_nf = depth_nf
+        self._mapper = mapper
+        self._shm_path = shm_path
+        self._tmp_path = shm_path + ".tmp"
+        self.period = 1.0 / max(1.0, float(hz))
+        self._stop = threading.Event()
+        self._had_file = False
+
+    def stop(self):
+        self._stop.set()
+        self.join(timeout=2.0)
+        self._remove()
+
+    def _remove(self):
+        try:
+            os.remove(self._shm_path)
+        except OSError:
+            pass
+        self._had_file = False
+
+    def run(self):
+        while not self._stop.wait(self.period):
+            if not (self._mapper is not None and self._mapper.active):
+                if self._had_file:
+                    self._remove()
+                continue
+            try:
+                cloud = self._depth_nf.map_cloud() if self._depth_nf is not None else None
+                if cloud is None or len(cloud) == 0:
+                    continue
+                t = time.time()
+                n = len(cloud)
+                data = (struct.pack("<dI", float(t), int(n))
+                        + np.asarray(cloud, dtype="<f4").tobytes())
+                with open(self._tmp_path, "wb") as f:
+                    f.write(data)
+                os.replace(self._tmp_path, self._shm_path)
+                self._had_file = True
+            except Exception as e:
+                print(f"[DEPTH-MAP] dump error: {e}", flush=True)
+
+
 def fsm_poll_loop():
-    period = 1.0 / FSM_POLL_HZ
     while True:
+        # While suppression is armed, sample faster (8 Hz) so the ~1s firmware
+        # climb flip is caught ~4x before it self-reverts. The blocking RPC stays
+        # wrapped in a 1.0s timeout (unchanged); only the trailing sleep shortens,
+        # so a slow RPC degrades gracefully -- no busy-spin, no stacked calls.
+        hz = SUPPRESS_POLL_HZ if state.suppress_autoclimb else FSM_POLL_HZ
+        period = 1.0 / hz
         result = call_with_timeout(reader.GetFsmId, 1.0)
         if result is not None:
             code, fsm = result
@@ -569,6 +829,11 @@ def fsm_poll_loop():
                                if remote_watcher is not None else "unknown source")
                         print(f"[FSM-EXTERNAL] {old} ({fsm_name(old)}) "
                               f"-> {fsm} ({fsm_name(fsm)}) | source: {src}", flush=True)
+                        # Flat-ground mode: reverse an un-commanded climb. Reached
+                        # ONLY from this external branch, so a commanded climb (which
+                        # reads as ours) is never touched.
+                        if state.suppress_autoclimb and fsm == FSM_CLIMB:
+                            _suppress_autoclimb(old, fsm)
                     # If we left main_control, we lost continuous gait state
                     if fsm != FSM_MAIN_CONTROL:
                         state.gait_enabled = False
@@ -706,6 +971,11 @@ def enter_mode(new_mode):
     if pacer is not None:
         pacer.reset()    # never resume mid-pulse on a fresh walk session
 
+    # Capture the mode we're LEAVING before overwriting it -- a routine name here
+    # (dance/probe/climb, not a VALID_MODE) is how we know to exit via 802 even if
+    # a probe landed in an fsm id we never registered.
+    prev_mode = state.mode
+
     # Set transitioning BEFORE mode so the FSM poller's mode-sync can't briefly
     # overwrite our just-set intent in the gap between these two assignments.
     state.transitioning = True
@@ -719,8 +989,13 @@ def enter_mode(new_mode):
         # Leaving a routine (dance 503 / climb 812) only works back to
         # main_control (802), never ready_stand -- so exit to 802 first, then let
         # the normal handling below take over (walk = done; stand goes on to damp).
-        if state.fsm_id in MODE_COMBO_FSMS and new_mode in ("stand", "walk"):
-            routine = MODE_COMBO_FSM_TO_NAME.get(state.fsm_id, "routine")
+        # Exit to main_control first when the robot is in a known routine FSM OR
+        # when we believe we're in a routine "mode" (state.mode is a dance/probe
+        # name, not a base mode) -- the latter recovers the robot even if a probe
+        # landed in an fsm id we never registered.
+        if new_mode in ("stand", "walk") and (state.fsm_id in ROUTINE_FSMS
+                                              or prev_mode not in VALID_MODES):
+            routine = ROUTINE_FSM_TO_NAME.get(state.fsm_id, prev_mode or "routine")
             print(f"[MODE] leaving {routine} (FSM {state.fsm_id}) -> main_control",
                   flush=True)
             client.SetFsmId(FSM_MAIN_CONTROL)
@@ -870,31 +1145,68 @@ def apply_cmd(name):
             print(f"[CMD] {name}: fsm_id not captured -- run "
                   f"scripts/capture_combo_fsm.py, then set mode_combos.{name}."
                   f"fsm_id in config/mapping.yaml", flush=True)
-        elif not _mode_lock.acquire(blocking=False):
-            # Serialize with enter_mode (same lock): a combo must not race a mode
-            # transition's state.mode write, or command_loop could read mode=="walk"
-            # while the robot FSM is a combo and drive velocity into it.
-            print(f"[CMD] {name} ignored -- mode transition in progress", flush=True)
         else:
-            try:
-                # Hand the whole body to this behavior: stop driving so the velocity
-                # keepalive can't fight the routine. mode != "walk" makes the command
-                # loop go quiet; the FSM poller leaves it (no FSM_TO_UI entry).
-                state.vx = state.vy = state.vyaw = 0.0
-                state.is_moving = False
-                state.gait_enabled = False
-                state.mode = name
-                print(f"[CMD] {name} -> SetFsmId({fsm})", flush=True)
-                note_fsm_intent(fsm)     # dashboard-commanded combo (not external)
-                try:
-                    client.SetFsmId(fsm)
-                except Exception as e:
-                    print(f"[mode combo error: {e}]", flush=True)
-            finally:
-                _mode_lock.release()
+            fire_whole_body(name, fsm)
 
     else:
         print(f"[cmd error: unknown '{name}']", flush=True)
+
+
+def fire_whole_body(name, fsm, require_upright=False):
+    """Hand the whole body to a routine FSM (climb / dance / a Dance Lab probe).
+
+    Serialized with enter_mode via _mode_lock: a routine must not race a mode
+    transition's state.mode write, or command_loop could read mode=="walk" while
+    the robot is in a routine FSM and drive velocity into it. Setting state.mode
+    to `name` (not a VALID_MODE) makes command_loop go quiet; the FSM poller
+    leaves it (no FSM_TO_UI entry). Registers the id as a routine so Stand/Walk
+    exit it via main_control. Returns True if the SetFsmId was issued.
+
+    require_upright: refuse unless the robot is settled + upright (stand/walk) and
+    not locomoting -- the safety gate for operator-fired dances and probes.
+    """
+    if not _valid_dance_id(fsm):
+        print(f"[CMD] {name} refused -- {fsm!r} is not a valid dance id "
+              f"(base modes 0/1/4/802 and out-of-range are rejected)", flush=True)
+        return False
+    if require_upright and (state.mode not in ("stand", "walk")
+                            or state.transitioning or _locomoting()):
+        print(f"[CMD] {name} refused -- robot not upright/settled "
+              f"(mode={state.mode} moving={_locomoting()})", flush=True)
+        return False
+    if not _mode_lock.acquire(blocking=False):
+        print(f"[CMD] {name} ignored -- mode transition in progress", flush=True)
+        return False
+    try:
+        register_routine_fsm(fsm, name)   # so Stand/Walk can exit it via 802
+        state.vx = state.vy = state.vyaw = 0.0
+        state.is_moving = False
+        state.gait_enabled = False
+        # Mark transitioning BEFORE the mode write so fsm_poll_loop's mode-sync
+        # can't revert state.mode back to "walk" while the robot is still reading
+        # the OLD fsm (802) mid-handoff -- which would let the velocity keepalive
+        # fight the routine. Cleared once the handoff settles (below).
+        state.transitioning = True
+        state.mode = name
+        print(f"[CMD] {name} -> SetFsmId({fsm})", flush=True)
+        note_fsm_intent(fsm)     # dashboard-commanded routine (not external)
+        try:
+            client.SetFsmId(fsm)
+        except Exception as e:
+            print(f"[mode combo error: {e}]", flush=True)
+    finally:
+        # Release the lock BEFORE waiting so an abort (operator hits Stand on a bad
+        # probe) is never blocked for the settle window.
+        _mode_lock.release()
+    # Wait for the robot to actually enter the routine, then drop the transitioning
+    # flag -- but only if WE still own this handoff (a concurrent Stand/Walk that
+    # grabbed the lock now owns state.mode + its own transitioning; don't stomp it).
+    try:
+        wait_for_fsm(fsm, timeout=5.0)
+    finally:
+        if state.mode == name:
+            state.transitioning = False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +1278,10 @@ def make_state_msg():
         # dashboard button reflects reality and shows what the robot just reacted to.
         "greeting_mode": state.greeting_mode,
         "greeting_status": state.greeting_status,
+        # Flat-ground auto-climb-suppression toggle. Carried on every broadcast +
+        # the on-connect send, so the UI reflects the current (possibly auto-
+        # disabled) value on all clients.
+        "suppress_autoclimb": state.suppress_autoclimb,
     }
 
 
@@ -1198,7 +1514,7 @@ async def broadcast_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf
+    global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf, depth_dumper
     global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
@@ -1297,15 +1613,24 @@ async def lifespan(app: FastAPI):
         print("Obstacle perception node started (viz always-on).", flush=True)
 
     # D435i near-ground depth fusion: reuses the dashboard's RealSense cloud (lidar)
-    # to fill the Mid-360's near-ground forward blind zone. Enabled via obstacle.yaml
-    # (depth_fusion.enabled: true) + self-gated by the frame-sanity check; the guard
-    # mixes its per-sector ring into the fused ring, min-only (never clears a reading).
+    # to fill the Mid-360's near-ground forward blind zone. Always on (no UI toggle) +
+    # self-gated by the frame-sanity check; the guard mixes its per-sector ring into
+    # the fused ring, min-only (never clears a reading).
     depth_nf = DepthNearField(lidar_source=lidar, cfg_path=str(OBSTACLE_CFG_PATH),
                               ls_mount_height=LIDAR_CAMERA_HEIGHT)
+    depth_nf.set_enabled(True)   # always on -- no UI toggle to disable it
     depth_nf.start()
     guard.set_depth_source(depth_nf.front_near_m)
     guard.set_depth_ring_source(depth_nf.front_ring)   # per-sector ring -> merged into lidar ring
     print(f"Depth near-field fusion ready ({'ON' if depth_nf.enabled else 'OFF'}; D435i).",
+          flush=True)
+
+    # Depth-for-map dumper: while mapping, writes DepthNearField's full leveled cloud to
+    # DEPTH_MAP_SHM for map_bridge (domain 99) to fuse into the saved/live map. Self-gated
+    # on mapper.active, so it's safe to just run it from startup -- no-op until mapping starts.
+    depth_dumper = DepthMapDumper(depth_nf, mapper)
+    depth_dumper.start()
+    print(f"Depth-for-map dumper ready (writes {DEPTH_MAP_SHM} only while mapping).",
           flush=True)
 
     # Velocity shaper: jerk/accel-limited smoothing of the teleop command (smooth walk).
@@ -1331,7 +1656,9 @@ async def lifespan(app: FastAPI):
     # =========================================================================
     # Interactive "wave back" greeting demo (gesture_reactor.GreetingService).
     # OPTIONAL and OFF by default. The service runs its own daemon thread that reads the
-    # pose container's per-person skeletons from POSE_TRACKS, classifies human gestures,
+    # pose container's per-person skeletons from POSE_TRACKS -- and, when available, the hand
+    # landmarks from HANDS_TRACKS (palm fusion, so a wave still reads when the short robot
+    # can't see the head/shoulders) -- classifies human gestures,
     # and -- ONLY while greeting mode is ON *and* it is safe right now -- fires the mapped
     # robot gesture through the EXISTING serialized command path (it sets state.pending_cmd,
     # which command_loop drains into apply_cmd under _arm_lock). No deep surgery: every
@@ -1385,6 +1712,7 @@ async def lifespan(app: FastAPI):
             "track_id": ev.get("track_id"),
             "human": ev.get("human", ev.get("gesture")),
             "robot": ev.get("robot_gesture"),
+            "source": ev.get("source"),   # "skeleton" or "skeleton+palm" -- tuning visibility
             "fired": _greeting_safe(),
             "ts": ev.get("t", time.time()),
             "box": ev.get("box"), "w": ev.get("w"), "h": ev.get("h"),
@@ -1398,6 +1726,7 @@ async def lifespan(app: FastAPI):
 
     greeting = GreetingService(
         tracks_path=POSE_TRACKS, demand_path=POSE_DEMAND,
+        hands_path=HANDS_TRACKS, hands_demand_path=HANDS_DEMAND,
         enabled_fn=_greeting_enabled, safe_fn=_greeting_safe, fire_fn=_greeting_fire,
         on_event=_greeting_on_event, on_skip=_greeting_on_skip)
     greeting.start()
@@ -1437,6 +1766,11 @@ async def lifespan(app: FastAPI):
     if depth_nf is not None:
         try:
             depth_nf.stop()
+        except Exception:
+            pass
+    if depth_dumper is not None:
+        try:
+            depth_dumper.stop()
         except Exception:
             pass
     if obstacle_mgr is not None:
@@ -1695,21 +2029,29 @@ async def hands_tracks():
 async def ws_lidar(ws: WebSocket):
     await ws.accept()
     print("[ws/lidar] client connected", flush=True)
-    live_period = 1.0 / LIDAR_STREAM_HZ
     map_period = 0.4   # map clouds are larger -> throttle harder
+    idle_period = 1.0  # nothing to stream -> just watch for the map appearing
     last_view = None
     try:
         while True:
-            # Show the map while mapping or when one is loaded; else the live cloud.
+            # Stream the FAST-LIO map while mapping is active or a map is loaded /
+            # has accumulated points. Otherwise send NOTHING here -- the raw D435i
+            # cloud (lidar.get_cloud()) is no longer streamed over this socket; the
+            # browser falls back to the always-on 'obstacle' telemetry (leveled
+            # sphere cloud) for its idle view instead. lidar.get_cloud() itself is
+            # untouched and still used by DepthNearField for depth-fusion guard logic.
             show_map = mapper is not None and (mapper.active or mapper.has_points())
-            cloud = mapper.get_map() if show_map else (lidar.get_cloud() if lidar else None)
-            view = "map" if show_map else "live"
+            view = "map" if show_map else "idle"
             if view != last_view:
                 await ws.send_text(json.dumps({"type": "lidar_meta", "view": view}))
                 last_view = view
-            if cloud is not None and len(cloud):
-                await ws.send_bytes(pack_cloud(cloud))
-            await asyncio.sleep(map_period if show_map else live_period)
+            if show_map:
+                cloud = mapper.get_map()
+                if cloud is not None and len(cloud):
+                    await ws.send_bytes(pack_cloud(cloud))
+                await asyncio.sleep(map_period)
+            else:
+                await asyncio.sleep(idle_period)
     except WebSocketDisconnect:
         print("[ws/lidar] client disconnected", flush=True)
     except Exception as e:
@@ -1718,7 +2060,7 @@ async def ws_lidar(ws: WebSocket):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    global control_owner_id
+    global control_owner_id, DANCES
     await ws.accept()
     clients.add(ws)
     client_meta[ws] = {"id": None, "label": None}
@@ -1731,6 +2073,8 @@ async def ws_endpoint(ws: WebSocket):
         "slow_scale": SLOW_SCALE,
         # which whole-body combos have a captured FSM id (-> button enabled)
         "mode_combos": {name: (fsm is not None) for name, fsm in MODE_COMBOS.items()},
+        # named dance catalog [{name, fsm_id, space_m, note}] for the Dance chooser
+        "dances": DANCES,
         # initial obstacle-guard UI flags (enabled [+ depth])
         "obstacle": (dict(guard.ui_config(), depth=depth_nf.telemetry())
                      if guard is not None and depth_nf is not None
@@ -1861,6 +2205,90 @@ async def ws_endpoint(ws: WebSocket):
             elif mtype == "cmd":
                 state.pending_cmd = msg.get("name", "")
 
+            elif mtype == "dance":
+                # Play a named catalog dance by its FSM id. Owner-only (reached only
+                # past the lock gate above). Fired in a thread so the blocking SetFsmId
+                # RPC never stalls the event loop; require_upright is the safety gate.
+                try:
+                    fsm = int(msg.get("fsm_id"))
+                except (TypeError, ValueError):
+                    fsm = None
+                entry = next((d for d in DANCES if d["fsm_id"] == fsm), None) if fsm is not None else None
+                if entry is not None:
+                    threading.Thread(target=fire_whole_body,
+                                     args=(entry["name"], entry["fsm_id"]),
+                                     kwargs={"require_upright": True},
+                                     daemon=True).start()
+                else:
+                    print(f"[DANCE] rejected unknown fsm_id {msg.get('fsm_id')!r} "
+                          f"(not in catalog)", flush=True)
+
+            elif mtype == "dance_probe":
+                # Dance Lab: SUPERVISED probe of a candidate FSM id. Same safety gate +
+                # threading as a named dance, but the id is arbitrary (unknown routine)
+                # -> register_routine_fsm (inside fire_whole_body) lets Stand/Walk recover
+                # it. _valid_dance_id rejects out-of-range AND base-mode ids (0/1/4/802).
+                fsm = msg.get("fsm_id")
+                if not _valid_dance_id(fsm):
+                    print(f"[DANCE-LAB] rejected probe id {fsm!r} "
+                          f"(base modes 0/1/4/802 and out-of-range not allowed)", flush=True)
+                else:
+                    fsm = int(fsm)
+                    print(f"[DANCE-LAB] supervised probe -> SetFsmId({fsm})", flush=True)
+                    threading.Thread(target=fire_whole_body,
+                                     args=(f"probe {fsm}", fsm),
+                                     kwargs={"require_upright": True},
+                                     daemon=True).start()
+
+            elif mtype == "dance_save":
+                # Dance Lab: persist a just-verified dance to the catalog (append or
+                # replace by fsm_id, verified=True), then rebroadcast so every client's
+                # chooser updates. Rejects base-mode ids via _valid_dance_id.
+                fsm = msg.get("fsm_id")
+                dname = (str(msg.get("name") or "").strip())[:40]
+                try:
+                    space = round(max(0.0, float(msg.get("space_m", 2.0))), 1)
+                except (TypeError, ValueError):
+                    space = 2.0
+                if not _valid_dance_id(fsm) or not dname:
+                    print(f"[DANCE-LAB] save rejected (fsm={fsm!r} name={dname!r})", flush=True)
+                else:
+                    fsm = int(fsm)
+                    cat = [d for d in DANCES if d["fsm_id"] != fsm]
+                    cat.append({"name": dname, "fsm_id": fsm, "space_m": space,
+                                "note": str(msg.get("note") or "")[:200], "verified": True})
+                    cat.sort(key=lambda d: d["fsm_id"])
+                    try:
+                        save_dances(cat)
+                        DANCES = cat
+                        register_routine_fsm(fsm, dname)
+                        print(f"[DANCE-LAB] saved '{dname}' (FSM {fsm}, ~{space} m)", flush=True)
+                        await broadcast({"type": "dances", "dances": DANCES})
+                    except OSError as e:
+                        print(f"[DANCE-LAB] save failed: {e}", flush=True)
+
+            elif mtype == "dance_delete":
+                # Dance Lab: remove a catalog entry (a dud candidate, or any tile) by
+                # fsm_id, persist, and rebroadcast. Does NOT unregister the routine FSM
+                # (harmless to leave; only affects log naming + exit recovery).
+                fsm = msg.get("fsm_id")
+                try:
+                    fsm = int(fsm)
+                except (TypeError, ValueError):
+                    fsm = None
+                if fsm is None or not any(d["fsm_id"] == fsm for d in DANCES):
+                    print(f"[DANCE-LAB] delete: no catalog entry for {msg.get('fsm_id')!r}",
+                          flush=True)
+                else:
+                    cat = [d for d in DANCES if d["fsm_id"] != fsm]
+                    try:
+                        save_dances(cat)
+                        DANCES = cat
+                        print(f"[DANCE-LAB] deleted dance FSM {fsm}", flush=True)
+                        await broadcast({"type": "dances", "dances": DANCES})
+                    except OSError as e:
+                        print(f"[DANCE-LAB] delete failed: {e}", flush=True)
+
             elif mtype == "greeting":
                 # Master toggle for the interactive wave-back demo. Turning it OFF resets
                 # the reactor so a pose held during the OFF window can't fire the instant it
@@ -1871,6 +2299,20 @@ async def ws_endpoint(ws: WebSocket):
                     state.greeting_status = ""
                     if greeting is not None:
                         greeting.reactor.reset()
+                await broadcast(make_state_msg())
+
+            elif mtype == "suppress_climb":
+                # Flat-ground/presentation toggle: arm/disarm dashboard-side
+                # reversal of the firmware's spontaneous climb. Owner-only (past the
+                # ownership gate above). Persists so the choice survives a restart,
+                # but ships/defaults OFF. A REAL climb will NOT happen while ON.
+                on = bool(msg.get("on"))
+                state.suppress_autoclimb = on
+                d = load_ui_settings()
+                d["suppress_autoclimb"] = on
+                save_ui_settings(d)
+                print(f"[SUPPRESS] auto-climb suppression "
+                      f"{'ON (flat-ground mode)' if on else 'off'}", flush=True)
                 await broadcast(make_state_msg())
 
             elif mtype == "map" and mapper is not None:
@@ -1905,8 +2347,6 @@ async def ws_endpoint(ws: WebSocket):
                     # Motion governing OFF only -- the perception node KEEPS running so
                     # the 2D/3D views stay live (it is paused solely for mapping).
                     if guard is not None: guard.set_enabled(False)
-                elif action == "depth_fusion" and depth_nf is not None:
-                    depth_nf.set_enabled(bool(msg.get("on")))
                 if guard is not None:
                     tm = guard.telemetry()
                     if depth_nf is not None:

@@ -94,7 +94,17 @@ DEFAULTS = {
     "self_half_width_m": 0.30,     # footprint self-mask: half-width (covers the leg stance)
     "self_mask_max_height_m": 0.6, # self-mask ONLY below this height above floor (legs/feet); overhead kept
     "min_cluster_points": 10,
-    "filter_alpha": 0.25,
+    "filter_alpha": 0.25,           # legacy symmetric EMA (kept for reference; wedges now use the asym filter)
+    # --- asymmetric per-direction wedge filter: "fast to fear, slow to trust" -----
+    #   A CLOSER raw reading (a real obstacle approaching) is adopted (near-)instantly so
+    #   the stop latency is UNCHANGED; a FARTHER raw reading (a Mid-360 false-CLEAR petal,
+    #   e.g. front 1.25 -> 1.75) is trusted only SLOWLY and is first clamped to a short
+    #   temporal MEDIAN of recent raws, so a lone single-frame far spike is rejected outright
+    #   -- frame-rate independent (the median is over frames, not seconds), so it survives the
+    #   CPU throttling that drops the frame rate under battery sag. Applies to all 4 wedges.
+    "wedge_near_alpha": 1.0,        # EMA weight when the new reading is CLOSER (1.0 = adopt instantly = fear)
+    "wedge_far_alpha": 0.05,        # EMA weight when the new reading is FARTHER (small = trust a far jump slowly)
+    "wedge_median_n": 5,           # temporal median window (frames) rejecting a single-frame far false-clear
     "ease_scale": True,
     "tight_open_m": 1.2,
     "tight_min": 0.7,
@@ -157,6 +167,14 @@ DEFAULTS = {
     "viz_win_s": 1.0,              # 3D-sphere accumulation window (s); ~5 frames @ 10 Hz
     "viz_win_max_frames": 16,      # hard cap on buffered sphere frames
     "viz_voxel_m": 0.10,           # sphere voxel-grid cell (m): stable positions + bounded count
+    # --- 3D-sphere voxel TIME-PERSISTENCE (frame-rate independent steadiness) -----
+    #   At ~5 Hz the viz_win_s union is only ~5 sparse Mid-360 petals, so boundary voxels
+    #   flip on/off ("appear/disappear"). Instead we STAMP each occupied voxel cell with the
+    #   time it was last seen and EMIT every cell seen within viz_hold_s -- independent of how
+    #   many frames landed this window. Mirrors the log-odds ring's decay, but simpler (one
+    #   stamp per cell). A hard cap bounds memory. Cosmetic only (no safety path reads these).
+    "viz_hold_s": 0.8,             # emit any voxel cell seen within this many seconds (0 = current frame only)
+    "viz_cell_cap": 6000,          # hard cap on persisted cells (memory); over cap drops the OLDEST-seen first
     "viz_mount_pitch_deg": 28.0,   # FIXED head nose-up tilt corrected in the sphere (measured ~28 deg).
                                    #   Raise if the floor still dips toward the FRONT; lower if it dips toward the BACK.
     "viz_mount_roll_deg": 0.0,     # FIXED head roll corrected in the sphere (+ = right side down); usually ~0
@@ -292,6 +310,11 @@ class ObstacleNode(Node):
         self.self_mask_max_h = float(c.get("self_mask_max_height_m", 0.6))
         self.k_cluster = max(1, int(c["min_cluster_points"]))
         self.alpha = float(c["filter_alpha"])
+        # asymmetric wedge filter ("fast to fear, slow to trust"): near/far EMA weights
+        # + a per-direction temporal-median window rejecting a single-frame far false-clear.
+        self.wedge_near_alpha = clamp(float(c.get("wedge_near_alpha", 1.0)), 0.0, 1.0)
+        self.wedge_far_alpha = clamp(float(c.get("wedge_far_alpha", 0.05)), 0.0, 1.0)
+        self.wedge_median_n = max(1, int(c.get("wedge_median_n", 5)))
         self.ease = bool(c["ease_scale"])
         self.tight_open = float(c["tight_open_m"])
         self.tight_min = float(c["tight_min"])
@@ -315,6 +338,11 @@ class ObstacleNode(Node):
         self.viz_win_s = max(0.0, float(c.get("viz_win_s", 1.0)))
         self.viz_win_max = max(1, int(c.get("viz_win_max_frames", 16)))
         self.viz_voxel_m = max(0.01, float(c.get("viz_voxel_m", 0.10)))
+        # voxel TIME-PERSISTENCE: cell key (i,j,k) -> (last_seen_stamp, count). Emit every
+        # cell seen within viz_hold_s so the sphere is steady at ANY (low/variable) frame rate.
+        self.viz_hold_s = max(0.0, float(c.get("viz_hold_s", 0.8)))
+        self.viz_cell_cap = max(100, int(c.get("viz_cell_cap", 6000)))
+        self._viz_cells = {}
         self.viz_floor_clip_m = max(0.0, float(c.get("viz_floor_clip_m", 0.0)))
         # sphere leveling: rotate the exported cloud by a FIXED mount-tilt plane so the
         # floor sits flat at z=0 (see _viz_level). The head is bolted nose-up at a
@@ -353,10 +381,15 @@ class ObstacleNode(Node):
 
         # --- per-frame state --------------------------------------------------
         self.seq = 0
-        self.front_filt = None        # EMA of the front distance (None until first reading)
-        self.back_filt = None         # EMA of the back distance
-        self.left_filt = None         # EMA of the left distance
-        self.right_filt = None        # EMA of the right distance
+        self.front_filt = None        # asym-filtered front distance (None until first reading)
+        self.back_filt = None         # asym-filtered back distance
+        self.left_filt = None         # asym-filtered left distance
+        self.right_filt = None        # asym-filtered right distance
+        # per-direction recent-raw ring buffers feeding the far-branch temporal median.
+        self._front_hist = deque(maxlen=self.wedge_median_n)
+        self._back_hist = deque(maxlen=self.wedge_median_n)
+        self._left_hist = deque(maxlen=self.wedge_median_n)
+        self._right_hist = deque(maxlen=self.wedge_median_n)
         self.first_frame = True       # gate the one-shot mount-frame sanity check
         self.floor_abc = None         # last fitted floor plane (a, b, c), for the sanity print
 
@@ -539,13 +572,15 @@ class ObstacleNode(Node):
         right_m = self._robust_nearest(horiz[(ang <= -45.0) & (ang > -135.0)])
         back_m = self._robust_nearest(horiz[np.abs(ang) >= 135.0])
 
-        # ---- 4. per-direction EMA distances -> smooth scales + tight_factor -
-        # When a direction is clear, feed obstacle_range_m so its filter relaxes
-        # back toward "open" instead of sticking at the last close reading.
-        self.front_filt = self._ema(self.front_filt, front_m)
-        self.back_filt = self._ema(self.back_filt, back_m)
-        self.left_filt = self._ema(self.left_filt, left_m)
-        self.right_filt = self._ema(self.right_filt, right_m)
+        # ---- 4. per-direction asymmetric-filtered distances -> scales + tight -
+        # "Fast to fear, slow to trust": a CLOSER reading is adopted instantly (stop
+        # latency preserved); a FARTHER reading (false-CLEAR petal) is trusted slowly
+        # and a lone one-frame far spike is median-rejected. When a direction is clear,
+        # feed obstacle_range_m so its filter relaxes back toward "open" (slowly).
+        self.front_filt = self._asym_filter(self.front_filt, front_m, self._front_hist)
+        self.back_filt = self._asym_filter(self.back_filt, back_m, self._back_hist)
+        self.left_filt = self._asym_filter(self.left_filt, left_m, self._left_hist)
+        self.right_filt = self._asym_filter(self.right_filt, right_m, self._right_hist)
         front_filt = self.front_filt
         back_filt = self.back_filt
         left_filt = self.left_filt
@@ -653,6 +688,32 @@ class ObstacleNode(Node):
         if state is None:
             return feed
         return self.alpha * feed + (1.0 - self.alpha) * state
+
+    def _asym_filter(self, state, raw, hist):
+        """One asymmetric per-direction step -- "fast to fear, slow to trust".
+
+        A CLOSER reading (feed <= state: a real obstacle approaching) is adopted
+        (near-)instantly via wedge_near_alpha (default 1.0), so the stop latency is
+        UNCHANGED and a direction is never falsely believed clear. A FARTHER reading
+        (feed > state: a potential Mid-360 false-CLEAR petal, e.g. front 1.25 -> 1.75)
+        is trusted only SLOWLY (wedge_far_alpha) AND first clamped to the temporal
+        MEDIAN of the last wedge_median_n raws -- so a lone single-frame far spike is
+        rejected outright (the median stays near the close value) no matter the frame
+        rate. A null (clear) reading feeds obstacle_range_m. Seeds on first use."""
+        feed = raw if raw is not None else self.range_m
+        hist.append(feed)
+        if state is None:
+            return feed
+        if feed <= state:
+            a = self.wedge_near_alpha                    # fast to fear: adopt the closer reading
+            return a * feed + (1.0 - a) * state
+        # farther: reject a one-frame far outlier via the median, then creep up slowly.
+        med = float(np.median(hist))
+        target = med if med < feed else feed             # median never exceeds the raw here
+        if target < state:
+            target = state                               # far branch must not pull the state DOWN
+        a = self.wedge_far_alpha
+        return a * target + (1.0 - a) * state
 
     def _dist_scale(self, d):
         """Filtered distance -> 0..1 speed scale. Above stop_at the scale never drops
@@ -1062,50 +1123,65 @@ class ObstacleNode(Node):
     def _viz_points(self):
         """Stabilised kept-obstacle points for the dashboard 3D sphere.
 
-        Unions the last viz_win_s of LEVELED frames (pushed by _viz_push), VOXEL-
-        downsamples to a fixed viz_voxel_m grid, and returns a FLAT [x0,y0,z0, ...]
-        list, x fwd / y left (both horizontal), z = height above the floor (floor 0).
+        LEVELS the last viz_win_s of frames (pushed by _viz_push) to a fixed viz_voxel_m
+        grid, then STAMPS each occupied cell with the time it was last seen and EMITS
+        every cell seen within viz_hold_s -- so the cloud is steady at ANY (low or
+        variable) frame rate, not just when many petals happen to land in one window.
+        Returns a FLAT [x0,y0,z0, ...] list, x fwd / y left (both horizontal), z = height
+        above the floor (floor 0).
 
-        The voxel grid snaps points to stable cell centres and the window keeps them
-        alive across the Mid-360's non-repetitive petals, so the sphere stops
-        flickering (measured Jaccard 0.42 -> ~0.89, one-frame voxels 27% -> 0%) and,
-        via floor-fit leveling, stops looking tilted. Purely cosmetic: no safety gating
-        reads these points (wedges/ring/guard use the per-frame x/y/z + ring computed
-        earlier). Capped at viz_max_points (drops the sparsest cells first)."""
-        now = time.time()
+        Voxel time-persistence mirrors the log-odds ring's decay but simpler (one stamp
+        per cell); a hard cap (viz_cell_cap) bounds memory. This kills the frame-to-frame
+        "appear/disappear" that the plain viz_win_s union suffers at ~5 Hz (only ~5 sparse
+        Mid-360 petals -> boundary voxels flip). Purely cosmetic: no safety gating reads
+        these points (wedges/ring/guard use the per-frame x/y/z + ring computed earlier).
+        Emitted payload capped at viz_max_points (drops the sparsest cells first)."""
+        now = time.time()                                # SAME clock as the frame stamps
+        cell = self.viz_voxel_m
+        # prune the leveling window (feeds _viz_level's fixed-tilt rotation + floor->0 z0).
         if self.viz_win_s > 0.0:
             cutoff = now - self.viz_win_s
             while len(self._viz_accum) > 1 and self._viz_accum[0][0] < cutoff:
                 self._viz_accum.popleft()
-        if not self._viz_accum:
+        # STAMP this window's occupied cells into the persistence store (leveling preserved).
+        n_raw = 0
+        leveldiag = None
+        if self._viz_accum:
+            raw = np.concatenate([p for _, p in self._viz_accum], axis=0)
+            n_raw = raw.shape[0]
+            # LEVEL by the fixed mount tilt + anchor the floor to z=0 (unchanged).
+            pts, leveldiag = self._viz_level(raw)
+            # Optional below-floor clip (DEFAULT OFF): points below the leveled floor are
+            # REAL small floor objects -- they only dip below z=0 via RESIDUAL leveling
+            # tilt, so do NOT clip them (would hide real obstacles); level better instead.
+            if self.viz_floor_clip_m > 0.0:
+                pts = pts[pts[:, 2] > -self.viz_floor_clip_m]
+            if pts.shape[0]:
+                keys = np.floor(pts / cell).astype(np.int64)
+                uk, counts = np.unique(keys, axis=0, return_counts=True)
+                for k, cnt in zip(map(tuple, uk.tolist()), counts.tolist()):
+                    self._viz_cells[k] = (now, cnt)      # (last-seen stamp, this-frame count)
+        # TIME-PERSISTENCE decay: keep only cells seen within viz_hold_s (steady @ any rate).
+        hold_cut = now - self.viz_hold_s
+        if self._viz_cells:
+            self._viz_cells = {k: v for k, v in self._viz_cells.items() if v[0] >= hold_cut}
+        # hard memory cap: if still oversized, keep the most-recently-seen cells.
+        if len(self._viz_cells) > self.viz_cell_cap:
+            kept = sorted(self._viz_cells.items(), key=lambda kv: kv[1][0],
+                          reverse=True)[:self.viz_cell_cap]
+            self._viz_cells = dict(kept)
+        if not self._viz_cells:
             self._viz_dbg = None
             return []
-        raw = np.concatenate([p for _, p in self._viz_accum], axis=0)
-        n_raw = raw.shape[0]
-        # LEVEL the accumulated cloud to the surface objects rest on (self-correcting
-        # low-percentile plane -- see _viz_level). Floor ends flat at z=0.
-        pts, leveldiag = self._viz_level(raw)
-        # Optional below-floor clip (DEFAULT OFF): points below the leveled floor are
-        # REAL small floor objects (they render correctly on the floor in COLUMNS mode)
-        # -- they only dip below z=0 because of RESIDUAL leveling tilt. So do NOT clip
-        # them (would hide real obstacles); the fix is to level better, not to clip.
-        if self.viz_floor_clip_m > 0.0:
-            pts = pts[pts[:, 2] > -self.viz_floor_clip_m]
-            if pts.shape[0] == 0:
-                self._viz_dbg = None
-                return []
-        # voxel-grid downsample: one representative (cell centre) per occupied cell.
-        cell = self.viz_voxel_m
-        keys = np.floor(pts / cell).astype(np.int64)
-        _, uidx, counts = np.unique(
-            keys, axis=0, return_index=True, return_counts=True)
-        centres = (keys[uidx].astype(np.float64) + 0.5) * cell
+        items = list(self._viz_cells.items())
         # bound the payload: keep the DENSEST cells (most returns = most real).
-        if self.viz_max_points > 0 and centres.shape[0] > self.viz_max_points:
-            keep = np.argpartition(counts, -self.viz_max_points)[-self.viz_max_points:]
-            centres = centres[keep]
+        if self.viz_max_points > 0 and len(items) > self.viz_max_points:
+            items.sort(key=lambda kv: kv[1][1], reverse=True)
+            items = items[:self.viz_max_points]
+        centres = (np.array([k for k, _ in items], dtype=np.float64) + 0.5) * cell
         self._viz_dbg = {
             "n_raw": int(n_raw), "n_out": int(centres.shape[0]),
+            "cells": len(self._viz_cells),               # persisted-cell count (time-held)
             "frames": len(self._viz_accum), "z0": round(float(self._viz_z0 or 0.0), 2),
         }
         self._viz_dbg.update(leveldiag or {})

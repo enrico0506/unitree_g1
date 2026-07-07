@@ -20,12 +20,16 @@ import pytest
 
 from gesture_reactor import (
     GestureReactor, GreetingService, ReactorConfig, classify, describe, GESTURE_TO_ROBOT,
-    _kp, _frame_scale, R_EAR, R_WRI,
+    _kp, _frame_scale, _hand_open, _swings, R_EAR, R_WRI,
 )
 import sim_gestures as sg
 from sim_gestures import (
     make_skeleton, feed, fired_gestures, wave_sequence, raise_sequence,
     idle_sequence, walking_sequence, reach_sequence,
+    make_hand, hands_for_wave, no_shoulders,
+    shoulder_level_wave_sequence, subtle_wave_sequence, clap_sequence, gesticulate_sequence,
+    held_raised_jitter_sequence, stir_sequence, nod_sequence, drift_sequence, tremor_sequence,
+    clear_wave_at_distance_sequence,
     DT, CX, CY, SW,
 )
 
@@ -61,8 +65,9 @@ def test_wave_left_arm_classifies():
     assert classify(history_from(wave_sequence(arm="left"), CFG), CFG) == "wave"
 
 
-def test_raise_hand_classifies():
-    assert classify(history_from(raise_sequence(), CFG), CFG) == "raise_hand"
+def test_raise_hand_no_longer_classifies():
+    # Auto high-five removed: a still raised hand must classify as nothing now.
+    assert classify(history_from(raise_sequence(), CFG), CFG) is None
 
 
 def test_idle_classifies_none():
@@ -76,19 +81,12 @@ def test_walking_classifies_none():
 
 
 def test_static_reach_classifies_none():
-    # Arm up but not oscillating and not above the head: neither wave nor raise_hand.
+    # Arm up but not oscillating: not a wave.
     assert classify(history_from(reach_sequence(), CFG), CFG) is None
 
 
 def test_single_frame_never_fires():
     assert classify(history_from(wave_sequence(n=1), CFG), CFG) is None
-
-
-def test_raise_is_not_a_wave_and_vice_versa():
-    # Guards the mutual-exclusion the precedence relies on: a still raised hand is never a
-    # wave (no oscillation), and an oscillating wrist below the head is never a raise.
-    assert classify(history_from(raise_sequence(), CFG), CFG) != "wave"
-    assert classify(history_from(wave_sequence(), CFG), CFG) != "raise_hand"
 
 
 # =============================================================== reactor: firing
@@ -97,10 +95,9 @@ def test_reactor_fires_wave_once():
     assert f.count("wave") == 1
 
 
-def test_reactor_fires_each_gesture():
-    for seq, want in ((wave_sequence(), "wave"),
-                      (raise_sequence(), "raise_hand")):
-        assert fired_gestures(feed(GestureReactor(CFG), seq)) == [want]
+def test_reactor_fires_only_wave():
+    # The sole gesture: a wave fires exactly one 'wave' event and nothing else.
+    assert fired_gestures(feed(GestureReactor(CFG), wave_sequence())) == ["wave"]
 
 
 def test_continuous_wave_debounced_to_one():
@@ -246,9 +243,145 @@ def test_gesture_to_robot_mapping_complete():
     # response must be a cmd the controller's apply_cmd already knows (guards silent typos).
     known_cmds = {"wave", "shake", "high_five", "hug", "heart", "clap", "high_wave",
                   "kiss", "hands_up", "release_arm"}
-    assert set(GESTURE_TO_ROBOT) == {"wave", "raise_hand"}
+    assert set(GESTURE_TO_ROBOT) == {"wave"}
     for robot_cmd in GESTURE_TO_ROBOT.values():
         assert robot_cmd in known_cmds
+
+
+# =============================================================== wave tiers + palm fusion
+# The G1 is short: a normal wave is often at SHOULDER LEVEL (hand not raised high), and a
+# close person's head + shoulders drop out of frame. Admission is elbow-based (forearm
+# raised); a CLEAR sweep fires on the skeleton alone at any height; a SUBTLE (small) sweep
+# needs open-palm corroboration; two raised oscillating arms are vetoed (clap).
+def test_full_wave_fires_without_hands():
+    # Regression: a clear overhead wave still fires with NO hand feed at all.
+    assert fired_gestures(feed(GestureReactor(CFG), wave_sequence())) == ["wave"]
+
+
+def test_strong_wave_tagged_skeleton():
+    ev = feed(GestureReactor(CFG), wave_sequence())[0]
+    assert ev["source"] == "skeleton"
+
+
+def test_shoulder_level_wave_fires_alone():
+    # THE reported miss: a normal wave at shoulder height (hand not raised high) now fires on
+    # the skeleton alone via the elbow-based raised test.
+    events = feed(GestureReactor(CFG), shoulder_level_wave_sequence())
+    assert fired_gestures(events).count("wave") == 1
+    assert events[0]["source"] == "skeleton"
+
+
+def test_shoulderless_clear_wave_fires_alone():
+    # Partial body (shoulders out of frame) + a clear sweep -> fires alone (elbow reference).
+    assert fired_gestures(feed(GestureReactor(CFG), no_shoulders(wave_sequence()))).count("wave") == 1
+
+
+def test_subtle_wave_alone_does_not_fire():
+    # A small-amplitude wave is a WEAK candidate; with no palm it must NOT fire.
+    assert feed(GestureReactor(CFG), subtle_wave_sequence()) == []
+
+
+def test_subtle_wave_with_open_palm_fires():
+    seq = subtle_wave_sequence()
+    hands = hands_for_wave(subtle_wave_sequence(), is_open=True)
+    events = feed(GestureReactor(CFG), seq, hand_frames=hands)
+    assert fired_gestures(events).count("wave") == 1
+    assert events[0]["source"] == "skeleton+palm"
+
+
+def test_subtle_wave_with_fist_does_not_fire():
+    seq = subtle_wave_sequence()
+    fists = hands_for_wave(subtle_wave_sequence(), is_open=False)
+    assert feed(GestureReactor(CFG), seq, hand_frames=fists) == []
+
+
+def test_subtle_wave_stray_hand_does_not_corroborate():
+    # An open oscillating palm far from the wrist (assoc gate) can't validate the weak wave.
+    seq = subtle_wave_sequence()
+    stray = [{"w": 640, "h": 480, "items": [make_hand(CX + 3 * SW + 12 * math.sin(i), CY)]}
+             for i in range(len(seq))]
+    assert feed(GestureReactor(CFG), seq, hand_frames=stray) == []
+
+
+def test_subtle_wave_hands_disabled_does_not_fire():
+    # With fusion off, a subtle wave can't be corroborated -> never fires.
+    cfg = ReactorConfig(use_hands=False)
+    seq = subtle_wave_sequence()
+    hands = hands_for_wave(subtle_wave_sequence(), is_open=True)
+    assert feed(GestureReactor(cfg), seq, hand_frames=hands) == []
+
+
+def test_clap_is_vetoed():
+    # Both forearms raised + oscillating -> bimanual veto -> no wave.
+    assert feed(GestureReactor(CFG), clap_sequence()) == []
+
+
+def test_single_sweep_reach_does_not_fire():
+    # One lateral sweep (rev <= 1) is a reach / conversational gesture, not a wave.
+    assert feed(GestureReactor(CFG), gesticulate_sequence()) == []
+
+
+def test_hand_open_detects_open_vs_fist():
+    assert _hand_open(make_hand(300, 200, is_open=True)["landmarks"]) is True
+    assert _hand_open(make_hand(300, 200, is_open=False)["landmarks"]) is False
+
+
+# =============================================================== jitter / non-wave robustness
+# The reported on-robot false positive: a raised-but-HELD hand (palm down) fired because pose
+# keypoints jitter a few px/frame and at distance the body scale is small, so that noise faked
+# reversals + amplitude. The hysteresis swing floor (absolute px) + horizontal-dominance +
+# rate-cap must reject a whole family of non-wave movements while keeping real waves.
+def test_swings_ignores_jitter_but_counts_a_wave():
+    import random as _r
+    rng = _r.Random(3)
+    held = [100.0 + rng.uniform(-5, 5) for _ in range(20)]        # jitter around a held position
+    rev_h, sw_h = _swings(held, 14.0)
+    assert rev_h == 0 and sw_h < 14.0
+    wave = [100.0 + 30 * math.sin(2 * math.pi * 1.3 * i * 0.08) for i in range(20)]
+    rev_w, sw_w = _swings(wave, 14.0)
+    assert rev_w >= 2 and sw_w > 40
+
+
+def test_held_raised_jitter_does_not_fire():
+    # A raised, HELD hand at distance with pose jitter -> no reversal clears the swing floor.
+    assert feed(GestureReactor(CFG), held_raised_jitter_sequence()) == []
+
+
+def test_held_raised_jitter_with_open_palm_does_not_fire():
+    # The reported bug end-to-end: held raised hand + jitter + a corroborating open-palm feed.
+    seq = held_raised_jitter_sequence()
+    hands = hands_for_wave(held_raised_jitter_sequence(), is_open=True)
+    assert feed(GestureReactor(CFG), seq, hand_frames=hands) == []
+
+
+def test_held_closed_fist_jitter_does_not_fire():
+    seq = held_raised_jitter_sequence()
+    fists = hands_for_wave(held_raised_jitter_sequence(), is_open=False)
+    assert feed(GestureReactor(CFG), seq, hand_frames=fists) == []
+
+
+def test_circular_stir_does_not_fire():
+    # x is a real sine but y co-moves (a circle) -> horizontal-dominance rejects it.
+    assert feed(GestureReactor(CFG), stir_sequence()) == []
+
+
+def test_vertical_nod_does_not_fire():
+    assert feed(GestureReactor(CFG), nod_sequence()) == []
+
+
+def test_monotonic_drift_does_not_fire():
+    # A slow one-way drift never retraces past the swing floor -> zero reversals.
+    assert feed(GestureReactor(CFG), drift_sequence()) == []
+
+
+def test_fast_tremor_does_not_fire():
+    # A fast (~4 Hz) shake clears the swing floor but exceeds the reversal-rate cap.
+    assert feed(GestureReactor(CFG), tremor_sequence()) == []
+
+
+def test_clear_wave_at_distance_still_fires():
+    # Hardening must not kill a clear wave far away (only tiny/subtle far waves are traded off).
+    assert fired_gestures(feed(GestureReactor(CFG), clear_wave_at_distance_sequence())).count("wave") == 1
 
 
 # =============================================================== GreetingService gate
@@ -274,7 +407,7 @@ def _drive(svc, frames, t0=100.0):
 def test_greeting_fires_robot_gesture_when_safe():
     svc, fired, skipped, events = _greeting(safe=lambda: True)
     _drive(svc, wave_sequence())
-    assert fired == [GESTURE_TO_ROBOT["wave"]]     # WaveHand cmd, once
+    assert fired == [GESTURE_TO_ROBOT["wave"]]     # working wave-back cmd (high_wave), once
     assert skipped == [] and len(events) == 1
 
 

@@ -149,14 +149,7 @@
       // Optimistic visual; server telemetry is authoritative and will correct.
       send({ type: "obstacle", action: enabled ? "disable" : "enable" });
     });
-    // Depth fusion is independent of the motion guard (toggle it to VALIDATE the D435i
-    // near-ground reading even with the guard off) -- so it is never greyed out.
-    el.depthBtn = makeBtn("obs-btn sub", "Depth fusion (D435i)", () => {
-      send({ type: "obstacle", action: "depth_fusion", on: !btnOn(el.depthBtn) });
-    });
-
     toggles.appendChild(el.primary);
-    toggles.appendChild(el.depthBtn);
     root.appendChild(toggles);
 
     // Readouts.
@@ -441,23 +434,20 @@
       : (mode !== "DISABLED" && mode !== "FAULT");
     setEnabledVisual(isEnabled);
 
-    // Depth fusion (D435i): toggle state + the validation readout (distance + pts).
+    // Depth fusion (D435i) is always on -- just render the validation readout.
     const depth = msg.depth;
-    if (depth && el.depthBtn) {
-      el.depthBtn.classList.toggle("on", !!depth.enabled);
-      if (el.depth) {
-        if (!depth.enabled) {
-          el.depth.textContent = "off";
-          el.depth.classList.add("obs-muted");
-        } else if (num(depth.front_near_m)) {
-          el.depth.textContent = depth.front_near_m.toFixed(2) + " m ("
-            + (depth.n_near || 0) + " pts)";
-          el.depth.classList.remove("obs-muted");
-        } else {
-          el.depth.textContent = (depth.live ? "clear" : "no depth") + " ("
-            + (depth.n_near || 0) + " pts)";
-          el.depth.classList.add("obs-muted");
-        }
+    if (depth && el.depth) {
+      if (!depth.enabled) {
+        el.depth.textContent = "off";
+        el.depth.classList.add("obs-muted");
+      } else if (num(depth.front_near_m)) {
+        el.depth.textContent = depth.front_near_m.toFixed(2) + " m ("
+          + (depth.n_near || 0) + " pts)";
+        el.depth.classList.remove("obs-muted");
+      } else {
+        el.depth.textContent = (depth.live ? "clear" : "no depth") + " ("
+          + (depth.n_near || 0) + " pts)";
+        el.depth.classList.add("obs-muted");
       }
     }
 

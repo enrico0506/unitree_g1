@@ -4,10 +4,10 @@
 The reactor's classifier is PURE (see gesture_reactor.classify), so it can be exercised
 end-to-end from SYNTHESIZED COCO-17 skeletons -- exactly the shape pose_service.py writes
 to /dev/shm/g1_pose_tracks.json ({w,h,items:[{id,name,box,kpts}]}, image pixels, y DOWN,
-conf 0-1). This file is the harness the demo is trusted on: it builds a waving arm, a
-raised hand, both-arms-up, and -- just as important -- NEGATIVE sequences (idle, walking,
-a static reach) that MUST NOT fire, feeds them through a real GestureReactor on a fake
-clock, and asserts the right gesture fires exactly ONCE (debounce) and idle fires nothing.
+conf 0-1). This file is the harness the demo is trusted on: it builds a waving arm and --
+just as important -- NEGATIVE sequences (idle, walking, a static reach, a still raised
+hand) that MUST NOT fire, feeds them through a real GestureReactor on a fake clock, and
+asserts the wave fires exactly ONCE (debounce) and everything else fires nothing.
 
 Everything is seeded/analytic, so a run is bit-for-bit reproducible: a green --selftest
 here is a green demo (given a live pose feed). The synthesis primitives are also imported
@@ -18,6 +18,7 @@ shoulder. All wrist heights below are written as `cy - k*sw` (k>0 == above centr
 
     python3 scripts/sim_gestures.py --selftest
 """
+import copy
 import math
 import random
 
@@ -101,7 +102,9 @@ def wave_sequence(n=22, freq=1.3, amp=0.25, arm="right", **kw):
 
 
 def raise_sequence(n=18, arm="right", **kw):
-    """RAISE_HAND: one wrist held STILL above the head top (above eyes/nose)."""
+    """NEGATIVE: one wrist held STILL above the head top (above eyes/nose). This was once a
+    valid gesture (the auto high-five); now that the auto high-five is removed it MUST fire
+    NOTHING -- kept as a negative fixture so a still raised hand can never trigger a response."""
     up = (CY - 0.95 * SW)                              # above head (nose is at -0.70 sw)
     seq = []
     for _ in range(n):
@@ -139,22 +142,211 @@ def reach_sequence(n=18, **kw):
     """NEGATIVE: one arm extended and held above the shoulder but BELOW the head, STILL.
 
     A tempting false positive -- the wrist IS above the shoulder -- but there is no
-    horizontal oscillation (fails WAVE) and it never clears the head (fails RAISE_HAND).
-    Proves the two positive gestures don't collapse into "arm is somewhat up"."""
+    horizontal oscillation, so it fails WAVE. Proves the wave detector doesn't collapse
+    into "arm is somewhat up"."""
     mid = (CY - 0.30 * SW)                              # above shoulder, below the head top
     return [make_skeleton(REST_L, (CX + 0.6 * SW, mid), **kw) for _ in range(n)]
 
 
+# ---------------------------------------------------------------- palm (hand) synthesis
+# MediaPipe hand-landmark order (see perception/hands/hand_detector.py): 0 wrist; 5/9/13/17
+# are the finger MCPs, 6/10/14/18 the PIPs, 8/12/16/20 the TIPs. We build the raw 21-point
+# wire format the hand feed writes, so tests exercise the reactor's palm fusion end-to-end.
+_HAND_FINGERS = ((8, 6), (12, 10), (16, 14), (20, 18))   # (tip, pip): index/middle/ring/pinky
+
+
+def make_hand(x, y, scale=40.0, is_open=True):
+    """One hand item {hand,score,landmarks:[[x,y,z]x21]} centered at (x, y) in SOURCE-frame
+    pixels (same frame as the skeleton). Open palm = finger tips reach far from the wrist; a
+    fist = tips curl in near it. `scale` is the palm length (wrist -> middle MCP) in pixels."""
+    lm = [[float(x), float(y), 0.0] for _ in range(21)]
+    lm[9] = [float(x), float(y - scale), 0.0]              # middle-MCP -> palm length ~= scale
+    reach = scale * (1.7 if is_open else 0.6)
+    for tip, pip in _HAND_FINGERS:
+        lm[pip] = [float(x), float(y - 0.9 * scale), 0.0]
+        lm[tip] = [float(x), float(y - reach), 0.0]
+    return {"hand": "Right", "score": 0.9, "landmarks": lm}
+
+
+def hands_for_wave(pose_seq, arm="right", is_open=True):
+    """A list of hand shm frames placing an (open) palm ON the waving wrist of each pose
+    frame -- the 'palm agrees with the skeleton' corroboration case. Same length as pose_seq."""
+    wri = R_WRI if arm == "right" else L_WRI
+    frames = []
+    for sk in pose_seq:
+        wx, wy = sk["kpts"][wri][0], sk["kpts"][wri][1]
+        frames.append({"w": FRAME_W, "h": FRAME_H,
+                       "items": [make_hand(wx, wy, is_open=is_open)]})
+    return frames
+
+
+def no_shoulders(pose_seq):
+    """Copies of the skeletons with BOTH shoulders dropped (conf 0) -- the SMALL-ROBOT case:
+    head + shoulders out of frame, so a wave must lean on the elbow-based raised test."""
+    out = []
+    for sk in pose_seq:
+        s = copy.deepcopy(sk)
+        s["kpts"][L_SHO] = [0.0, 0.0, 0.0]
+        s["kpts"][R_SHO] = [0.0, 0.0, 0.0]
+        out.append(s)
+    return out
+
+
+def shoulder_level_wave_sequence(n=22, freq=1.3, amp=0.28, arm="right", **kw):
+    """A natural wave held at SHOULDER height (wrist ~= shoulder.y, forearm bent up above the
+    elbow) -- the 'normal wave without raising the hand high' the old shoulder-anchored gate
+    missed. Fires on the elbow-based raised test."""
+    seq = []
+    for i in range(n):
+        t = i * DT
+        dx = amp * SW * math.sin(2 * math.pi * freq * t)
+        wy = CY                                     # shoulder line (make_skeleton shoulders at CY)
+        if arm == "right":
+            seq.append(make_skeleton(REST_L, (CX + 0.5 * SW + dx, wy), **kw))
+        else:
+            seq.append(make_skeleton((CX - 0.5 * SW + dx, wy), REST_R, **kw))
+    return seq
+
+
+def subtle_wave_sequence(n=26, freq=1.6, amp=0.11, arm="right", **kw):
+    """A SMALL-amplitude wave above the shoulder: clears the elbow raised test and has >=2
+    reversals, but its sweep is below the strict amp floor -> a WEAK candidate that fires
+    ONLY with palm corroboration."""
+    seq = []
+    for i in range(n):
+        t = i * DT
+        dx = amp * SW * math.sin(2 * math.pi * freq * t)
+        up = CY - 0.55 * SW
+        if arm == "right":
+            seq.append(make_skeleton(REST_L, (CX + 0.5 * SW + dx, up), **kw))
+        else:
+            seq.append(make_skeleton((CX - 0.5 * SW + dx, up), REST_R, **kw))
+    return seq
+
+
+def clap_sequence(n=20, freq=1.6, amp=0.30, **kw):
+    """NEGATIVE: BOTH forearms raised, both wrists oscillating toward/away from the body
+    centreline (a clap / two-handed gesticulation). Each arm alone looks wave-ish, so the
+    BIMANUAL VETO must suppress it."""
+    seq = []
+    for i in range(n):
+        t = i * DT
+        d = amp * SW * abs(math.sin(2 * math.pi * freq * t))
+        up = CY - 0.35 * SW
+        seq.append(make_skeleton((CX - 0.15 * SW - d, up), (CX + 0.15 * SW + d, up), **kw))
+    return seq
+
+
+def gesticulate_sequence(n=14, arm="right", **kw):
+    """NEGATIVE: one raised forearm making a SINGLE lateral sweep (one direction change) -- a
+    conversational gesture / reach, not a wave. rev <= 1 must fail the oscillation gate."""
+    seq = []
+    for i in range(n):
+        frac = i / (n - 1)
+        dx = 0.35 * SW * math.sin(math.pi * frac)   # single hump: out then back once
+        up = CY - 0.4 * SW
+        if arm == "right":
+            seq.append(make_skeleton(REST_L, (CX + 0.5 * SW + dx, up), **kw))
+        else:
+            seq.append(make_skeleton((CX - 0.5 * SW + dx, up), REST_R, **kw))
+    return seq
+
+
+# --- non-wave movements that must NOT fire (the reported "raised hand fired" family). Several
+# use a small `sw` (a FAR person -> small pixel scale) + per-frame `jitter` to reproduce the
+# pose-noise-at-distance leak the absolute swing floor is designed to kill. -----------------
+def held_raised_jitter_sequence(n=20, sw=45.0, jitter=5.0, seed=7, wy_frac=-0.95,
+                                arm="right", **kw):
+    """NEGATIVE (the on-robot bug): a forearm raised and HELD still (wrist fixed clearly above
+    the elbow) with per-frame pose jitter, at a FAR/small scale where fixed-px jitter is a big
+    fraction of scale. Must fire NOTHING -- jitter stays below the absolute swing floor."""
+    rng = random.Random(seed)
+    wy = CY + wy_frac * sw
+    lrest, rrest = (CX - 0.5 * sw, CY + 1.15 * sw), (CX + 0.5 * sw, CY + 1.15 * sw)
+    seq = []
+    for _ in range(n):
+        if arm == "right":
+            seq.append(make_skeleton(lrest, (CX + 0.5 * sw, wy), sw=sw, rng=rng, jitter=jitter, **kw))
+        else:
+            seq.append(make_skeleton((CX - 0.5 * sw, wy), rrest, sw=sw, rng=rng, jitter=jitter, **kw))
+    return seq
+
+
+def stir_sequence(n=20, sw=SW, radius=0.30, revolutions=2, **kw):
+    """NEGATIVE: a raised hand tracing a slow CIRCLE -- x is a real sine, but y co-moves in
+    lockstep, so xswing ~= yswing -> the horizontal-dominance gate must reject it."""
+    seq = []
+    for i in range(n):
+        ang = 2 * math.pi * revolutions * i / n
+        wx = CX + 0.5 * sw + radius * sw * math.cos(ang)
+        wy = CY - 0.5 * sw + radius * sw * math.sin(ang)
+        seq.append(make_skeleton((CX - 0.5 * sw, CY + 1.15 * sw), (wx, wy), sw=sw, **kw))
+    return seq
+
+
+def nod_sequence(n=20, sw=80.0, bob=0.25, jitter=4.0, seed=11, **kw):
+    """NEGATIVE: a raised hand held at ~fixed x while it bobs / tilts VERTICALLY (+ jitter).
+    No horizontal oscillation -> x-swing ~ 0 -> no wave."""
+    rng = random.Random(seed)
+    seq = []
+    for i in range(n):
+        wy = CY - 0.5 * sw + bob * sw * math.sin(2 * math.pi * 1.3 * i * DT)
+        seq.append(make_skeleton((CX - 0.5 * sw, CY + 1.15 * sw), (CX + 0.5 * sw, wy),
+                                 sw=sw, rng=rng, jitter=jitter, **kw))
+    return seq
+
+
+def drift_sequence(n=20, sw=100.0, total=0.25, jitter=5.0, seed=13, **kw):
+    """NEGATIVE: a raised hand drifting MONOTONICALLY sideways (a slow lean / point), + jitter.
+    Never retraces >= the swing floor -> zero confirmed reversals -> no wave (even though the
+    raw range would look like amplitude)."""
+    rng = random.Random(seed)
+    seq = []
+    for i in range(n):
+        wx = CX + 0.3 * sw + total * sw * (i / (n - 1))
+        seq.append(make_skeleton((CX - 0.5 * sw, CY + 1.15 * sw), (wx, CY - 0.5 * sw),
+                                 sw=sw, rng=rng, jitter=jitter, **kw))
+    return seq
+
+
+def tremor_sequence(n=20, sw=100.0, freq=4.0, amp=0.22, **kw):
+    """NEGATIVE: a raised hand shaking FAST (~4 Hz) with real amplitude -- clears the swing
+    floor, so it is the RATE CAP (too many reversals/second) that must reject it as a tremor /
+    fidget rather than a deliberate ~1-2 Hz wave."""
+    seq = []
+    for i in range(n):
+        wx = CX + 0.5 * sw + amp * sw * math.sin(2 * math.pi * freq * i * DT)
+        seq.append(make_skeleton((CX - 0.5 * sw, CY + 1.15 * sw), (wx, CY - 0.5 * sw), sw=sw, **kw))
+    return seq
+
+
+def clear_wave_at_distance_sequence(n=22, sw=70.0, freq=1.3, amp=0.35, arm="right", **kw):
+    """POSITIVE: a CLEAR wave at moderate distance (small scale). Its swing is big enough to
+    clear the absolute px floor, so it still fires far away -- only tiny/subtle far waves are
+    the accepted trade-off of the jitter hardening."""
+    seq = []
+    for i in range(n):
+        dx = amp * sw * math.sin(2 * math.pi * freq * i * DT)
+        up = CY - 0.5 * sw
+        if arm == "right":
+            seq.append(make_skeleton((CX - 0.5 * sw, CY + 1.15 * sw), (CX + 0.5 * sw + dx, up), sw=sw, **kw))
+        else:
+            seq.append(make_skeleton((CX - 0.5 * sw + dx, up), (CX + 0.5 * sw, CY + 1.15 * sw), sw=sw, **kw))
+    return seq
+
+
 # --------------------------------------------------------------------- harness
-def feed(reactor, frames, t0=100.0, dt=DT, w=FRAME_W, h=FRAME_H):
+def feed(reactor, frames, t0=100.0, dt=DT, w=FRAME_W, h=FRAME_H, hand_frames=None):
     """Drive `reactor` frame-by-frame on a DETERMINISTIC clock; return the list of fired
     events. `frames` is a list where each element is either one skeleton item or a list of
-    items (multi-person). Passing our own `t` is what makes the run reproducible."""
+    items (multi-person). `hand_frames`, if given, is a parallel list of hand shm frames fed
+    to the palm fusion. Passing our own `t` is what makes the run reproducible."""
     fired = []
     t = t0
-    for fr in frames:
+    for i, fr in enumerate(frames):
         items = fr if isinstance(fr, list) else [fr]
-        ev = reactor.update({"w": w, "h": h, "items": items}, t)
+        hf = hand_frames[i] if hand_frames is not None else None
+        ev = reactor.update({"w": w, "h": h, "items": items}, t, hf)
         if ev is not None:
             fired.append(ev)
         t += dt
@@ -183,7 +375,6 @@ def selftest():
     # --- positives: each fires once, and maps to the intended robot response ---
     for label, seq, want in (
         ("wave",         wave_sequence(),          "wave"),
-        ("raise_hand",   raise_sequence(),         "raise_hand"),
     ):
         f = run(seq)
         check(f"{label} fires", want in f)
@@ -197,6 +388,7 @@ def selftest():
     check("idle fires nothing",    run(idle_sequence()) == [])
     check("walking fires nothing", run(walking_sequence()) == [])
     check("static reach fires nothing", run(reach_sequence()) == [])
+    check("raised hand fires nothing (auto high-five removed)", run(raise_sequence()) == [])
 
     # --- robustness: seeded pose jitter + a dropped-out shoulder still classify a wave ---
     rng = random.Random(42)

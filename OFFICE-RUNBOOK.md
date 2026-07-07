@@ -4,7 +4,11 @@ Branch `home`, pushed to `origin/main` + `origin/home` + `origin/office` (all al
 
 > ## Update — changes after this runbook was first written
 > - **"Greet" is now "🤝 Interaction" mode** (same toggle, same place). When ON the robot
->   responds to a person's gesture: **wave → waves back**, **hand up → high-fives**. Every
+>   responds to a person's gesture: **wave → waves back**. Wave detection now **fuses the
+>   skeleton with the MediaPipe palm feed**: a clean shoulder-based wave fires on the skeleton
+>   alone, but when the short robot can't see the head/shoulders on a close person, an **open
+>   palm oscillating on the wrist** corroborates the (weaker) elbow-only skeleton wave so it
+>   still fires — while a lone weak signal never does, keeping false waves down. Every
 >   detected gesture is **labelled on the camera feed** (a "👋 wave" chip on that person) and
 >   **written to the dashboard log** (`👋 #3 wave → robot wave`, or "held — not safe"). Still
 >   OFF by default; only fires upright in Walk, not moving, not busy. (`e58f133`)
@@ -83,6 +87,13 @@ python3 scripts/robot_web_controller.py
 perception/pose/run_pose.sh          # or, if the container already exists: sudo docker start g1-pose
 sudo docker ps                       # confirm g1-pose is Up
 
+# 3b) OPTIONAL but recommended for the wave-back — hands container (palm fusion). Lets a
+#     wave still register when the short robot can't see a close person's head/shoulders.
+#     Demand-gated too: Interaction mode now heartbeats g1_hands_demand. Without it, only
+#     clean shoulder-based waves fire (graceful fallback, no crash). NB: pose + hands + camera
+#     share the Jetson GPU — expect some video lag while both infer.
+perception/hands/run_hands.sh        # or: sudo docker start g1-hands ; confirm g1-hands is Up
+
 # 4) Open the UI
 #    Laptop console: http://<robot-ip>:8080/?full=1
 #    Phone teleop:   http://<robot-ip>:8080/phone   (phone-sized devices auto-redirect)
@@ -136,14 +147,16 @@ Ordered so the highest-risk unknowns come first.
 3. **Camera feed live.** Dashboard camera panel shows video; MJPEG at `/camera/stream`. Confirm no second `camera_service.py` (single-consumer).
    - **Fail looks like:** blank panel / stale frame.
 
-4. **Wave-back end-to-end (the client path).** Pose container up, Walk FSM, Greet ON, person waves at the head camera ~1.5 s (wrist above shoulder, side-to-side). Caption: "watching for a wave…" → "saw wave -> waving back"; arm waves back once (`LocoClient.WaveHand`), debounced.
+4. **Wave-back end-to-end (the client path).** Pose container up, Walk FSM, Greet ON, person waves at the head camera ~1.5 s (wrist above shoulder, side-to-side). Caption: "watching for a wave…" → "saw wave -> waving back"; arm waves back once (arm-action 26 / `high_wave` — the native `LocoClient.WaveHand()` is a dead no-op on this G1), debounced.
    - **Fail looks like:** caption stuck on "watching for a wave…" forever = dead pose feed OR arm client failed to init (see run-of-show gates).
+   - **Close-range / small-robot case (palm fusion):** stand CLOSE so the head + shoulders leave frame, then wave with an **open palm**. With `g1-hands` up it still fires (the dashboard gesture log shows `source: skeleton+palm`); without `g1-hands` it won't (a weak wave needs corroboration) — that's expected, start the hands container.
+   - **Shoulder-level wave (must FIRE):** wave normally with the hand at shoulder height (forearm bent up, not raised overhead) — it now fires (`source: skeleton`). **Held / non-wave (must NOT fire):** raise the forearm and HOLD it still (palm down), or stir/point/clap — the robot must stay put. If a held hand still triggers a wave-back on-robot, the pose jitter is heavier than assumed → raise `wave_swing_min_px` (14.0) in `ReactorConfig`. Known residual: an animated talker doing a genuine open-palm side-to-side at shoulder height can still read as a subtle wave (indistinguishable) — the safety gate limits it to upright/idle.
 
 5. **Startup line `G1 ArmActionClient ready (gestures).`** Watch controller stdout at boot (`robot_web_controller.py:1149`).
-   - **Fail looks like:** `ArmActionClient init failed` (`:1152`) → the safety gate's `arm_client is not None` check makes even the LocoClient wave silently no-op. Catch this before the demo, not during.
+   - **Fail looks like:** `ArmActionClient init failed` (`:1152`) → the wave-back now runs as arm-action 26 (`high_wave`), so a dead arm client means it never fires (and the safety gate's `arm_client is not None` check blocks it). Catch this before the demo, not during.
 
-6. **`raise_hand` → high-five (arm action 18).** Hold one wrist at head level ~1 s → high-five fires, auto-releases after ~4 s.
-   - **Fail looks like:** nothing fires = arm-action service path down (separate from LocoClient).
+6. **Manual High Five button (arm action 18).** The auto high-five (raise a hand → high-five) was removed; the manual button stays. Tap **High Five** on the dashboard/phone → high-five fires, auto-releases after ~4 s.
+   - **Fail looks like:** nothing fires = arm-action service path down (the same `arm` service the wave-back now uses).
 
 7. **Greeting safety gate physically holds arms.** Greet ON but robot in **damp** (not Walk), wave → caption "saw wave -- holding (not safe)", ZERO arm motion. Repeat while driving.
    - **Fail looks like:** any arm motion when not upright+idle+walk = gate broken; stop the demo.
@@ -186,7 +199,7 @@ All GREEN when re-run at home this cycle. Trust them.
 - **Full closed-loop avoidance** — floor-only no-detect, wall@2m, 6 cm pole@3m, no-collision + smooth (0 accel violations): `sim_perception.py --selftest` exercises the REAL node + REAL guard + REAL shaper. Pipeline logic is proven.
 - **Depth ring low-object sensitivity** — 4 cm cable → 33 viz points, sub-clearance noise → 0: `test_depth_ring.py`. Only the real D435i *frame validity* needs the camera (robot item #8).
 - **Fused-odometry filter math** — straight/rotation/yaw-wrap, no-lidar==leg-only exactly, drift correction, dropout coasting, outlier + kidnapped-robot re-acquire, NaN guards, drift magnitude (fused ≤0.5× leg): `test_fused_odometry.py` (18/18) + `sim_odometry.py --selftest`.
-- **Gesture decision logic** — wave fires once, raise_hand fires, idle fires nothing, jitter/head-dropout robustness, safety-gate dispatch: `gesture_reactor --selftest` + `sim_gestures --selftest` + `test_gesture_reactor`.
+- **Gesture decision logic** — a wave fires once at ANY height (overhead OR **shoulder-level**, via the elbow-based raised test); a SUBTLE small wave fires only with open-palm corroboration; and a big **non-wave / false-wave catalog fires nothing**: idle, walking, static-reach, single sweep, clap (bimanual veto), circular stir (horizontal-dominance), fast tremor (rate cap), and — the key on-robot fix — a **held / jittery raised hand at distance** (hysteresis swing counting with an absolute px floor, so pose noise can't fake reversals). Proven: `gesture_reactor --selftest` + `sim_gestures --selftest` + `test_gesture_reactor` (53 tests).
 - **Velocity ramp / step-pacing on handoff reset** — `cmd_shaper` + `step_pacer` green; handoff just calls `shaper.reset()`/`pacer.reset()`. Only verify the *integration* (no-lurch) via robot item #13.
 
 ### Skip / not ready
@@ -201,16 +214,16 @@ All GREEN when re-run at home this cycle. Trust them.
 
 1. Robot powered, e-stop in reach.
 2. Start the backbone: `python3 scripts/robot_web_controller.py`. **Watch stdout for `G1 ArmActionClient ready (gestures).`** — if it says init failed, stop and fix; the wave will silently no-op.
-3. Start the pose container: `perception/pose/run_pose.sh`; confirm `sudo docker ps` shows **g1-pose Up**.
+3. Start the pose container: `perception/pose/run_pose.sh`; confirm `sudo docker ps` shows **g1-pose Up**. For the close-range case also start the hands container: `perception/hands/run_hands.sh` (**g1-hands Up**) — enables palm fusion.
 4. Open `http://<robot-ip>:8080/?full=1` on the laptop (lone laptop auto-holds control via take-if-free, so the toggle is allowed).
 5. Bring the robot upright to **Walk (802)**: damp → stand → walk.
 6. Flip **"🤖 Greet: off" → ON**. Caption shows "watching for a wave…".
 7. Person stands in the **head-camera** FOV and waves ~1.5 s: wrist **above shoulder**, side-to-side.
-8. Expect: caption "saw wave -> waving back", arm waves back within ~1.5–2 s, **once** (debounced). (A wrist held still at head level ~1 s fires high-five instead.)
+8. Expect: caption "saw wave -> waving back", arm waves back within ~1.5–2 s, **once** (debounced).
 
 **Silent-fail gates to check if it doesn't wave (debug in this order):**
 
-- **Arm client didn't init** → the greeting safety gate requires `arm_client is not None` *even for the hero wave* (which uses LocoClient). No `G1 ArmActionClient ready` line = wave never fires. (Arm-client init + ready/failed print at `robot_web_controller.py:1145-1152`; the `_greeting_safe` gate that checks it at `:1287-1295`.)
+- **Arm client didn't init** → the wave-back now runs as arm-action 26 (`high_wave`), so the arm client genuinely must be up; the greeting safety gate also requires `arm_client is not None`. No `G1 ArmActionClient ready` line = wave never fires. (Arm-client init + ready/failed print at `robot_web_controller.py:1145-1152`; the `_greeting_safe` gate that checks it at `:1287-1295`.)
 - **Dead pose feed** → g1-pose stopped or camera not writing frames shows the SAME "watching for a wave…" as "no one is waving". `sudo docker ps` + check `/dev/shm/g1_pose_tracks.json` is fresh. Nothing distinguishes the two in the UI.
 - **Not in Walk** → gate blocks unless upright + idle + Walk FSM. Caption "saw wave -- holding (not safe)" = you're in damp/stand or moving.
 - **Robot moving** → `is_moving` blocks the auto-fire; stop driving before demoing.

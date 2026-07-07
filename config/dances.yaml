@@ -1,0 +1,45 @@
+# ============================================================================
+# G1 DANCE CATALOG — named whole-body FSM routines selectable from the dashboard
+# ============================================================================
+# Each entry is a whole-body routine the robot can perform, triggered with
+# LocoClient.SetFsmId(<fsm_id>). The dashboard's "Dance" chooser renders one
+# tile per entry (name + space it needs), and firing one hands the whole body
+# to that routine — press Stand or Walk afterwards to exit (exit routes through
+# main_control 802, never damps).
+#
+# HOW TO ADD MORE DANCES (they must actually work):
+#   There is NO public menu of G1 dance FSM ids — only SetFsmId(n) exists, and
+#   firing a guessed id at a standing humanoid is unsafe. The safe way to find a
+#   real, working dance id is the dashboard's "Dance Lab" (supervised probe):
+#     1. Stand the robot, clear ~2.5 m around it, keep the e-stop in reach.
+#     2. Open Dance → Dance Lab, type a candidate FSM id, press "Fire once".
+#     3. Watch the camera. If it danced, fill in a name + the clear radius it
+#        needed and press "Save" — it is appended here and becomes a tile.
+#     4. If nothing good happens, press "Stop → Stand" and try another id.
+#   (This file is machine-written by that Save flow, so keep hand-edits simple.)
+#
+# fsm_id  : integer passed to SetFsmId(). 503 = the built-in dance (remote R1+B),
+#           the one id confirmed working on this robot (captured 2026-06-23).
+# space_m : radius of clear floor the routine needs, in metres (UI shows "~X m").
+# note    : short free-text description shown on the tile's tooltip.
+# ----------------------------------------------------------------------------
+dances:
+  # ---- VERIFIED (green ▶ Play) — confirmed working on this robot ----
+  - name: "Classic Dance"
+    fsm_id: 503
+    space_m: 2.0
+    verified: true
+    note: "Built-in whole-body dance (remote R1+B). Returns to walk on its own."
+
+  # ---- CANDIDATES (amber 🧪 Test) — UNVERIFIED neighbours of the known dance id.
+  # These are NOT confirmed to be dances; they are here so you can Test each one at
+  # the robot (standing, ~2.5 m clear, e-stop in hand). If it dances, Save it (it
+  # turns green). If it's a dud or does nothing useful, ✕ remove it. Base-mode ids
+  # (0/1/4/802) are deliberately absent — they are not dances. ----
+  - { name: "Candidate 501", fsm_id: 501, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }
+  - { name: "Candidate 502", fsm_id: 502, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }
+  - { name: "Candidate 504", fsm_id: 504, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }
+  - { name: "Candidate 505", fsm_id: 505, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }
+  - { name: "Candidate 506", fsm_id: 506, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }
+  - { name: "Candidate 507", fsm_id: 507, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }
+  - { name: "Candidate 508", fsm_id: 508, space_m: 2.0, verified: false, note: "Untested — Test at the robot." }

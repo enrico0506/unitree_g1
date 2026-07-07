@@ -1,0 +1,36 @@
+# motion pipeline — single source of truth. ALL on-device (Jetson Orin NX 16GB, no workstation).
+
+record:
+  frame_source: /dev/shm/g1_camera.jpg   # the clean feed camera_service.py already writes
+  record_hz: 30                          # sample rate; TRUE fps is MEASURED over wall-clock, stamped per clip
+  max_seconds: 30
+
+robot:
+  name: unitree_g1
+  dof: 29                                # 29 for the sim path (GMR/SONIC ship 29-DOF only); 23-DOF hw deferred
+  control_hz: 50                         # SONIC reference/control rate (0.02 s)
+
+pose:
+  estimator: romp                        # replaces GVHMR (GVHMR can't run on ARM); body-SMPL only
+  static_cam: true                       # robot stands still -> don't need camera-motion world-grounding
+  root_orient_smoothing: true            # SLERP low-pass on root rotation to keep spins from flipping
+
+# On-device RAM is tight (16GB unified). Stop these live containers during Recreate, restart after.
+recreate:
+  pause_containers: [g1-pose, g1-hands, g1-detect]
+
+deploy:
+  jetpack: 6                             # SONIC requires JetPack 6
+  tensorrt: "10.7"                       # SONIC's pin; stock JetPack 6.2 ships 10.3 -> install 10.7 on top
+                                         #   (a version mismatch produces WRONG motion)
+
+models:
+  smpl_dir: models/smpl                  # SMPL body model (MPI registration required)
+  sonic_encoder: models/sonic/model_encoder.onnx
+  sonic_decoder: models/sonic/model_decoder.onnx
+  sonic_obs_cfg: models/sonic/observation_config.yaml
+
+replay:
+  provider: stub                         # stub -> sonic (Phase 5); fallback: gmr_kinematic if SONIC diverges
+
+# workstation: (unused on-device; only for the optional two-machine fallback — see PLAN.md)

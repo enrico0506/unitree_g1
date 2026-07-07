@@ -30,3 +30,6 @@ perception/**/*_test*.jpg
 .DS_Store
 *.swp
 *~
+
+# runtime UI settings (suppress_autoclimb etc.)
+state/

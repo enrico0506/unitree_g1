@@ -80,6 +80,7 @@ function connect() {
     if (window.Obstacle) window.Obstacle.init(send);
     if (window.StepMode) window.StepMode.init(send);
     if (window.DriveMode) window.DriveMode.init();
+    if (window.Dance) window.Dance.init(send);
   };
 
   ws.onmessage = (event) => {
@@ -99,6 +100,7 @@ function connect() {
         window.Obstacle3D && window.Obstacle3D.update(msg);
       }
       else if (msg.type === "control") updateControl(msg);
+      else if (msg.type === "dances") window.Dance && window.Dance.handleDances(msg);
       else if (msg.type === "takeover_denied")
         logEvent("can't take control while the robot is moving — wait until it stops", "warn");
       else if (msg.type === "gesture_event") handleGesture(msg);
@@ -130,6 +132,43 @@ function send(obj) {
     || (obj.type === "cmd" && OPEN_GESTURES.has(obj.name)));
   if (obj && obj.type && !shared && !hasControl) return;
   ws.send(JSON.stringify(obj));
+  logControl(obj);   // record exactly what was sent to the robot (event log)
+}
+
+// --- Control logging -------------------------------------------------------
+// Log every command actually sent to the robot into the on-screen event log, so
+// you can see the exact sequence you drove and reproduce it for a dance. Steady
+// 30 Hz "move" packets are throttled to meaningful changes (start / stop / a new
+// velocity vector, at most ~2/s); discrete commands are logged every time. Toggle
+// off with the "Log controls" switch if it gets noisy.
+let logControlsOn = true;
+let _lastMoveSig = null, _lastMoveAt = 0;
+
+function logControl(obj) {
+  if (!logControlsOn || !obj || !obj.type) return;
+  if (obj.type === "hello" || obj.type === "take_control") return;   // handshake noise
+
+  if (obj.type === "move") {
+    const moving = Math.abs(obj.vx) > 0.01 || Math.abs(obj.vy) > 0.01 || Math.abs(obj.vyaw) > 0.01;
+    const sig = moving ? `${obj.vx.toFixed(2)},${obj.vy.toFixed(2)},${obj.vyaw.toFixed(2)}` : "stop";
+    const now = Date.now();
+    // Skip repeats of the same vector unless 500ms passed; never repeat "stop".
+    if (sig === _lastMoveSig && (sig === "stop" || now - _lastMoveAt < 500)) return;
+    _lastMoveSig = sig; _lastMoveAt = now;
+    logEvent(moving
+      ? `→ move  vx=${obj.vx.toFixed(2)} vy=${obj.vy.toFixed(2)} vyaw=${obj.vyaw.toFixed(2)}`
+      : `→ move  stop`, "ctrl");
+    return;
+  }
+
+  // Discrete controls: mode / dance / dance_probe / dance_save / dance_delete /
+  // cmd (gesture) / stop / step_mode / greeting / obstacle / map …
+  const bits = [obj.type];
+  if (obj.name != null)    bits.push(obj.name);
+  if (obj.fsm_id != null)  bits.push(`fsm=${obj.fsm_id}`);
+  if (obj.action != null)  bits.push(obj.action);
+  if (obj.on !== undefined) bits.push(obj.on ? "on" : "off");
+  logEvent(`→ ${bits.join(" ")}`, "ctrl");
 }
 
 connect();
@@ -139,6 +178,7 @@ let uiMode = "damp";
 let fsmId = null;
 let transitioning = false;
 let greetingOn = false;   // auto wave-back master toggle (mirrors server greeting_mode)
+let suppressClimbOn = false;   // flat-ground auto-climb suppression (mirrors server suppress_autoclimb)
 let slowMode = false;   // Shift = precise slow control (~40% speed)
 
 function speedScale() { return slowMode ? SLOW_SCALE : 1.0; }
@@ -149,6 +189,9 @@ function applyConfig(msg) {
   if (typeof msg.max_vyaw === "number") MAX_VYAW = msg.max_vyaw;
   if (typeof msg.slow_scale === "number") SLOW_SCALE = msg.slow_scale;
   setInfo("infoSpeeds", `vx≤${MAX_VX} · vy≤${MAX_VY} · vyaw≤${MAX_VYAW} m/s`);
+
+  // Named dance catalog -> the Dance chooser tiles (name + space each needs).
+  if (window.Dance) window.Dance.applyConfig(msg);
 
   // Whole-body combo buttons (dance/climb) only work once their FSM id has been
   // captured into config/mapping.yaml; enable/disable them from the server flag.
@@ -210,6 +253,10 @@ function updateFsmState(msg) {
 
   setInfo("infoMode", uiMode);   // transition state is shown by .transit-flag (CSS)
 
+  // Dance chooser: reflect the robot's FSM so a playing dance highlights its tile,
+  // the upright-gate enables/disables Play/Fire, and the Dance Lab shows current FSM.
+  if (window.Dance) window.Dance.setState(fsmId, uiMode, transitioning);
+
   const mismatchEl = document.getElementById("fsmMismatch");
   if (mismatchEl) {
     const expected = UI_TO_FSM[uiMode];
@@ -257,6 +304,19 @@ function updateFsmState(msg) {
     }
     const gs = document.getElementById("greetingStatus");
     if (gs) gs.textContent = greetingOn ? (msg.greeting_status || "watching for gestures…") : "";
+  }
+
+  // Suppress auto-climb (flat-ground/presentation): reflect the server's truth on the
+  // Setup-tab toggle, so it also repaints if the server auto-disables it after the
+  // firmware keeps re-triggering (see robot_web_controller's oscillation guard).
+  if (msg.suppress_autoclimb !== undefined) {
+    suppressClimbOn = !!msg.suppress_autoclimb;
+    const st = document.getElementById("suppressClimbToggle");
+    if (st) {
+      st.classList.toggle("on", suppressClimbOn);
+      st.setAttribute("aria-pressed", suppressClimbOn ? "true" : "false");
+      st.textContent = suppressClimbOn ? "🧗 Suppress auto-climb: ON" : "🧗 Suppress auto-climb: off";
+    }
   }
 }
 
@@ -580,6 +640,13 @@ if (_greetingToggle) {
   _greetingToggle.addEventListener("click", () => send({ type: "greeting", on: !greetingOn }));
 }
 
+// Suppress auto-climb toggle (Setup tab): flat-ground/presentation flag. send() gates it
+// on control, same as Greeting; updateFsmState() repaints the button from server truth.
+const _suppressClimbToggle = document.getElementById("suppressClimbToggle");
+if (_suppressClimbToggle) {
+  _suppressClimbToggle.addEventListener("click", () => send({ type: "suppress_climb", on: !suppressClimbOn }));
+}
+
 // =========================================================================
 // TAP BUTTONS (stop)
 // =========================================================================
@@ -640,6 +707,13 @@ function updateMapStatus(msg) {
   if (maps.includes(cur)) mapLoad.value = cur;
 
   setInfo("infoMap", mapStatus.textContent);
+
+  // Drive the cloud window: show the FAST-LIO map while mapping is active OR a
+  // map is loaded (points>0), else the idle 3D obstacle sphere. This mirrors the
+  // server's show_map = mapper.active or mapper.has_points() so the two agree.
+  if (window.FeedView) {
+    window.FeedView.setMapShown((!!msg.active) || (msg.points || 0) > 0);
+  }
 }
 
 if (mapToggle) {

@@ -196,14 +196,17 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
       b.visible = false; scene.add(b); boxes.push(b);
     }
 
-    // mode toggle: a small fixed corner button + the 'c' key (choice persists).
+    // mode toggle: a small corner button in the sphere view's TOP-RIGHT (matches the
+    // other floating window chips) + the 'c' key (choice persists). Mounted INSIDE
+    // #bigSphere so it only shows while the 3D-sphere feed is active.
     toggleBtn = document.createElement("button");
     toggleBtn.id = "obs3d-mode"; toggleBtn.title = "Toggle 3D view: points / columns (c)";
-    toggleBtn.style.cssText = "position:fixed;bottom:10px;left:10px;z-index:9999;" +
-      "padding:4px 9px;font:600 12px system-ui,sans-serif;color:#E9EDF6;" +
-      "background:rgba(20,26,38,0.85);border:1px solid #5C8DF2;border-radius:6px;cursor:pointer;";
+    toggleBtn.style.cssText = "position:absolute;top:9px;right:9px;z-index:4;" +
+      "padding:5px 11px;font:600 12px system-ui,sans-serif;color:#E9EDF6;" +
+      "background:rgba(10,13,19,0.72);border:1px solid #232C3E;border-radius:8px;cursor:pointer;" +
+      "backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);";
     toggleBtn.onclick = () => setMode(mode === "points" ? "columns" : "points");
-    document.body.appendChild(toggleBtn);
+    mount.appendChild(toggleBtn);
     window.addEventListener("keydown", (e) => {
       const tag = (e.target && e.target.tagName) || "";
       if ((e.key === "c" || e.key === "C") && !/INPUT|TEXTAREA/.test(tag))

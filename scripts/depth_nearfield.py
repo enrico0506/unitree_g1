@@ -15,8 +15,9 @@ corridor.
 
 Exposed: front_near_m() -> float metres or None (clear / not enough points). The
 ObstacleGuard mixes this into its forward distance (min) so the robot slows/stops
-for low things ahead the lidar missed. DEFAULT OFF (depth_fusion.enabled) until the
-frame is validated on the robot -- a wrong pitch/height would false-stop or miss.
+for low things ahead the lidar missed. Always ON -- no UI/runtime toggle disables
+it; the frame-sanity self-gate (frame_check) still auto-skips a frame it judges
+untrustworthy (wrong pitch/height), which is a safety guard, not a user toggle.
 """
 
 import math
@@ -28,7 +29,7 @@ import yaml
 
 
 _DEFAULTS = {
-    "enabled": False,          # OFF until validated on the robot (a bad frame = false stops)
+    "enabled": True,           # always on -- kept for cfg back-compat; DepthNearField ignores it
     "pitch_deg": 47.6,         # D435i downward mount tilt (URDF 0.83078 rad). + = looks DOWN.
     "camera_height_m": 1.30,   # real D435i height above the floor (MEASURE; ~pelvis + 0.47)
     "corridor_half_m": 0.35,   # forward corridor half-width (robot half-width + margin)
@@ -55,11 +56,19 @@ _DEFAULTS = {
     #     height ramps with range. With the correct frame a flat floor sits at height ~0 at
     #     ALL ranges. If the floor ramps more than the tolerance, the frame is UNTRUSTWORTHY
     #     -> emit NO ring/scalar this frame (fail to lidar-only), never a false near-stop.
-    #     Makes depth_fusion.enabled safe off-robot: watch telemetry frame_ok on the robot. ---
+    #     This is what makes always-on depth fusion safe: watch telemetry frame_ok. ---
     "frame_check": True,
     "frame_floor_ramp_m": 0.15,  # max floor-height DRIFT across the 0.5-2 m band (wrong pitch)
     "frame_floor_offset_m": 0.12, # max |median floor height| from 0 (wrong camera_height)
     "frame_min_floor_pts": 30,   # need this many candidate floor points to judge the frame
+    # --- full-cloud export for the mapping fusion (map_cloud()) -- SEPARATE band from the
+    #     scalar/ring obstacle bands above: wider range (mapping wants more context than the
+    #     near-field guard), floor dropped by a small clearance (not the cable-catching ring
+    #     clearance), ceiling capped so overhead clutter doesn't pollute the map. ---
+    "map_min_range_m": 0.30,     # ignore closer than the D435i min range (~0.3 m)
+    "map_max_range_m": 4.0,      # far enough to add real map context beyond the near-field band
+    "map_ground_clearance_m": 0.03,  # drop the floor, keep low cables/objects
+    "map_max_height_m": 2.0,     # drop overhead / ceiling
 }
 
 
@@ -80,7 +89,7 @@ class DepthNearField:
                 print(f"[DEPTH] config load failed ({e}); using defaults", flush=True)
         self.cfg = cfg
 
-        self.enabled = bool(cfg["enabled"])
+        self.enabled = True   # always on -- no UI/runtime toggle can disable this (see set_enabled)
         theta = math.radians(float(cfg["pitch_deg"]))
         self._ct, self._st = math.cos(theta), math.sin(theta)
         self.cam_h = float(cfg["camera_height_m"])
@@ -104,6 +113,11 @@ class DepthNearField:
         self.frame_ramp_tol = float(cfg.get("frame_floor_ramp_m", 0.15))
         self.frame_offset_tol = float(cfg.get("frame_floor_offset_m", 0.12))
         self.frame_min_floor_pts = int(cfg.get("frame_min_floor_pts", 30))
+        # full-cloud export band for mapping fusion (see map_cloud())
+        self.map_min_range = float(cfg.get("map_min_range_m", 0.30))
+        self.map_max_range = float(cfg.get("map_max_range_m", 4.0))
+        self.map_ground_clear = float(cfg.get("map_ground_clearance_m", 0.03))
+        self.map_max_height = float(cfg.get("map_max_height_m", 2.0))
 
         self._lock = threading.Lock()
         self._front = None         # last computed nearest forward distance (m) or None
@@ -132,11 +146,10 @@ class DepthNearField:
             self._thread.join(timeout=2.0)
 
     def set_enabled(self, on):
-        self.enabled = bool(on)
-        if not self.enabled:
-            with self._lock:
-                self._front = None
-                self._n_near = 0
+        # Depth fusion is permanently ON -- there is no UI toggle to disable it, and
+        # this must not become a disable path. Kept as a no-op (rather than removed)
+        # so any caller that still invokes it (e.g. forced-enable at startup) is safe.
+        self.enabled = True
 
     # --- core -------------------------------------------------------------
     def _compute(self, cloud):
@@ -339,6 +352,42 @@ class DepthNearField:
         if pts is None or len(pts) == 0:
             return None
         return [round(float(v), 2) for v in np.asarray(pts, dtype=np.float32).ravel()]
+
+    def map_cloud(self):
+        """FULL leveled depth cloud (M,3) float32 in BODY floor-referenced frame (x-fwd,
+        y-left, z = height above floor) for the mapping fusion -- NOT the narrow forward
+        corridor/ring used by the obstacle guard, and not FOV-restricted. Reuses the same
+        validated derotation as ``_compute`` (pitch + camera height) and the same
+        frame-sanity gate, so a bad-pitch/height frame is never fed into the map. Pulls a
+        FRESH cloud straight from the lidar source (not the cached near-field state) since
+        callers (the map dumper) run on their own cadence. Returns None when disabled, no
+        camera, no points, or the frame fails sanity."""
+        if not self.enabled or self.lidar is None:
+            return None
+        cloud = self.lidar.get_cloud()
+        if cloud is None or len(cloud) == 0:
+            return None
+        if self.frame_check:
+            ramp, offset, nf = self._frame_sanity(cloud)
+            if not (nf >= self.frame_min_floor_pts
+                    and ramp <= self.frame_ramp_tol
+                    and offset <= self.frame_offset_tol):
+                return None
+        X = cloud[:, 0]
+        Y = cloud[:, 1]
+        Zc = cloud[:, 2] - self.ls_mount_height
+        fwd = X * self._ct + Zc * self._st
+        up = -X * self._st + Zc * self._ct
+        left = Y
+        height = up + self.cam_h
+        rng = np.hypot(fwd, left)
+        keep = (
+            (height > self.map_ground_clear) & (height < self.map_max_height)
+            & (rng > self.map_min_range) & (rng < self.map_max_range)
+        )
+        if not np.any(keep):
+            return None
+        return np.column_stack((fwd[keep], left[keep], height[keep])).astype(np.float32)
 
     def telemetry(self):
         with self._lock:

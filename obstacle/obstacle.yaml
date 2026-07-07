@@ -91,7 +91,19 @@ min_height_m: -0.4           # height band lower edge (sensor-relative z): cuts 
 max_height_m: 0.50           # height band upper edge (cuts ceiling / overhead)
 blind_radius_m: 0.45         # drop self-returns / points closer than this
 min_cluster_points: 10       # k: the k-th closest point is the robust nearest (1 = noise)
-filter_alpha: 0.25           # per-direction distance EMA: filt = a*new + (1-a)*filt (lower = smoother)
+filter_alpha: 0.25           # legacy symmetric EMA (kept for reference; the wedges now use the asym filter below)
+# --- asymmetric per-direction wedge filter: "fast to fear, slow to trust" ---------------
+# The Mid-360 scans NON-REPETITIVELY, so a sparse petal occasionally reads a wedge FARTHER
+# than it is (a one-frame false-CLEAR spike, e.g. front 1.25 -> 1.75) -- a symmetric EMA lets
+# that leak through and the "distance in front changes the whole time". Instead: a CLOSER raw
+# reading (a real obstacle approaching) is adopted (near-)INSTANTLY, so the stop latency is
+# UNCHANGED and a direction is never wrongly believed clear; a FARTHER reading is trusted only
+# SLOWLY and is first clamped to a short temporal MEDIAN of recent raws, so a lone one-frame far
+# spike is rejected outright. Frame-rate INDEPENDENT (the median is over frames, not seconds), so
+# it still holds when battery sag throttles the CPU and the frame rate drops. Applies to all 4 wedges.
+wedge_near_alpha: 1.0        # EMA weight when the new reading is CLOSER (1.0 = adopt instantly = "fear")
+wedge_far_alpha: 0.05        # EMA weight when the new reading is FARTHER (small = a far jump is trusted very slowly)
+wedge_median_n: 5            # temporal median window (frames) per direction; rejects a single-frame far false-clear
 ease_scale: true             # node: smoothstep S-curve for distance->scale (false = linear ramp)
 tight_open_m: 1.2            # node: a direction starts counting as "closing in" below this
 tight_min: 0.7              # node: floor of the global tight-space multiplier (gentle: 70% when boxed in)
@@ -183,6 +195,15 @@ viz_win_s: 1.0               # 3D-sphere accumulation window (s); ~5 frames @ 10
 viz_win_max_frames: 16       # hard cap on buffered sphere frames (memory/CPU)
 viz_voxel_m: 0.10            # sphere voxel-grid cell (m): stable positions + bounded count.
                              #   Smaller = finer/denser (more points); 0.10 balances detail vs steadiness.
+# Voxel TIME-PERSISTENCE (fixes the residual "appear/disappear" at a LOW/variable frame rate):
+# the plain viz_win_s union is only ~5 sparse Mid-360 petals @ ~5 Hz, so boundary voxels flip
+# on/off frame-to-frame. Instead we STAMP each occupied voxel cell with the time it was last
+# seen and EMIT every cell seen within viz_hold_s -- independent of how many frames actually
+# landed this window -- so the cloud stays steady no matter the rate (it survives CPU throttling
+# under battery sag). Mirrors the log-odds ring's decay, but simpler (one stamp per cell). A hard
+# cap bounds memory. Cosmetic only (no safety path reads these points). viz_dbg gains a "cells" count.
+viz_hold_s: 0.8             # emit any voxel cell seen within this many seconds (0 = current frame only)
+viz_cell_cap: 6000          # hard cap on persisted cells (memory bound); over cap drops the OLDEST-seen first
 # Sphere leveling = FIXED mount-tilt correction. The head/Mid-360 is bolted nose-up at
 # a CONSTANT angle, so the sphere just rotates the cloud by that fixed plane. We do NOT
 # use the per-frame floor fit: MEASURED, at this steep up-tilt the sensor barely sees
@@ -218,11 +239,19 @@ use_deskew: true             # IMU-gyro motion-compensate the cloud (needs /livo
 # (scripts/depth_nearfield.py) reuses the dashboard's already-decoded depth cloud
 # (no second camera open), corrects the mount pitch, drops the floor, and reports
 # the nearest forward near-ground obstacle. The guard mixes it into the forward
-# distance (slow + stop). DEFAULT OFF: a wrong pitch/height would false-stop or
-# miss, so VALIDATE on the robot (watch depth.front_near in the telemetry) first.
+# distance (slow + stop). Depth fusion is now ALWAYS ON -- the runtime toggle has
+# been removed (validated on the robot); enabled stays true here as the single
+# permanent switch. Watch depth.front_near in the telemetry to sanity-check the frame.
 depth_fusion:
-  enabled: true              # ON: validate the depth frame on the robot; a bad frame = false stops
-  pitch_deg: 47.6            # D435i downward mount tilt (URDF d435_joint = 0.83078 rad)
+  enabled: true              # ALWAYS ON (toggle removed); leave true -- a bad depth frame can false-stop
+  pitch_deg: 52.0            # D435i downward mount tilt. URDF d435_joint nominal is 47.6 deg
+                             # (0.83078 rad), but MEASURED live the floor RAMPED ~+0.12 m across the
+                             # 0.5-2 m band (telemetry floor_ramp_m) -> a low object at range read ~16 cm
+                             # too HIGH. That ramp = a ~4-5 deg pitch shortfall (the real head pose tilts
+                             # the cam DOWN more than nominal), so raised 47.6 -> 52.0. TUNE by minimising
+                             # floor_ramp_m: if a floor object still shows too HIGH (floor ramps UP with
+                             # range) RAISE this; if it now dips too LOW (ramps down) LOWER it. Analogous
+                             # to viz_mount_pitch_deg for the Mid-360 sphere -- a SEPARATE knob.
   camera_height_m: 1.30      # real D435i height above the floor -- MEASURE (head ~1.27 m)
   corridor_half_m: 0.35      # forward corridor half-width (robot half-width + margin)
   min_range_m: 0.35          # ignore closer than the D435i min range (~0.3 m)

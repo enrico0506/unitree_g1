@@ -1,0 +1,17 @@
+# weights + artifacts + third-party build outputs are large / regenerable — keep them out of git
+models/**
+!models/**/.gitkeep
+data/**
+!data/**/.gitkeep
+third_party/*/            # submodule working trees pull their own code; don't vendor build outputs
+
+# python / build junk
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.mp4
+*.egg-info/
+.venv/

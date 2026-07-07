@@ -1,14 +1,19 @@
 // Feed-mode switcher for the top-right LiDAR window.
 //
 // The window can show one of three things, full-size, chosen by a small toggle:
-//   cloud  -> the live 3D LiDAR point cloud (lidar.js, default)
+//   cloud  -> live 3D feed: the FAST-LIO map while mapping/loaded, else the 3D
+//             obstacle sphere (obstacle3d.js) re-parented into #cloudSphere
 //   radar  -> the 2D obstacle ring (obstacle.js drawn big into #bigRadar)
 //   sphere -> the 3D obstacle sphere (obstacle3d.js renderer re-parented to #bigSphere)
 //
-// We don't create second renderers: the 2D radar just draws into a bigger canvas,
-// and the 3D sphere's single WebGL canvas is moved between the small panel mount
-// (#obs-sphere) and the big mount (#bigSphere). The cloud-only overlays (nav pad,
-// view bar, map bar, legend) are hidden via the window's data-feed attribute (CSS).
+// Two client inputs drive the window: the feed toggle (cloud/radar/sphere) and
+// mapShown, mirrored from map_status (active OR points>0) by controller.js. When
+// feed=cloud and NOT mapShown the window shows the obstacle sphere (idle look,
+// identical to the 3D sphere view — same single renderer, same telemetry); when
+// mapShown it shows the FAST-LIO map (lidar.js /ws/lidar). We never stand up a
+// second WebGL context: the sphere's single canvas is re-parented between the big
+// mount (#bigSphere) and the cloud-idle mount (#cloudSphere); when neither wants
+// it, it's left parked and hidden by CSS. The 2D radar just draws bigger.
 //
 // Plain classic script, no framework. Loaded after obstacle.js (classic) and the
 // modules; wires up on DOMContentLoaded when window.Obstacle / Obstacle3D exist.
@@ -16,35 +21,56 @@
 (function () {
   "use strict";
 
+  // Module-level so setMapShown (from a map_status) and setMode (from a click)
+  // both feed the one idempotent applyLayers(); last event wins, no split-brain.
+  let feed = "cloud";
+  let mapShown = false;
+
   function init() {
     const win = document.querySelector(".lidar-window");
     if (!win) return;
     const btns = win.querySelectorAll("[data-feed-btn]");
     const bigRadar = document.getElementById("bigRadar");
     const bigSphere = document.getElementById("bigSphere");
-    const smallSphere = document.getElementById("obs-sphere");
+    const cloudSphere = document.getElementById("cloudSphere");
     if (!btns.length) return;
 
-    function setMode(mode) {
-      win.setAttribute("data-feed", mode);
-      btns.forEach((b) => b.classList.toggle("active", b.dataset.feedBtn === mode));
+    // Recompute the window's data-* attributes, the 2D radar canvas, and where the
+    // single 3D-sphere renderer is mounted, from (feed, mapShown). Idempotent.
+    function applyLayers() {
+      win.setAttribute("data-feed", feed);
+      win.setAttribute("data-cloud", mapShown ? "map" : "sphere");
+      btns.forEach((b) => b.classList.toggle("active", b.dataset.feedBtn === feed));
 
       // 2D radar: hand obstacle.js the big canvas only while it's the active view.
       if (window.Obstacle && window.Obstacle.setBigRadar) {
-        window.Obstacle.setBigRadar(mode === "radar" ? bigRadar : null);
+        window.Obstacle.setBigRadar(feed === "radar" ? bigRadar : null);
       }
-      // 3D sphere: move the single renderer to the big mount, else back to small.
-      if (window.Obstacle3D && window.Obstacle3D.mountTo) {
-        window.Obstacle3D.mountTo(mode === "sphere" ? bigSphere : smallSphere);
+      // 3D sphere: the single renderer goes to the big mount for the sphere view,
+      // to the cloud-idle mount when cloud is showing the sphere, else stays put
+      // (parked + hidden by CSS). mountTo(null) leaves the canvas where it is.
+      const target =
+        feed === "sphere" ? bigSphere :
+        (feed === "cloud" && !mapShown) ? cloudSphere :
+        null;
+      if (target && window.Obstacle3D && window.Obstacle3D.mountTo) {
+        window.Obstacle3D.mountTo(target);
       }
       // Let three.js / the radar resize to their new boxes.
       window.dispatchEvent(new Event("resize"));
     }
 
+    function setMode(mode) { feed = mode; applyLayers(); }
+    function setMapShown(b) { mapShown = !!b; applyLayers(); }
+
     btns.forEach((b) =>
       b.addEventListener("click", () => setMode(b.dataset.feedBtn)));
 
-    setMode("cloud");   // default: live cloud, sphere parked in the small panel
+    // Exposed so controller.js's updateMapStatus() can flip the cloud window
+    // between the idle sphere and the FAST-LIO map as mapping starts/stops/loads.
+    window.FeedView = { setMode: setMode, setMapShown: setMapShown };
+
+    setMode("cloud");   // default: cloud feed, sphere mounted into #cloudSphere
   }
 
   if (document.readyState === "loading") {

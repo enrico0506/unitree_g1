@@ -48,7 +48,7 @@
   })();
   </script>
   <title>G1 Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=22">
+  <link rel="stylesheet" href="/static/style.css?v=26">
   <script type="importmap">
   {
     "imports": {
@@ -88,7 +88,7 @@
       <div class="mode-buttons">
         <button data-mode="walk" class="mode-btn">Walk <small>802</small></button>
         <span class="mode-sep" aria-hidden="true"></span>
-        <button data-cmd="dance" data-combo="dance" data-arm="1" class="mode-btn behaviour" disabled title="dance: whole-body routine (R1+B)">Dance</button>
+        <button id="danceOpen" type="button" class="mode-btn behaviour" title="Choose a dance">Dance ▾</button>
         <button data-cmd="climb" data-combo="climb" data-arm="1" class="mode-btn behaviour" disabled title="climb: whole-body routine (R2+B)">Climb</button>
       </div>
     </div>
@@ -116,7 +116,6 @@
          detected gesture is also labelled on the camera feed + logged. -->
     <button id="greetingToggle" class="gesture-select greeting-toggle" type="button"
             aria-pressed="false" title="Interaction mode: the robot responds to a person's gesture (waves back, high-fives)">🤝 Interaction: off</button>
-    <span id="greetingStatus" class="greeting-status" aria-live="polite"></span>
     <div class="gesture-src" hidden>
       <button data-cmd="clap" data-arm="1">Clap</button>
       <button data-cmd="high_wave" data-arm="1">Wave</button>
@@ -130,11 +129,6 @@
     </div>
 
     <div class="header-spacer"></div>
-
-    <!-- Jump to the stripped-down phone teleop page (and remember the choice so a
-         phone opening "/" lands there next time too). -->
-    <a class="control-chip" href="/phone" title="Open the phone teleop page"
-       onclick="try{localStorage.removeItem('g1.surface')}catch(e){}">📱 Phone</a>
 
     <!-- Single-controller lock: who currently drives the robot. Click to take
          control back from a phone. Hidden until the first {type:"control"} msg. -->
@@ -173,7 +167,7 @@
         </div>
       </div>
 
-      <div class="media-window lidar-window" data-feed="cloud">
+      <div class="media-window lidar-window" data-feed="cloud" data-cloud="sphere">
         <div class="window-title">
           <span id="lidarTitleText">LiDAR 3D</span> <span id="lidarBadge" class="badge">…</span>
         </div>
@@ -185,6 +179,7 @@
         <div id="lidarView" class="lidar-canvas"></div>
         <canvas id="bigRadar" class="feed-layer"></canvas>
         <div id="bigSphere" class="feed-layer"></div>
+        <div id="cloudSphere" class="feed-layer"></div>
         <div class="map-bar feed-cloud-only">
           <button id="mapToggle" data-map="start">● Start Mapping</button>
           <button id="mapSave" data-map="save">Save</button>
@@ -256,6 +251,31 @@
           Select "Stand" then "Walk" to enable WASD / arrow control.
         </p>
       </section>
+
+      <!-- Suppress auto-climb: the onboard firmware occasionally enters climb mode
+           (FSM 802 -> 812 -> 802) on its own, with no dashboard command and the remote
+           off. When ON, the dashboard watches for that un-commanded transition and
+           immediately re-commands FSM 802 (main_control) -- the same base state Walk
+           mode already uses. Deliberate Climb-button presses are unaffected (they are
+           recognised as ours and never reversed). Flat-ground / presentation use only:
+           leave OFF wherever the robot may need to climb real stairs. Mirrors
+           #greetingToggle's on/off button pattern; state comes from fsm_state.suppress_autoclimb. -->
+      <section class="panel span-all">
+        <h2>Behavior</h2>
+        <button id="suppressClimbToggle" class="setup-toggle" type="button"
+                aria-pressed="false"
+                title="Flat-ground / presentation only: reverses an un-commanded onboard climb back to normal stance. Leave OFF if the robot may need to climb real stairs.">
+          🧗 Suppress auto-climb: off
+        </button>
+        <p class="mode-hint">
+          The onboard firmware can spontaneously trigger climb mode on level ground — not a
+          dashboard command. When ON, the dashboard detects that and immediately returns the
+          robot to normal stance. <strong>Flat-ground / presentation use only</strong> — a
+          deliberate Climb command is never affected, but turn this OFF before real stairs or
+          curbs. If the firmware keeps re-triggering, the dashboard disables this itself and
+          logs a warning (likely a real climb).
+        </p>
+      </section>
     </main>
   </div>
 
@@ -286,14 +306,15 @@
   <script src="/static/obstacle.js?v=8"></script>
   <script src="/static/step_mode.js?v=3"></script>
   <script src="/static/drive_mode.js?v=5"></script>
-  <script src="/static/controller.js?v=24"></script>
+  <script src="/static/dance.js?v=2"></script>
+  <script src="/static/controller.js?v=27"></script>
   <script src="/static/camera.js?v=4"></script>
   <script src="/static/cam-overlay.js?v=7"></script>
   <script src="/static/hands.js?v=1"></script>
   <script src="/static/pose.js?v=5"></script>
   <script src="/static/detect.js?v=4"></script>
   <script type="module" src="/static/lidar.js?v=14"></script>
-  <script type="module" src="/static/obstacle3d.js?v=10"></script>
-  <script src="/static/feedview.js?v=1"></script>
+  <script type="module" src="/static/obstacle3d.js?v=12"></script>
+  <script src="/static/feedview.js?v=2"></script>
 </body>
 </html>

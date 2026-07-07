@@ -212,9 +212,13 @@ body[data-transitioning="1"] .live-flag { display: none; }
 .lidar-window[data-feed="radar"] #bigRadar { display: block; }
 .lidar-window[data-feed="sphere"] #bigSphere { display: block; }
 .lidar-window[data-feed="sphere"] #bigSphere canvas { display: block; width: 100%; height: 100%; }
+/* cloud feed, idle (no map): show the 3D obstacle sphere instead of #lidarView */
+.lidar-window[data-feed="cloud"][data-cloud="sphere"] #cloudSphere { display: block; }
+.lidar-window[data-feed="cloud"][data-cloud="sphere"] #cloudSphere canvas { display: block; width: 100%; height: 100%; }
 /* keep the cloud renderer alive but hidden behind the active obstacle layer */
 .lidar-window[data-feed="radar"] #lidarView,
-.lidar-window[data-feed="sphere"] #lidarView { visibility: hidden; }
+.lidar-window[data-feed="sphere"] #lidarView,
+.lidar-window[data-feed="cloud"][data-cloud="sphere"] #lidarView { visibility: hidden; }
 /* cloud-only overlays (nav pad / view bar / map bar / legend) hide off-cloud */
 .lidar-window:not([data-feed="cloud"]) .feed-cloud-only { display: none; }
 .orient-legend { position: absolute; left: 110px; bottom: 13px; z-index: 2; font-family: var(--font-data); font-size: 10px; color: var(--steel); background: rgba(10,13,19,0.66); backdrop-filter: blur(6px); padding: 3px 7px; border-radius: 6px; pointer-events: none; }
@@ -447,3 +451,233 @@ input:focus-visible { outline-offset: 0; }
 /* Take-over chip blocked: another device is driving AND the robot is moving — you must
    wait for it to stop. Rendered greyed + non-interactive (button also gets :disabled). */
 .control-chip.blocked, .control-chip:disabled { opacity: .5; cursor: not-allowed; }
+
+/* =========================================================================
+   DESIGN REFRESH — user-friendliness pass (information-preserving)
+   Unifies spacing / radius / type with the phone UI, aligns the header into one
+   control band, balances the Drive panels, and tidies every surface. Appended so
+   it wins by source order; nothing above was removed and no information is hidden.
+   ========================================================================= */
+:root {
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px;
+  --r-control: 8px; --r-card: 12px; --r-pill: 999px; --r-inner: 6px;
+  --fs-eyebrow: 10px; --fs-mono: 11px; --fs-label: 13px; --fs-title: 15px;
+}
+
+/* ---- header: one aligned control band, kept to a SINGLE line at laptop widths ---- */
+header { align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+.wordmark, .tabs, .modebar, .gesture-select, .greeting-toggle,
+.control-chip, #controlChip, .status, .battery { min-height: 36px; }
+.status, .battery, .control-chip, #controlChip { display: inline-flex; align-items: center; }
+/* Compact the clusters so everything fits on one row (no forced second row; the spacer
+   just pushes the connection cluster to the right edge). */
+.wordmark { gap: var(--sp-2); margin-right: 0; }
+.modebar { gap: var(--sp-2); padding: 3px 6px 3px 11px; }
+.modebar .mode-btn { padding: 5px 9px; }
+.gesture-select, .greeting-toggle { padding-top: 7px; padding-bottom: 7px; }
+.status { gap: 6px; }
+.status #statusText { white-space: nowrap; }
+
+/* Interaction toggle is a button, not a dropdown: drop the misleading ▼ chevron, seat
+   its live caption in the band, and light it BLUE (the UI/interaction accent, matching
+   the phone) instead of the old hard-coded greens. */
+.greeting-toggle { background-image: none; padding-left: 12px; padding-right: 12px; }
+.greeting-toggle.on {
+  background: color-mix(in srgb, var(--focus) 14%, var(--surface-2));
+  border-color: var(--focus); color: var(--chalk);
+  box-shadow: inset 0 0 0 1px var(--focus), 0 0 12px -3px var(--focus);
+}
+.greeting-status { opacity: .85; color: var(--steel); font-size: var(--fs-mono); }
+/* base chips (Phone link, take-control) gain the same hover language as the tabs */
+.control-chip:not(.mine):hover { border-color: var(--focus); color: var(--chalk); }
+
+/* ---- radius system: collapse the 3/6/7/9/10/12 scramble to control / card / pill ---- */
+.tabs, .modebar, .gesture-select, .greeting-toggle, .feed-toggle,
+.cam-bar, .map-bar, .people-bar, .media-window, .panel { border-radius: var(--r-card); }
+.tab, .mode-btn, .window-title, .cam-bar button, .feed-toggle button,
+.map-bar button, .map-bar input, .map-bar select, .people-row, .obj-chip,
+.people-row input, .event-log { border-radius: var(--r-control); }
+.control-chip, #controlChip { border-radius: var(--r-pill); }
+
+/* ---- type: kill the 9 / 12.5px jitter; one label rung, legible eyebrows ---- */
+.mode-btn, .modebar .mode-btn, .gesture-select, .greeting-toggle, .mode-hint { font-size: var(--fs-label); }
+.mode-btn small, .dpad button small { font-size: var(--fs-eyebrow); }
+.map-status { font-size: var(--fs-mono); }
+
+/* ---- focus ring hugs each element's real shape ---- */
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: var(--r-control); }
+.control-chip:focus-visible, #controlChip:focus-visible { border-radius: var(--r-pill); }
+input:focus-visible { outline-offset: 0; }
+
+/* ---- media windows: stack the two label bars, unify the floating-chip recipe ---- */
+#peopleBar:not([hidden]) + #objBar:not([hidden]) { bottom: 56px; }  /* Objects above People when both on */
+.window-title { left: 9px; border-color: var(--line); background: rgba(10,13,19,0.72); backdrop-filter: blur(8px); }
+.cam-bar button, .feed-toggle button, .map-bar button, .map-bar select, .map-bar input {
+  padding: 6px 11px; font-size: 12px; line-height: 1.2;
+}
+/* map-bar: cap to the window + scroll rather than clip on short / 1024px windows (nothing hidden) */
+.map-bar { gap: var(--sp-1); max-height: calc(100% - 49px); overflow-y: auto; }
+.map-bar button, .map-bar input, .map-bar select { padding: 6px 9px; }
+
+/* ---- Drive panel: title/toggle row, grouped pad+step, clearer STOP, balanced columns ---- */
+.panel.buttons h2 { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+#drive-mode-toggle { margin-left: auto; }
+.drive-body { justify-content: center; align-items: flex-start; gap: var(--sp-4); }
+.drive-main { flex: 0 1 280px; }
+.dpad { gap: var(--sp-2); }
+.dpad .up, .dpad .left, .dpad .right, .dpad .down { font-size: 16px; }
+.dpad .center.stop { background: color-mix(in srgb, var(--stop) 12%, var(--surface-2)); }
+.obs-toggles { align-items: stretch; }
+.step-btn:hover { background: var(--surface); color: #fff; }
+@media (min-width: 760px) {
+  main.controls { align-items: stretch; }
+  main.controls .panel:not(.buttons) { display: flex; flex-direction: column; }
+  main.controls #obstacle-panel { flex: 1 1 auto; justify-content: center; }
+}
+
+/* ---- Setup tab: compose the lone panel instead of a stretched full-width band ---- */
+main.setup { grid-template-columns: minmax(0, 820px); }
+.setup .panel { padding: 20px 22px; }
+.setup .mode-buttons { gap: var(--sp-2); }
+.setup .mode-sep { margin: 0 var(--sp-3); min-height: 28px; }
+.setup .mode-btn { padding: 11px 16px; }
+.setup .mode-hint { max-width: 62ch; margin-top: 14px; }
+
+/* Suppress auto-climb toggle (Behavior panel): a standalone on/off button, same shape
+   language as .greeting-toggle / .obs-btn.primary but lit in --caution (orange) rather
+   than the calm live/focus colors -- it is actively overriding onboard-firmware safety
+   behavior, so the ON state should read as a deliberate, watchful choice, not routine. */
+.setup-toggle {
+  font-family: inherit; font-size: var(--fs-label); font-weight: 500;
+  color: var(--chalk); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: var(--r-card);
+  padding: 10px 16px; cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s, box-shadow .15s;
+}
+.setup-toggle:hover { color: #fff; border-color: var(--focus); }
+.setup-toggle.on {
+  color: #fff; background: color-mix(in srgb, var(--caution) 18%, var(--surface-2));
+  border-color: var(--caution);
+  box-shadow: inset 0 0 0 1px var(--caution), 0 0 12px -3px var(--caution);
+}
+.setup .setup-toggle + .mode-hint { margin-top: 10px; }
+
+/* ---- Logs & Info tab: tighter readouts, a bounded log 'well', quiet-button feedback ---- */
+.diag .vel-line { max-width: 460px; }
+.event-log { background: var(--inset); border: 1px solid var(--line-soft); padding: 10px 12px; min-height: 120px; }
+#fsmMismatch:empty { display: none; margin: 0; }
+.log-clear:hover { border-color: var(--focus); color: var(--chalk); }
+.log-clear:active { background: var(--surface); transform: translateY(1px); }
+
+/* ---- vertical rhythm on the spacing grid ---- */
+.windows { gap: var(--sp-3); margin-bottom: var(--sp-4); }
+main, main.controls, main.diag { gap: var(--sp-3); }
+.panel { padding: var(--sp-4); }
+.mode-readout { gap: var(--sp-2); }
+
+/* =========================================================================
+   DANCE CHOOSER + DANCE LAB (dance.js)
+   A modal opened by the header "Dance ▾" button: pick a named dance (each tile
+   shows the clear space it needs), plus a supervised "Dance Lab" to discover and
+   save new working dance FSM ids. Themed with the console's tokens.
+   ========================================================================= */
+.dance-modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; background: rgba(6,9,14,0.66); backdrop-filter: blur(4px);
+}
+.dance-modal[hidden] { display: none; }
+.dance-card {
+  width: min(560px, 100%); max-height: min(86vh, 720px); overflow-y: auto;
+  background: linear-gradient(180deg, var(--surface), var(--surface-2));
+  border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 18px;
+}
+.dance-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.dance-head h2 { margin: 0; font-size: 16px; color: var(--chalk); letter-spacing: .01em; }
+.dance-close {
+  width: 30px; height: 30px; padding: 0; font-size: 14px; line-height: 1;
+  background: var(--surface-2); color: var(--steel); border: 1px solid var(--line); border-radius: 7px;
+}
+.dance-close:hover { color: var(--chalk); border-color: var(--focus); }
+
+.dance-warn {
+  font-size: 12px; color: var(--caution); background: color-mix(in srgb, var(--caution) 12%, var(--inset));
+  border: 1px solid color-mix(in srgb, var(--caution) 40%, var(--line));
+  border-radius: 8px; padding: 8px 11px; margin-bottom: 12px;
+}
+.dance-warn[hidden] { display: none; }
+.dance-warn.flash { animation: pulse 0.6s ease-in-out 2; }
+
+.dance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.dance-empty { grid-column: 1 / -1; color: var(--steel); font-size: 13px; text-align: center; padding: 14px 0; }
+.dance-tile {
+  display: flex; flex-direction: column; gap: 5px;
+  background: var(--inset); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 11px;
+}
+.dance-tile.active { border-color: var(--live); box-shadow: 0 0 0 1px var(--live), 0 0 16px rgba(63,211,155,0.2); }
+.dt-name { font-size: 13px; font-weight: 600; color: var(--chalk); }
+.dt-space { font-family: var(--font-data); font-size: 11px; color: var(--st-stand); }
+.dt-note { font-size: 11px; color: var(--steel-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dt-play {
+  margin-top: 4px; padding: 7px 9px; font-size: 12px; font-weight: 600;
+  background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px;
+}
+.dt-play:hover:not(:disabled) { border-color: var(--focus); }
+.dt-play:disabled { opacity: 0.45; cursor: not-allowed; }
+.dance-tile.active .dt-play { color: var(--live); border-color: var(--live); }
+
+.dance-foot { margin-top: 12px; }
+.dance-stop {
+  width: 100%; padding: 9px; font-size: 13px; font-weight: 600;
+  background: color-mix(in srgb, var(--stop) 16%, var(--surface-2)); color: var(--stop);
+  border: 1px solid color-mix(in srgb, var(--stop) 50%, var(--line)); border-radius: 8px;
+}
+.dance-stop[hidden] { display: none; }
+
+/* ---- Dance Lab (supervised probe) ---- */
+.dance-lab { margin-top: 16px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.dance-lab > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--chalk); list-style: none; }
+.dance-lab > summary::-webkit-details-marker { display: none; }
+.dance-lab-note { font-size: 11.5px; line-height: 1.5; color: var(--steel); margin: 10px 0 12px; }
+.dance-lab-note b { color: var(--chalk); }
+.dance-lab-row, .dance-lab-save { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-bottom: 11px; }
+.dance-lab label { font-size: 11px; color: var(--steel); display: inline-flex; align-items: center; gap: 6px; }
+.dance-lab input {
+  padding: 6px 8px; font-size: 12px; font-family: var(--font-ui);
+  background: var(--inset); color: var(--chalk); border: 1px solid var(--line); border-radius: 6px;
+}
+.dance-lab input[type="number"] { width: 74px; font-family: var(--font-data); }
+.dance-lab input[type="text"] { width: 120px; }
+.lab-fire {
+  padding: 7px 12px; font-size: 12px; font-weight: 600;
+  background: color-mix(in srgb, var(--caution) 16%, var(--surface-2)); color: var(--caution);
+  border: 1px solid color-mix(in srgb, var(--caution) 50%, var(--line)); border-radius: 7px;
+}
+.lab-fire:disabled { opacity: 0.45; cursor: not-allowed; }
+.lab-cur { font-size: 11px; color: var(--steel); font-family: var(--font-data); }
+.lab-cur b { color: var(--chalk); }
+.dance-lab-save { border-top: 1px dashed var(--line-soft); padding-top: 11px; }
+.lab-save-label { font-size: 11px; color: var(--steel); }
+.lab-save {
+  padding: 7px 12px; font-size: 12px; font-weight: 600;
+  background: color-mix(in srgb, var(--live) 15%, var(--surface-2)); color: var(--live);
+  border: 1px solid color-mix(in srgb, var(--live) 45%, var(--line)); border-radius: 7px;
+}
+
+/* ---- Dance Lab: candidate (unverified) tiles + Test / remove controls ---- */
+.dance-tile { position: relative; }
+.dance-tile.candidate { border-style: dashed; }
+.dt-del {
+  position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; padding: 0;
+  font-size: 11px; line-height: 1; border-radius: 5px;
+  background: transparent; color: var(--steel-dim); border: 1px solid transparent;
+}
+.dt-del:hover { color: var(--stop); border-color: color-mix(in srgb, var(--stop) 45%, var(--line)); }
+.dt-test {
+  margin-top: 4px; padding: 7px 9px; font-size: 12px; font-weight: 600;
+  background: color-mix(in srgb, var(--caution) 15%, var(--surface-2)); color: var(--caution);
+  border: 1px solid color-mix(in srgb, var(--caution) 45%, var(--line)); border-radius: 7px;
+}
+.dt-test:hover:not(:disabled) { border-color: var(--caution); }
+.dt-test:disabled { opacity: 0.45; cursor: not-allowed; }
