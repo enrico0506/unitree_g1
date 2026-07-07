@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -317,6 +318,10 @@ class ControlState:
         self.greeting_mode = False
         self.greeting_status = ""    # e.g. "saw wave -> waving back"
         self.greeting_busy_until = 0.0   # wall-clock until which a greeting gesture is mid-motion
+        # Discrete gesture events handed from the greeting daemon thread to broadcast_loop
+        # (append/popleft are atomic under the GIL; single-producer/single-consumer, no lock).
+        # Each is a ready-to-send {type:"gesture_event", ...} for the feed label + log line.
+        self.gesture_events = deque(maxlen=32)
         # Battery (from rt/lf/bmsstate; None until the first BMS message arrives)
         self.battery_soc = None      # % state-of-charge
         self.battery_v = None        # pack volts
@@ -1179,6 +1184,11 @@ async def broadcast_loop():
                 tm["depth_ring"] = depth_nf.front_ring()       # per-sector depth ring or None
             await broadcast(tm)
 
+        # Flush any discrete gesture events (feed label + log line) the greeting thread
+        # queued -- independent of the telemetry throttle so a burst isn't coalesced.
+        while state.gesture_events:
+            await broadcast(state.gesture_events.popleft())
+
         await asyncio.sleep(0.1)
 
 
@@ -1366,6 +1376,19 @@ async def lifespan(app: FastAPI):
         # make_state_msg on the next broadcast tick), fired-or-not.
         state.greeting_status = greeting_describe(ev)
         print(f"[GREETING] {state.greeting_status}", flush=True)
+        # Hand a discrete gesture_event to broadcast_loop so the camera feed can label the
+        # person + the dashboard logs a line -- on EVERY classified gesture, fired or not.
+        # fired = would the robot actually move (same safety gate, a pure read here); box/w/h
+        # anchor the on-feed label even when the skeleton overlay is off.
+        state.gesture_events.append({
+            "type": "gesture_event",
+            "track_id": ev.get("track_id"),
+            "human": ev.get("human", ev.get("gesture")),
+            "robot": ev.get("robot_gesture"),
+            "fired": _greeting_safe(),
+            "ts": ev.get("t", time.time()),
+            "box": ev.get("box"), "w": ev.get("w"), "h": ev.get("h"),
+        })
 
     def _greeting_on_skip(ev):
         # Classified but gated out by _greeting_safe -> tell the operator we saw it and why

@@ -101,6 +101,7 @@ function connect() {
       else if (msg.type === "control") updateControl(msg);
       else if (msg.type === "takeover_denied")
         logEvent("can't take control while the robot is moving — wait until it stops", "warn");
+      else if (msg.type === "gesture_event") handleGesture(msg);
     } catch (e) { /* ignore */ }
   };
 
@@ -252,10 +253,10 @@ function updateFsmState(msg) {
     if (gt) {
       gt.classList.toggle("on", greetingOn);
       gt.setAttribute("aria-pressed", greetingOn ? "true" : "false");
-      gt.textContent = greetingOn ? "🤖 Greet: ON" : "🤖 Greet: off";
+      gt.textContent = greetingOn ? "🤝 Interaction: ON" : "🤝 Interaction: off";
     }
     const gs = document.getElementById("greetingStatus");
-    if (gs) gs.textContent = greetingOn ? (msg.greeting_status || "watching for a wave…") : "";
+    if (gs) gs.textContent = greetingOn ? (msg.greeting_status || "watching for gestures…") : "";
   }
 }
 
@@ -683,6 +684,17 @@ function logEvent(text, level) {
 }
 const logClearBtn = document.getElementById("logClear");
 if (logClearBtn) logClearBtn.addEventListener("click", () => { eventLog.innerHTML = ""; });
+
+// A detected human gesture (interaction mode): log a line + flash a label on the person in
+// the camera feed. fired = the robot actually responded; otherwise it saw it but held.
+function handleGesture(msg) {
+  const human = msg.human || "gesture";
+  const who = msg.track_id != null ? ` #${msg.track_id}` : "";
+  const tail = msg.fired ? ` → robot ${msg.robot || "?"}` : " (held — not safe)";
+  logEvent(`👋${who} ${human}${tail}`, msg.fired ? "ok" : "warn");
+  if (window.CamOverlay && msg.track_id != null)
+    window.CamOverlay.pushGesture(msg.track_id, "👋 " + human, 2500, msg.box, msg.w, msg.h);
+}
 
 function updateBattery(soc, volts) {
   const pill = document.getElementById("battery");

@@ -409,6 +409,9 @@ class GestureReactor:
             "robot_gesture": GESTURE_TO_ROBOT.get(gesture),
             "human": GESTURE_HUMAN.get(gesture, gesture),
             "t": t,
+            # Target's image box + frame size so a UI can anchor an on-feed label to the
+            # right person even without the live pose overlay. Inert for existing callers.
+            "box": target.get("box"), "w": w, "h": h,
         }
 
 

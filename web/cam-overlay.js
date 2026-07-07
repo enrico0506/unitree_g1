@@ -20,6 +20,10 @@
 
   let poseOn = false, detectOn = false;
   let poseData = null, detectData = null, handsData = null;   // each: { w, h, items:[...] }
+  // Short-lived "👋 wave" labels anchored to a person's track. id -> {text, expiry, box, w, h}.
+  // Rendered every frame (even with Skeleton off) and self-expiring, so they never pile up.
+  const gestureLabels = new Map();
+  const GESTURE_LABEL_COLOR = "88,200,250";   // blue, distinct from the green skeleton chip
 
   // COCO-17 skeleton bones (index pairs into the keypoint array).
   const BONES = [
@@ -173,6 +177,30 @@
     }
   }
 
+  // Draw the short-lived gesture labels. Follows the live pose box while Skeleton is on;
+  // else falls back to the box snapshot carried on the event, so it works with Skeleton off.
+  function drawGestureLabels(cw, ch) {
+    if (!gestureLabels.size) return;
+    const now = performance.now();
+    ctx.font = "14px ui-monospace, Menlo, monospace";
+    ctx.textBaseline = "top";
+    for (const [id, g] of gestureLabels) {
+      if (now >= g.expiry) { gestureLabels.delete(id); continue; }
+      const a = Math.min(1, (g.expiry - now) / 500);   // fade over the last 0.5 s
+      const live = poseData && poseData.items && poseData.items.find((p) => p.id === id);
+      const box = live ? live.box : g.box;
+      const srcFrame = live ? poseData : { w: g.w, h: g.h };
+      const P = projector(srcFrame, cw, ch);
+      if (!P || !box) continue;
+      const [x, y] = P(box[0], box[3]);          // bottom-left, clear of the top #id chip
+      const tw = ctx.measureText(g.text).width;
+      ctx.fillStyle = `rgba(${GESTURE_LABEL_COLOR},${0.85 * a})`;
+      ctx.fillRect(x, y + 2, tw + 8, 17);
+      ctx.fillStyle = `rgba(6,20,30,${a})`;
+      ctx.fillText(g.text, x + 4, y + 4);
+    }
+  }
+
   function frame() {
     requestAnimationFrame(frame);
     const cw = camFeed.clientWidth, ch = camFeed.clientHeight;
@@ -194,6 +222,7 @@
     if (detectOn && detectData) drawDetect(detectData, cw, ch);
     if (poseOn && poseData) drawPose(poseData, cw, ch);   // skeletons on top
     if (poseOn && handsData) drawHands(handsData, cw, ch); // fingers ride the Skeleton toggle
+    drawGestureLabels(cw, ch);   // UNCONDITIONAL: gesture labels show even with Skeleton off
 
     // On-canvas readout: proves the overlay layer is rendering and shows the live
     // count the browser is receiving (skeleton people / detected objects).
@@ -220,5 +249,12 @@
     setPoseData(d) { poseData = d; },
     setDetectData(d) { detectData = d; },
     setHandsData(d) { handsData = d; },
+    // Flash a gesture label on a person for ttlMs (default 2.5 s). box/w/h let it anchor
+    // even when the Skeleton overlay is off; while it's on, the live pose box wins.
+    pushGesture(id, text, ttlMs, box, w, h) {
+      if (id == null) return;
+      gestureLabels.set(id, { text, expiry: performance.now() + (ttlMs || 2500),
+                              box: box || null, w: w || 0, h: h || 0 });
+    },
   };
 })();
