@@ -443,3 +443,7 @@ input:focus-visible { outline-offset: 0; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Take-over chip blocked: another device is driving AND the robot is moving — you must
+   wait for it to stop. Rendered greyed + non-interactive (button also gets :disabled). */
+.control-chip.blocked, .control-chip:disabled { opacity: .5; cursor: not-allowed; }

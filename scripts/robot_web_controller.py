@@ -297,6 +297,9 @@ class ControlState:
         self.cmd_vyaw = 0.0
         self.last_packet_time = 0.0
         self.is_moving = False
+        # Wall-clock until which the robot counts as "locomoting" (refreshed on every non-zero
+        # velocity command). Latches motion across step-mode settle gaps; see _locomoting().
+        self.moving_hold_until = 0.0
         self.pending_cmd = None
         self.mode = INITIAL_MODE
         # Discrete-step pacing mode: 'continuous' (analog, default), 'small', 'medium'.
@@ -335,6 +338,45 @@ clients: set = set()
 #   control_owner_id: the client_id that currently holds the lock, or None (free).
 client_meta: dict = {}
 control_owner_id = None
+
+# Access model: driving (joysticks), mode changes and whole-body combos (dance/climb)
+# stay EXCLUSIVE to the lock owner. These arm "greeting" gestures are SHARED -- any
+# connected client may fire them even without the lock, so onlookers can greet while one
+# person drives. They're serialized by _arm_lock and gated to an upright robot below.
+OPEN_GESTURES = frozenset({"high_wave", "high_five", "clap", "shake", "hug", "heart", "kiss"})
+
+# How long a commanded non-zero velocity keeps the robot considered "locomoting" after the
+# last motion command. Bridges the pacer's OFF/settle windows in step mode so the take-over
+# gate can't flicker open between steps (review finding #3).
+MOVE_HOLD_S = 0.7
+# Per-gesture arm-busy windows (s) -- how long an accepted arm gesture keeps the arms moving,
+# so overlapping shared/auto gestures can't interleave mid-hold (review finding #4). Shared
+# with the auto-greeting path (state.greeting_busy_until).
+_ARM_BUSY_S = {"wave": 3.5, "high_five": 5.0, "hug": 5.0, "heart": 5.0,
+               "shake": 4.0, "clap": 2.5, "kiss": 2.5, "high_wave": 3.5}
+
+
+def _locomoting():
+    """True iff the robot is actively translating in walk. Mode-guarded (a non-walk robot is
+    NEVER locomoting, so it is always take-able -- fixes the is_moving latch after an
+    uncommanded FSM drop, review #2) + a short hold window (review #3) so the step-mode settle
+    gaps don't momentarily read as 'stopped' and open the take-over gate mid-drive."""
+    return (state.mode == "walk" and not state.transitioning
+            and time.time() < state.moving_hold_until)
+
+
+def _arm_busy():
+    """True while an arm gesture is still physically in motion (shared with the greeting path
+    via state.greeting_busy_until), so a second gesture can't interleave mid-hold (review #4)."""
+    return time.time() < state.greeting_busy_until
+
+
+def _gesture_exec_ok():
+    """Safe to run an arm/hero gesture RIGHT NOW: upright, settled, NOT translating, and the
+    owner's arms are not raised. Re-checked at execution time because a shared gesture can be
+    enqueued by a non-owner and the robot state can change before it drains (review #1,#5,#6)."""
+    return (state.mode in ("stand", "walk") and not state.transitioning
+            and not _locomoting() and not state.arm_raised)
 
 camera: CameraSource = None
 pose: CameraSource = None
@@ -911,6 +953,10 @@ def make_state_msg():
         "fsm_name": state.fsm_name,
         "ui_mode": state.mode,
         "transitioning": state.transitioning,
+        # True while the robot is actively locomoting (walk + moving, latched across step
+        # gaps). Clients gate the "take over" button on it -- exactly the server's take_control
+        # rule -- so a non-walk/stopped robot is always take-able.
+        "moving": _locomoting(),
         # Greeting-mode toggle + last feedback line ("saw wave -> waving back"), so the
         # dashboard button reflects reality and shows what the robot just reacted to.
         "greeting_mode": state.greeting_mode,
@@ -977,7 +1023,19 @@ def command_loop():
         if state.pending_cmd is not None:
             cmd = state.pending_cmd
             state.pending_cmd = None
-            threading.Thread(target=apply_cmd, args=(cmd,), daemon=True).start()
+            # Execution-time safety re-check for SHARED arm gestures: one can be enqueued by a
+            # non-owner and then the robot starts moving / leaves upright before it drains
+            # (review #1 exec gap, #6 TOCTOU). Never run an arm/hero gesture on a translating
+            # or non-upright robot; owner-only commands (modes/combos/hands_up) are unaffected.
+            if cmd in OPEN_GESTURES and not _gesture_exec_ok():
+                print(f"[GESTURE] dropped shared '{cmd}' -- unsafe at execution "
+                      f"(mode={state.mode} moving={_locomoting()})", flush=True)
+            else:
+                if cmd in OPEN_GESTURES:
+                    # Start the arm-busy window when the gesture actually RUNS (not at
+                    # enqueue) so a gesture dropped by the re-check above never blocks the arms.
+                    state.greeting_busy_until = now + _ARM_BUSY_S.get(cmd, 3.5)
+                threading.Thread(target=apply_cmd, args=(cmd,), daemon=True).start()
 
         # Watchdog: browser went silent -> force stop. Comms loss is a safety event,
         # so reset the shaper (instant stop) rather than easing down a stale ramp.
@@ -1046,6 +1104,12 @@ def command_loop():
         last_desired = desired   # feeds the pacer's settle gate on the next tick
 
         moving = desired != (0.0, 0.0, 0.0)
+        if moving:
+            # Refresh the locomotion hold every tick a non-zero velocity is commanded, so the
+            # take-over gate stays closed across step-mode OFF windows and for MOVE_HOLD_S
+            # after the operator releases (review #3). Runs regardless of in_walk; _locomoting()
+            # additionally requires mode == walk so a non-walk robot is never "locomoting".
+            state.moving_hold_until = now + MOVE_HOLD_S
         changed = any(abs(desired[i] - last_sent[i]) > DEADZONE for i in range(3))
 
         # Send only on CHANGE or as a low-rate refresh -- these are blocking RPCs;
@@ -1277,17 +1341,13 @@ async def lifespan(app: FastAPI):
     # The reactor adds its own debounce on top (per-gesture cooldown + a global refractory),
     # so a continuous wave fires exactly once and gestures can never machine-gun.
     #
-    # Conservative upper bounds on how long each robot response keeps the arms in motion
-    # (WaveHand is self-completing; the arm actions hold for their auto_release then settle).
-    _GREETING_BUSY_S = {"wave": 3.5, "high_five": 5.0, "hug": 5.0, "heart": 5.0}
-
     def _greeting_enabled():
         return state.greeting_mode
 
     def _greeting_safe():
         return (arm_client is not None and client is not None
                 and state.mode == "walk"          # upright, balancing, ready -- not damped
-                and not state.is_moving            # not translating right now
+                and not _locomoting()              # not translating (latched across step gaps)
                 and not state.transitioning        # not mid mode-change
                 and not state.arm_raised            # arms not already raised (hands_up)
                 and state.pending_cmd is None       # nothing already queued to run
@@ -1299,7 +1359,7 @@ async def lifespan(app: FastAPI):
         # the arm busy for the gesture's duration so nothing else fires mid-motion.
         if robot_gesture and state.pending_cmd is None:
             state.pending_cmd = robot_gesture
-            state.greeting_busy_until = time.time() + _GREETING_BUSY_S.get(robot_gesture, 4.0)
+            state.greeting_busy_until = time.time() + _ARM_BUSY_S.get(robot_gesture, 4.0)
 
     def _greeting_on_event(ev):
         # Every classified gesture updates the dashboard feedback line (surfaced by
@@ -1688,14 +1748,41 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             if mtype == "take_control":
-                # Explicit "I control the movements now" -- always steals the lock from
-                # whoever held it (and zeroes velocity via _set_owner, so no lurch).
+                # Explicit "I control the movements now". Safety handoff: you may seize the
+                # lock when it is FREE or when the robot is NOT actively moving. Never rip
+                # control from a device whose robot is translating -- wait until it stops.
+                # _set_owner zeroes velocity on handoff, so there's no lurch.
                 cid = str(msg.get("client_id") or "")
                 if cid:
-                    meta = client_meta.get(ws) or {"id": None, "label": "device"}
-                    meta["id"] = cid
-                    client_meta[ws] = meta
-                    await _set_owner(cid)
+                    held_by_other = control_owner_id is not None and control_owner_id != cid
+                    if held_by_other and _locomoting():
+                        # Refuse only while the robot is actually locomoting (walk + moving).
+                        # A non-walk / damped / faulted robot is ALWAYS take-able so a backup
+                        # operator can recover it (review #2); the hold timer keeps this closed
+                        # across step-mode settle gaps (#3). Tell the asker so its button waits.
+                        await ws.send_text(json.dumps(
+                            {"type": "takeover_denied", "reason": "moving"}))
+                    else:
+                        meta = client_meta.get(ws) or {"id": None, "label": "device"}
+                        meta["id"] = cid
+                        client_meta[ws] = meta
+                        await _set_owner(cid)
+                continue
+
+            if mtype == "cmd" and msg.get("name") in OPEN_GESTURES:
+                # SHARED arm gesture -- any connected client may fire it, with or without the
+                # drive lock. Mirrors the auto-greeting safety gate (_greeting_safe): upright
+                # and settled (stand/walk), NOT translating (never move the arms mid-stride --
+                # review #1), the owner's hands_up-raised arms are left alone (#5), and no arm
+                # gesture is already queued or physically in motion (#4). Sets the shared
+                # arm-busy window on accept so overlapping gestures can't interleave.
+                # Deliberately does NOT touch last_packet_time: a shared gesture must never
+                # feed the driver's motion watchdog (a silent driver still halts the robot).
+                gname = msg.get("name", "")
+                if (state.mode in ("stand", "walk") and not state.transitioning
+                        and not _locomoting() and not state.arm_raised
+                        and state.pending_cmd is None and not _arm_busy()):
+                    state.pending_cmd = gname   # arm-busy window starts at execution (drain)
                 continue
 
             # Every other message MUTATES robot state -> only the lock owner may send

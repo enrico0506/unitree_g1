@@ -42,6 +42,10 @@
   const axes = { fwd: 0, strafe: 0, turn: 0 };
   let uiMode = "damp", transitioning = false;
   let hasControl = false, ownerLabel = null;
+  let robotMoving = false;   // fsm_state.moving — you can only take the drive lock while stopped
+  // Arm "greeting" gestures any client may fire WITHOUT the drive lock (match the server's
+  // OPEN_GESTURES). Driving, modes and Dance/Climb still take control first.
+  const OPEN_GESTURES = new Set(["high_wave", "high_five", "clap", "shake", "hug", "heart", "kiss"]);
   let actionsOpen = false;                 // Actions surface shown -> deck inert
   let comboReady = { dance: false, climb: false };   // server-captured whole-body FSM ids
   let gestureBusyUntil = 0;                // optimistic double-fire lock (monotonic ms)
@@ -90,6 +94,16 @@
         case "telemetry": applyTelemetry(msg); break;
         case "obstacle":  applyObstacle(msg); break;
         case "control":   applyControl(msg); break;
+        case "takeover_denied":
+          // Visible on BOTH surfaces: the Actions status line AND a brief flash on the
+          // always-on header chip (the Drive surface has no actions status).
+          setActionStatus("Robot moving — stop it to take control");
+          if (el.chip) {
+            el.chip.classList.add("denied");
+            el.chip.textContent = "○ robot moving — can't take yet";
+            setTimeout(() => { el.chip.classList.remove("denied"); renderChip(); }, 1600);
+          }
+          break;
         case "step_mode": applyStep(msg.name || msg.mode || msg.step_mode); break;
       }
     };
@@ -126,6 +140,7 @@
   function applyFsm(msg) {
     uiMode = msg.ui_mode || "";
     transitioning = !!msg.transitioning;
+    if (msg.moving !== undefined) { robotMoving = !!msg.moving; renderChip(); }
     document.body.dataset.mode = uiMode;
     document.body.dataset.transitioning = transitioning ? "1" : "";
     if (el.mode) el.mode.textContent = uiMode || "—";
@@ -165,27 +180,40 @@
   // =====================================================================
   // Control lock UI
   // =====================================================================
+  // Repaint the control chip. Shared by setControl (owner changed) and applyFsm (robot
+  // started/stopped moving), because the take-over gate depends on BOTH: another device
+  // driving AND the robot moving -> you must wait for it to stop.
+  function renderChip() {
+    if (!el.chip) return;
+    const blocked = !hasControl && !!ownerLabel && robotMoving;
+    el.chip.classList.toggle("mine", hasControl);
+    el.chip.classList.toggle("theirs", !hasControl);
+    el.chip.classList.toggle("blocked", blocked);
+    el.chip.textContent = hasControl
+      ? "● You have control"
+      : blocked ? `○ ${ownerLabel} driving — stop to take`
+      : (ownerLabel ? `○ ${ownerLabel} driving — tap to take` : "○ Take control");
+  }
+
   function setControl(mine, label) {
     const changed = (mine !== hasControl);
     hasControl = mine;
     ownerLabel = label;
-
-    // chip
-    if (el.chip) {
-      el.chip.classList.toggle("mine", mine);
-      el.chip.classList.toggle("theirs", !mine);
-      el.chip.textContent = mine
-        ? "● You have control"
-        : (label ? `○ ${label} driving — tap to take` : "○ Take control");
-    }
+    renderChip();
     // Grab-on-first-tap model: the read-only overlay must NEVER block the deck, or you
     // couldn't tap a control to grab. Keep it hidden; the chip shows who drives, and any
-    // stick/gesture/mode tap takes control (steals) via withControl().
+    // stick/mode tap takes control (steals) via withControl().
     if (el.takeOverlay) el.takeOverlay.hidden = true;
     if (changed && !mine) { resetSticks(); closeSheet(); closeActions(); pendingAction = null; }
     if (changed && mine) runPending();   // grab-on-first-tap: fire the queued action now
     renderDeckHint();
     renderActions();          // arm/whole-body gating follows the control lock
+  }
+
+  // Only send an explicit take-over when it can succeed: not already owner, and not blocked
+  // by another device actively driving (server enforces the same rule -> avoids a futile ask).
+  function tryTakeControl() {
+    if (!hasControl && !(ownerLabel && robotMoving)) requestControl();
   }
 
   function requestControl() { send({ type: "take_control", client_id: CLIENT_ID }); }
@@ -480,7 +508,8 @@
   // guard -- the server's apply_cmd does NOT mode-check); whole-body needs its FSM id captured.
   function renderActions() {
     if (el.actionsHint) {
-      el.actionsHint.textContent = !hasControl ? "Tap a tile to take control"
+      el.actionsHint.textContent = !hasControl
+        ? "Greetings work for anyone · other actions take control"
         : armReady() ? "Robot is up — OK" : "Stand first for arm gestures";
     }
     document.querySelectorAll("#phGestGrid .ph-gest").forEach((b) =>
@@ -528,7 +557,7 @@
   // one-shot gesture (mirrors controller.js). Arm-gated tiles need the robot up;
   // a short busy-lock stops double-fire.
   function fireGesture(name, isArm) {
-    withControl(() => {
+    const run = () => {
       if (isArm && !armReady()) { setActionStatus("Stand first for arm gestures"); return; }
       const now = performance.now();
       if (now < gestureBusyUntil) return;
@@ -536,7 +565,11 @@
       send({ type: "cmd", name });
       setActionStatus("→ " + (GEST_LABEL[name] || name));
       if (navigator.vibrate) navigator.vibrate(15);
-    });
+    };
+    // Shared arm gestures fire WITHOUT the drive lock (the server accepts them from any
+    // client). Owner-only actions (hands_up / release_arm) take control first.
+    if (OPEN_GESTURES.has(name)) run();
+    else withControl(run);
   }
 
   // whole-body hold-to-fire: press-and-hold ~1.3 s (progress fill); release early aborts.
@@ -609,7 +642,8 @@
     }
     base.addEventListener("pointerdown", (e) => {
       if (pointerId !== null) return;
-      if (!hasControl) requestControl();   // grab-on-first-touch (drives once the grant lands)
+      tryTakeControl();   // grab-on-first-touch when free/stopped (drives once granted; a
+                          // moving robot held by another device denies -> takeover_denied)
       if (!drivable()) return;
       pointerId = e.pointerId;
       originX = e.clientX; originY = e.clientY;   // anchor neutral to the touch-down point
@@ -713,8 +747,8 @@
       }));
 
     // take-control affordances (taking control is a natural moment to go immersive)
-    if (el.takeBtn) el.takeBtn.addEventListener("click", () => { requestControl(); goImmersive(); });
-    if (el.chip) el.chip.addEventListener("click", () => { if (!hasControl) requestControl(); });
+    if (el.takeBtn) el.takeBtn.addEventListener("click", () => { tryTakeControl(); goImmersive(); });
+    if (el.chip) el.chip.addEventListener("click", () => { tryTakeControl(); });
 
     // fullscreen + landscape lock toggle (⛶). Hidden if already launched standalone
     // (Add-to-Home-Screen) since we're already chromeless there.

@@ -56,7 +56,11 @@ const CLIENT_ID = (window.crypto && crypto.randomUUID)
   : "laptop-" + Math.random().toString(36).slice(2);
 const CLIENT_LABEL = "Laptop";
 const ALWAYS_ALLOWED_MSGS = new Set(["hello", "take_control"]);
+// Arm "greeting" gestures any connected client may fire WITHOUT the drive lock (must match
+// the server's OPEN_GESTURES). Driving, mode changes and Dance/Climb stay owner-exclusive.
+const OPEN_GESTURES = new Set(["high_wave", "high_five", "clap", "shake", "hug", "heart", "kiss"]);
 let hasControl = false;
+let robotMoving = false;   // from fsm_state.moving — you can only take the lock while stopped
 let ownerLabel = null;
 
 const statusEl = document.getElementById("status");
@@ -95,6 +99,8 @@ function connect() {
         window.Obstacle3D && window.Obstacle3D.update(msg);
       }
       else if (msg.type === "control") updateControl(msg);
+      else if (msg.type === "takeover_denied")
+        logEvent("can't take control while the robot is moving — wait until it stops", "warn");
     } catch (e) { /* ignore */ }
   };
 
@@ -117,8 +123,11 @@ function connect() {
 function send(obj) {
   if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
   // Read-only device: while another device holds the control lock, drop every
-  // mutating command (move/mode/obstacle/step/map/cmd). hello + take_control pass.
-  if (obj && obj.type && !ALWAYS_ALLOWED_MSGS.has(obj.type) && !hasControl) return;
+  // mutating command (move/mode/obstacle/step/map/cmd). hello + take_control pass, and so
+  // do the SHARED arm gestures (cmd + an OPEN_GESTURES name) — those need no lock.
+  const shared = obj && (ALWAYS_ALLOWED_MSGS.has(obj.type)
+    || (obj.type === "cmd" && OPEN_GESTURES.has(obj.name)));
+  if (obj && obj.type && !shared && !hasControl) return;
   ws.send(JSON.stringify(obj));
 }
 
@@ -228,6 +237,13 @@ function updateFsmState(msg) {
     window.DriveMode.reset();
   }
 
+  // Robot motion drives the take-over gate: the "take control" chip is blocked while
+  // another device is actively driving, and unblocks the moment the robot stops.
+  if (msg.moving !== undefined) {
+    robotMoving = !!msg.moving;
+    renderControlChip();
+  }
+
   // Greeting mode (auto wave-back): reflect the server's truth on the toggle + caption,
   // so the button state is authoritative even if another device flipped it.
   if (msg.greeting_mode !== undefined) {
@@ -287,18 +303,28 @@ function renderControlChip() {
   const chip = document.getElementById("controlChip");
   if (!chip) return;
   chip.hidden = false;
+  // Another device is driving AND the robot is moving -> you must wait for it to stop
+  // before you can take the lock (the server enforces the same rule).
+  const blocked = !hasControl && !!ownerLabel && robotMoving;
   chip.classList.toggle("mine", hasControl);
   chip.classList.toggle("theirs", !hasControl);
+  chip.classList.toggle("blocked", blocked);
+  chip.disabled = blocked;
   chip.textContent = hasControl
     ? "● You have control"
-    : (ownerLabel ? `○ ${ownerLabel} has control · Take back` : "○ Take control");
+    : blocked
+      ? `○ ${ownerLabel} driving · stop to take`
+      : (ownerLabel ? `○ ${ownerLabel} has control · Take back` : "○ Take control");
 }
 
 const _controlChip = document.getElementById("controlChip");
 if (_controlChip) {
   _controlChip.addEventListener("click", () => {
-    // Clicking when you already hold control is a no-op (avoids a needless velocity reset).
-    if (!hasControl) send({ type: "take_control", client_id: CLIENT_ID });
+    // No-op if you already hold it; blocked while another device is actively driving
+    // (wait for the robot to stop). Server denies it anyway; this avoids the futile ask.
+    if (!hasControl && !(ownerLabel && robotMoving)) {
+      send({ type: "take_control", client_id: CLIENT_ID });
+    }
   });
 }
 

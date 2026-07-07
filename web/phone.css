@@ -511,3 +511,10 @@ body.ph-landscape .ph-land-exit {
 .ph-mbtn[data-mode="zero_torque"].current { opacity: 1; }
 /* the "leave to desktop" link must read differently from the landscape toggle */
 .ph-fs[href] { color: var(--steel); }
+
+/* Take-over chip blocked (another device driving + robot moving -> wait for stop). */
+.ph-chip.blocked { opacity: .55; }
+
+/* Take-over denied flash: brief amber pulse on the header chip when the server refuses a
+   take-over because the robot is moving (visible on the Drive surface too). */
+.ph-chip.denied { color: #ffcf6b; border-color: #ffcf6b; }

@@ -16,7 +16,7 @@
   <title>G1 · Phone Teleop</title>
   <link rel="manifest" href="/static/phone.webmanifest">
   <link rel="apple-touch-icon" href="/static/phone-icon.svg">
-  <link rel="stylesheet" href="/static/phone.css?v=12">
+  <link rel="stylesheet" href="/static/phone.css?v=14">
   <!-- three.js (shared vendored copy) for the LiDAR cloud feed + 3D obstacle sphere -->
   <script type="importmap">
   {
@@ -130,7 +130,7 @@
       <button class="ph-gest" data-cmd="high_wave" data-arm="1" type="button"><span>👋</span><small>Wave</small></button>
       <button class="ph-gest" data-cmd="high_five" data-arm="1" type="button"><span>✋</span><small>High Five</small></button>
       <button class="ph-gest" data-cmd="clap"      data-arm="1" type="button"><span>👏</span><small>Clap</small></button>
-      <button class="ph-gest" data-cmd="shake"                 type="button"><span>🤝</span><small>Shake</small></button>
+      <button class="ph-gest" data-cmd="shake"      data-arm="1" type="button"><span>🤝</span><small>Shake</small></button>
       <button class="ph-gest" data-cmd="hug"       data-arm="1" type="button"><span>🤗</span><small>Hug</small></button>
       <button class="ph-gest" data-cmd="heart"     data-arm="1" type="button"><span>❤️</span><small>Heart</small></button>
       <button class="ph-gest" data-cmd="kiss"      data-arm="1" type="button"><span>😘</span><small>Kiss</small></button>
@@ -199,7 +199,7 @@
     </div>
   </div>
 
-  <script src="/static/phone.js?v=13"></script>
+  <script src="/static/phone.js?v=15"></script>
   <!-- viz modules (ES modules, deferred): render on the PHONE's GPU; phone.js feeds
        them obstacle frames + drives the feed switch. -->
   <script type="module" src="/static/obstacle3d.js?v=10"></script>
