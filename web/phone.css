@@ -1,5 +1,13 @@
 /* G1 phone teleop -- self-contained; mirrors the console palette (web/style.css).
-   Touch-first, single screen, no scrolling. */
+   Touch-first, single screen. Surface = two thumbsticks, two live switches (obstacle
+   avoidance + interaction), a mode ladder, and a gestures panel.
+
+   Design system (keep it coherent):
+     spacing  4 / 8 / 12 / 16          (--sp-*)
+     radius   12 control · 16 card · 999 pill   (--r-*)
+     type     10 eyebrow · 11 sub/mono · 13 label · 17 title
+     accent   --mode = posture STATE · green=live/safe · blue=UI/interaction · orange=caution
+     elevation flat + 1px line by default; only true overlays float; GLOW is for LEDs only */
 
 :root {
   --ink:        #0A0D13;
@@ -21,6 +29,11 @@
   --mode:       var(--st-off);
   --font-ui:    "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-data:  "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* spacing + radius scale */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --r-control: 12px; --r-card: 16px; --r-pill: 999px;
+  --shadow-float: 0 20px 60px rgba(0,0,0,.5);
 }
 
 /* mode accent ramp, driven by body[data-mode] (same idea as the console) */
@@ -41,35 +54,41 @@ html, body {
 body {
   display: flex; flex-direction: column;
   height: 100vh; height: 100dvh;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right)
-           env(safe-area-inset-bottom) env(safe-area-inset-left);
-  gap: 8px;
+  /* Honour the safe-area insets, but ALWAYS keep a minimum margin so nothing ever hugs a
+     screen edge / cutout even if the platform under-reports its insets. */
+  padding: max(env(safe-area-inset-top), 6px) max(env(safe-area-inset-right), 6px)
+           max(env(safe-area-inset-bottom), 6px) max(env(safe-area-inset-left), 6px);
+  gap: var(--sp-2);
 }
 
 /* ============================== top bar ============================== */
+/* Wraps on a narrow phone: the (variable-length) control chip drops to its own full-width
+   second row so it never clips the mode word / battery. */
 .ph-top {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 12px 4px;
+  display: flex; flex-wrap: wrap; align-items: center;
+  column-gap: var(--sp-2); row-gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
 }
 .ph-mode { display: flex; flex-direction: column; line-height: 1.05; min-width: 0; }
-.ph-eyebrow { font-size: 9px; letter-spacing: .16em; text-transform: uppercase; color: var(--steel-dim); }
+.ph-eyebrow { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--steel-dim); }
 .ph-mode-word {
-  font-size: 18px; font-weight: 700; letter-spacing: .01em; color: var(--mode);
+  font-size: 17px; font-weight: 700; letter-spacing: .01em; color: var(--mode);
   text-transform: capitalize;
 }
-.ph-transit { font-size: 10px; color: var(--caution); letter-spacing: .04em; }
+.ph-transit { font-size: 11px; color: var(--caution); letter-spacing: .04em; }
 
 .ph-status {
-  display: flex; align-items: center; gap: 6px; margin-left: auto;
+  display: flex; align-items: center; gap: 6px; margin-left: auto; min-width: 0;
   font-size: 11px; color: var(--steel); font-family: var(--font-data);
 }
 .ph-status .ph-dot {
-  width: 8px; height: 8px; border-radius: 50%; background: var(--stop);
+  width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--stop);
   box-shadow: 0 0 8px var(--stop);
 }
 .ph-status.on .ph-dot { background: var(--live); box-shadow: 0 0 8px var(--live); }
+.ph-status #phStatusText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.ph-batt { display: flex; align-items: center; gap: 5px; font-size: 12px;
+.ph-batt { display: flex; align-items: center; gap: 5px; flex: none; font-size: 11px;
   font-family: var(--font-data); color: var(--steel); }
 .ph-batt-icon {
   position: relative; width: 24px; height: 12px; border: 1px solid var(--steel);
@@ -82,28 +101,42 @@ body {
 .ph-batt.warn i { background: var(--caution); }
 .ph-batt.crit i { background: var(--stop); }
 
-/* control chip: identity + take-control tap target */
+/* control chip: identity + take-control tap target. Full-width second row (order:10). */
 .ph-chip {
-  font-family: inherit; font-size: 11px; font-weight: 700; letter-spacing: .03em;
+  order: 10; flex: 1 1 100%;
+  font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: .03em;
   color: var(--steel); background: var(--surface-2); border: 1px solid var(--line);
-  border-radius: 999px; padding: 7px 12px; min-height: 32px; cursor: pointer;
-  white-space: nowrap;
+  border-radius: var(--r-pill); padding: 10px 14px; min-height: 44px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center;
 }
 .ph-chip.mine { color: #06281C; background: var(--live); border-color: var(--live); }
 .ph-chip.theirs { color: var(--caution); border-color: color-mix(in srgb, var(--caution) 50%, var(--line)); }
 
+/* header icon buttons. The ⤢ landscape toggle is the primary in-app action (boxed);
+   the ⧉ "leave to full dashboard" link is demoted to a quiet glyph so they don't look alike. */
+.ph-fs {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  font-size: 16px; line-height: 1; color: var(--steel); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: var(--r-control); width: 40px; height: 40px;
+  cursor: pointer; text-decoration: none;
+}
+.ph-fs:active { color: var(--chalk); }
+.ph-fs.on { color: #06281C; background: var(--live); border-color: var(--live); }
+.ph-fs[hidden] { display: none; }
+.ph-fs[href] { background: transparent; border-color: transparent; color: var(--steel-dim); }
+
 /* ============================== mode ladder ========================== */
 .ph-modes {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 0 12px;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--sp-2); padding: 0 var(--sp-3);
 }
 .ph-mbtn {
   font-family: inherit; font-size: 13px; font-weight: 600; letter-spacing: .02em;
   color: var(--steel); background: var(--surface-2); border: 1px solid var(--line);
-  border-radius: 10px; padding: 12px 4px; min-height: 52px; cursor: pointer;
+  border-radius: var(--r-control); padding: 12px 4px; min-height: 52px; cursor: pointer;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
   transition: color .12s, background .12s, border-color .12s;
 }
-.ph-mbtn small { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--steel-dim); }
+.ph-mbtn small { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--steel-dim); }
 .ph-mbtn.current { color: var(--chalk); border-color: var(--mode);
   box-shadow: inset 0 0 0 1px var(--mode); background: color-mix(in srgb, var(--mode) 14%, var(--surface-2)); }
 .ph-mbtn.current small { color: var(--mode); }
@@ -112,28 +145,38 @@ body {
 .ph-walk.current { color: #2A1500; background: var(--st-walk); border-color: var(--st-walk); }
 .ph-walk.current small { color: #2A1500; }
 @keyframes ph-pulse { 50% { opacity: .5; } }
+/* recess the dangerous Zero-Torque so it isn't one identical tap from Walk */
+.ph-mbtn[data-mode="zero_torque"] { opacity: .72; }
+.ph-mbtn[data-mode="zero_torque"].current { opacity: 1; }
 
-/* fullscreen button (header) — enters fullscreen + landscape lock (see phone.js) */
-.ph-fs {
-  display: inline-flex; align-items: center; justify-content: center;
-  font-size: 15px; line-height: 1; color: var(--steel); background: var(--surface-2);
-  border: 1px solid var(--line); border-radius: 8px; width: 34px; height: 32px;
-  cursor: pointer; flex: none; text-decoration: none;
+/* Drive | Gestures surface selector -- detached from the posture ladder by a hairline so
+   it reads as "which surface", not a 5th mode button. */
+.ph-surfsel {
+  grid-column: 1 / -1; margin-top: 6px;
+  display: inline-flex; border: 1px solid var(--line);
+  border-radius: var(--r-control); overflow: hidden; background: var(--surface);
+  box-shadow: 0 -3px 0 -2px var(--line);
 }
-.ph-fs:active { color: var(--chalk); }
-.ph-fs.on { color: #06281C; background: var(--live); border-color: var(--live); }
-.ph-fs[hidden] { display: none; }
+.ph-surfbtn {
+  flex: 1 1 0;
+  font-family: inherit; font-size: 13px; font-weight: 700; letter-spacing: .02em; color: var(--steel);
+  background: transparent; border: 0; padding: 9px 16px; min-height: 44px;
+  cursor: pointer; touch-action: manipulation;
+}
+.ph-surfbtn + .ph-surfbtn { border-left: 1px solid var(--line); }
+.ph-surfbtn.current { color: var(--ink); background: var(--focus); }
+.ph-surfbtn:active { background: color-mix(in srgb, var(--focus) 25%, var(--surface)); }
 
 /* ============================== driving deck (stick | center | stick) = */
 .ph-deck {
   position: relative; flex: 1 1 auto; min-height: 0;
   display: flex; align-items: stretch; justify-content: space-between;
-  padding: 6px 14px 12px; gap: 12px;
+  padding: var(--sp-2) 14px var(--sp-3); gap: var(--sp-3);
 }
 /* sticks anchored to the bottom of their side column */
 .ph-stick-wrap {
   display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
-  gap: 6px; flex: 0 0 auto;
+  gap: 6px; flex: 0 0 auto; min-width: 0;
 }
 .ph-stick {
   position: relative;
@@ -162,7 +205,7 @@ body {
   box-shadow: 0 4px 16px rgba(0,0,0,.6), 0 0 0 2px var(--st-walk); }
 .ph-stick-cap { font-size: 10px; text-transform: uppercase; letter-spacing: .14em;
   color: var(--steel); text-align: center; }
-.ph-stick-cap small { display: block; font-family: var(--font-data); font-size: 9px;
+.ph-stick-cap small { display: block; font-family: var(--font-data); font-size: 10px;
   letter-spacing: .02em; color: var(--steel-dim); text-transform: none; margin-top: 2px; }
 
 /* sticks bite only in live walk; otherwise dim + inert so a resting thumb can't
@@ -170,90 +213,62 @@ body {
 body:not([data-mode="walk"]) .ph-stick,
 body[data-transitioning="1"] .ph-stick { opacity: .4; pointer-events: none; }
 
-/* --- center column: obstacle view + on/off + STOP --- */
+/* --- center column: the two live switches ------------------------------- */
 .ph-center {
   flex: 1 1 auto; min-width: 0;
-  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  display: flex; flex-direction: column; align-items: stretch; justify-content: center; gap: var(--sp-2);
 }
-.ph-obsview {
-  position: relative; flex: 1 1 auto; min-height: 96px;
-  border-radius: 12px; overflow: hidden;
-  background: var(--inset); border: 1px solid var(--line);
-}
-.ph-feed-layer { position: absolute; inset: 0; display: none; }
-.ph-feed-layer > canvas { width: 100% !important; height: 100% !important; display: block; }
-#bigRadar.ph-feed-layer { width: 100%; height: 100%; }
-/* show exactly one layer, keyed off #phObsView[data-feed] */
-.ph-obsview[data-feed="radar"]  .ph-feed-layer[data-layer="radar"],
-.ph-obsview[data-feed="sphere"] .ph-feed-layer[data-layer="sphere"],
-.ph-obsview[data-feed="cloud"]  .ph-feed-layer[data-layer="cloud"] { display: block; }
 
-.ph-feed-toggle {
-  position: absolute; top: 6px; left: 50%; transform: translateX(-50%); z-index: 2;
-  display: inline-flex; align-items: center; gap: 0;
-  border-radius: 8px; overflow: hidden; border: 1px solid var(--line);
-  background: color-mix(in srgb, var(--ink) 55%, transparent);
-  backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+/* a switch = LED + name/sub + ON/OFF pill; the whole card is the tap target.
+   Kept compact so the thumbsticks get the bulk of the screen. */
+.ph-switch {
+  display: flex; align-items: center; gap: var(--sp-2); text-align: left;
+  font-family: inherit; color: var(--steel);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-control);
+  padding: var(--sp-2) var(--sp-3); min-height: 48px; cursor: pointer;
+  transition: border-color .14s, background .14s, transform .06s;
 }
-.ph-feed-toggle button {
-  font-family: inherit; font-size: 11px; font-weight: 700; letter-spacing: .03em;
-  color: var(--steel); background: transparent; border: 0;
-  border-right: 1px solid var(--line); padding: 5px 10px; cursor: pointer; min-height: 28px;
+.ph-switch:active { transform: scale(.985); }
+.ph-switch-led {
+  width: 10px; height: 10px; border-radius: 50%; flex: none;
+  background: var(--steel-dim); box-shadow: inset 0 0 0 1px rgba(0,0,0,.35);
+  transition: background .14s, box-shadow .14s;
 }
-.ph-feed-toggle button:last-of-type { border-right: 0; }
-.ph-feed-toggle button.active { color: #06281C; background: var(--live); }
-.ph-feed-badge {
-  font-family: var(--font-data); font-size: 10px; letter-spacing: .04em;
-  color: var(--steel-dim); padding: 0 8px; border-left: 1px solid var(--line);
+.ph-switch-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ph-switch-name { font-size: 13px; font-weight: 700; color: var(--chalk); letter-spacing: .01em; }
+.ph-switch-sub {
+  font-size: 11px; color: var(--steel-dim); line-height: 1.25;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ph-feed-badge.live { color: var(--live); }
+.ph-switch-state {
+  flex: none; font-family: var(--font-data); font-size: 11px; font-weight: 700;
+  letter-spacing: .06em; color: var(--steel-dim);
+  border: 1px solid var(--line); border-radius: var(--r-pill);
+  padding: 3px 0; min-width: 44px; text-align: center;
+}
 
-/* obstacle on/off toggle (single control — no sub-toggles) */
-.ph-obs-btn {
-  width: 100%; display: flex; align-items: center; gap: 8px;
-  font-family: inherit; font-size: 12px; font-weight: 600; color: var(--steel);
-  background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
-  padding: 9px 12px; min-height: 42px; cursor: pointer; flex: none;
+/* ON — obstacle avoidance reads "safe/live" green (glow lives on the LED only) */
+.ph-switch.on {
+  border-color: color-mix(in srgb, var(--live) 55%, var(--line));
+  background: color-mix(in srgb, var(--live) 9%, var(--surface-2));
 }
-.ph-obs-led { width: 10px; height: 10px; border-radius: 50%; background: var(--steel-dim); flex: none; }
-.ph-obs-label { flex: 1; text-align: left; }
-.ph-obs-state { font-family: var(--font-data); font-size: 12px; letter-spacing: .06em;
-  text-transform: uppercase; color: var(--steel-dim); }
-.ph-obs-btn.on { color: var(--chalk); border-color: color-mix(in srgb, var(--live) 55%, var(--line)); }
-.ph-obs-btn.on .ph-obs-led { background: var(--live); box-shadow: 0 0 10px var(--live); }
-.ph-obs-btn.on .ph-obs-state { color: var(--live); }
+.ph-switch.on .ph-switch-led { background: var(--live); box-shadow: 0 0 12px var(--live); }
+.ph-switch.on .ph-switch-state { color: var(--live); border-color: color-mix(in srgb, var(--live) 55%, var(--line)); }
 
-/* step-size selector (continuous / medium / small) */
-.ph-step {
-  display: flex; align-items: center; gap: 6px; flex: none;
-  background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
-  padding: 5px 8px;
+/* ON — interaction reads with the focus-blue identity so the two switches don't blur together */
+.ph-switch-interact.on {
+  border-color: color-mix(in srgb, var(--focus) 60%, var(--line));
+  background: color-mix(in srgb, var(--focus) 10%, var(--surface-2));
 }
-.ph-step-label { font-size: 10px; text-transform: uppercase; letter-spacing: .12em;
-  color: var(--steel-dim); }
-.ph-step button {
-  flex: 1; font-family: inherit; font-size: 12px; font-weight: 600; color: var(--steel);
-  background: transparent; border: 1px solid var(--line); border-radius: 7px;
-  padding: 7px 4px; cursor: pointer; min-height: 30px;
-}
-.ph-step button.on { color: #06281C; background: var(--live); border-color: var(--live); }
-
-.ph-stop {
-  align-self: center; flex: none;
-  font-family: inherit; font-size: 16px; font-weight: 800; letter-spacing: .12em;
-  color: #fff; background: var(--stop);
-  border: 1px solid color-mix(in srgb, var(--stop) 70%, #000);
-  border-radius: 12px; width: clamp(120px, 42%, 200px); height: clamp(56px, 11vh, 72px);
-  box-shadow: 0 2px 12px rgba(255, 71, 71, .35);
-  cursor: pointer; touch-action: manipulation;
-}
-.ph-stop:active { transform: scale(.97); background: color-mix(in srgb, var(--stop) 85%, #000); }
+.ph-switch-interact.on .ph-switch-led { background: var(--focus); box-shadow: 0 0 12px var(--focus); }
+.ph-switch-interact.on .ph-switch-sub { color: var(--focus); }
+.ph-switch-interact.on .ph-switch-state { color: var(--focus); border-color: color-mix(in srgb, var(--focus) 55%, var(--line)); }
 
 .ph-deck-hint {
   position: absolute; left: 50%; top: 40%; transform: translate(-50%, -50%); z-index: 3;
   font-size: 13px; color: var(--steel); text-align: center; pointer-events: none;
   background: color-mix(in srgb, var(--ink) 78%, transparent); padding: 8px 14px;
-  border-radius: 10px; border: 1px solid var(--line);
+  border-radius: var(--r-control); border: 1px solid var(--line);
 }
 .ph-deck-hint b { color: var(--st-walk); }
 
@@ -266,16 +281,17 @@ body[data-transitioning="1"] .ph-stick { opacity: .4; pointer-events: none; }
 }
 .ph-overlay[hidden] { display: none; }
 .ph-overlay-card {
-  width: min(420px, 92vw); text-align: center;
-  background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
-  padding: 26px 22px; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  width: min(420px, 100%); text-align: center;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-card);
+  padding: 26px 22px; box-shadow: var(--shadow-float);
+  animation: ph-card-in .18s ease-out;
 }
 .ph-overlay-title { font-size: 17px; font-weight: 700; color: var(--chalk); }
 .ph-overlay-sub { font-size: 13px; color: var(--steel); margin-top: 6px; }
 .ph-take {
   margin-top: 18px; font-family: inherit; font-size: 15px; font-weight: 700;
   letter-spacing: .03em; color: #06281C; background: var(--live);
-  border: 0; border-radius: 12px; padding: 15px 22px; width: 100%; cursor: pointer;
+  border: 0; border-radius: var(--r-control); padding: 15px 22px; width: 100%; cursor: pointer;
 }
 .ph-take:active { filter: brightness(.92); }
 
@@ -289,21 +305,23 @@ body[data-transitioning="1"] .ph-stick { opacity: .4; pointer-events: none; }
 .ph-sheet-card {
   width: min(560px, 100%); position: relative;
   background: var(--surface); border: 1px solid var(--line);
-  border-radius: 18px 18px 0 0; padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
-  box-shadow: 0 -14px 50px rgba(0,0,0,.5);
+  border-radius: var(--r-card) var(--r-card) 0 0; padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
+  box-shadow: var(--shadow-float);
+  animation: ph-sheet-up .22s cubic-bezier(.2,.8,.2,1); will-change: transform;
 }
 .ph-sheet-x {
-  position: absolute; top: 12px; right: 12px; width: 34px; height: 34px;
+  position: absolute; top: 10px; right: 10px; width: 44px; height: 44px;
   border-radius: 50%; border: 1px solid var(--line); background: var(--surface-2);
-  color: var(--steel); font-size: 14px; cursor: pointer;
+  color: var(--steel); font-size: 15px; cursor: pointer;
 }
-.ph-sheet-title { font-size: 17px; font-weight: 700; color: var(--chalk); padding-right: 40px; }
+.ph-sheet-x:active { background: var(--surface); border-color: var(--focus); color: var(--chalk); }
+.ph-sheet-title { font-size: 17px; font-weight: 700; color: var(--chalk); padding-right: 44px; }
 .ph-sheet-note { font-size: 13px; color: var(--steel); margin-top: 6px; line-height: 1.45; }
 .ph-sheet-note.warn { color: var(--caution); }
 
 /* the swipe track */
 .ph-swipe {
-  position: relative; margin-top: 18px; height: 60px; border-radius: 14px;
+  position: relative; margin-top: 18px; height: 60px; border-radius: var(--r-control);
   background: var(--inset); border: 1px solid var(--line); overflow: hidden;
   touch-action: none;
 }
@@ -326,27 +344,30 @@ body[data-transitioning="1"] .ph-stick { opacity: .4; pointer-events: none; }
 .ph-swipe-knob.snap { transition: transform .18s ease-out; }
 .ph-swipe.armed .ph-swipe-knob { background: var(--live); }
 
+/* shared overlay/sheet entrance animations */
+@keyframes ph-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@keyframes ph-card-in  { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+
 /* ============================== orientation ========================== */
 /* Landscape-first (bigger sticks) but usable in BOTH orientations, so we NEVER
-   block on rotation -- iOS can't rotate at all when the system rotation lock is on,
-   which left the old full-screen "rotate to drive" wall un-dismissable. That wall is
-   gone; portrait reflows to obstacle-view-on-top with the two sticks along the bottom. */
+   block on rotation -- iOS can't rotate at all when the system rotation lock is on.
+   Portrait reflows to switches-on-top with the two sticks along the bottom. */
 .ph-rotate { display: none; }   /* no blocking wall; portrait is fully drivable */
 
 /* --- Forced landscape (⤢) = JOYSTICKS-ONLY driving surface --------------------
-   Strip everything but the two sticks (+ a small STOP and an exit button). Applies
-   whenever the class is on, in either real or CSS-faked landscape. */
+   Strip everything but the two sticks (+ an exit button). Applies whenever the
+   class is on, in either real or CSS-faked landscape. */
+body.ph-landscape { overflow: hidden; }
 body.ph-landscape .ph-top,
 body.ph-landscape .ph-modes,
-body.ph-landscape .ph-obsview,
-body.ph-landscape .ph-obs-btn,
-body.ph-landscape #phStep { display: none; }
-/* pull the sticks inward from the edges for better thumb reach (vh here maps to the
-   VISUAL horizontal axis once rotated, so it scales with the landscape width). */
+body.ph-landscape .ph-center,
+body.ph-landscape .ph-actions { display: none; }   /* gestures is a portrait/deck-only surface */
+/* pull the sticks inward from the edges for better thumb reach */
 body.ph-landscape .ph-deck { align-items: center; padding: 10px clamp(16px, 4vh, 60px); }
-body.ph-landscape .ph-center { flex: 0 0 auto; gap: 0; }   /* just the STOP now */
 body.ph-landscape .ph-stick {
-  width: clamp(245px, 60vw, 380px); height: clamp(245px, 60vw, 380px);
+  /* forced-portrait-rotated: 84vw fills the short axis; native landscape: 72vh caps it */
+  width:  min(clamp(260px, 84vw, 380px), 72vh);
+  height: min(clamp(260px, 84vw, 380px), 72vh);
   max-width: none; max-height: none;
 }
 .ph-land-exit { display: none; }
@@ -363,22 +384,35 @@ body.ph-landscape .ph-land-exit {
   box-shadow: 0 3px 12px rgba(0,0,0,.5);
 }
 
+/* Native landscape (short viewport) WITHOUT the forced class: reclaim vertical room so the
+   full UI isn't crushed while the user hasn't tapped ⤢. */
+@media (orientation: landscape) and (max-height: 480px) {
+  body:not(.ph-landscape) .ph-top { padding: 4px var(--sp-3) 2px; }
+  body:not(.ph-landscape) .ph-modes { gap: 6px; }
+  body:not(.ph-landscape) .ph-mbtn { min-height: 44px; padding: 6px 4px; }
+  body:not(.ph-landscape) .ph-stick { max-width: 46vh; max-height: 46vh; }
+  /* cap + centre the switch stack so it reads as a tidy column, not a stretched band */
+  body:not(.ph-landscape) .ph-center { max-width: 380px; margin-inline: auto; }
+}
+
 @media (orientation: portrait) {
-  /* Normal portrait (NOT forced-landscape): reflow the 3-col deck to obstacle-view-
-     on-top with the two sticks along the bottom. */
+  /* Normal portrait (NOT forced-landscape): reflow the 3-col deck to switches-on-top
+     with the two sticks along the bottom. minmax(0,1fr) lets a stick stay INSIDE its
+     column instead of forcing the track wider (which used to overflow the gutter). */
   body:not(.ph-landscape) .ph-deck {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: 1fr auto;
-    grid-template-areas: "view view" "move turn";
-    gap: 10px 12px; align-items: stretch;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: auto 1fr;                 /* compact switches on top, sticks take the rest */
+    grid-template-areas: "sw sw" "move turn";
+    gap: var(--sp-3); align-items: stretch;
   }
-  body:not(.ph-landscape) .ph-center { grid-area: view; }
+  body:not(.ph-landscape) .ph-center { grid-area: sw; justify-content: flex-start; }
   body:not(.ph-landscape) .ph-stick-wrap:nth-of-type(1) { grid-area: move; align-self: end; }
   body:not(.ph-landscape) .ph-stick-wrap:nth-of-type(2) { grid-area: turn; align-self: end; }
+  /* sized off min(vw,vh) so each circle stays within its ~1fr cell on 360 AND 390 wide */
   body:not(.ph-landscape) .ph-stick {
-    width: clamp(190px, 49vw, 340px); height: clamp(190px, 49vw, 340px);
-    max-width: none; max-height: none;   /* drop the landscape vh cap */
+    width:  min(41vw, 42vh); height: min(41vw, 42vh);
+    max-width: none; max-height: none;
   }
 
   /* Forced landscape: CSS-rotate the whole surface 90deg so it reads landscape while
@@ -389,7 +423,6 @@ body.ph-landscape .ph-land-exit {
     position: absolute; top: 100%; left: 0;
     width: 100vh; height: 100vw;
     transform-origin: left top; transform: rotate(-90deg);
-    overflow: hidden;
     /* Safe-area insets DON'T rotate with the transform, so remap them for -90deg:
        body-local right maps to the physical TOP (the notch) -> give it inset-top;
        body-local top->physical left, bottom->physical right, left->physical bottom.
@@ -411,110 +444,110 @@ body.ph-landscape .ph-land-exit {
 }
 .ph-a2hs[hidden] { display: none; }
 .ph-a2hs-card {
-  position: relative; width: min(440px, 92vw);
-  background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
-  padding: 22px; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  position: relative; width: min(440px, 100%);
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-card);
+  padding: 22px; box-shadow: var(--shadow-float);
+  animation: ph-card-in .18s ease-out;
 }
 .ph-a2hs-x {
-  position: absolute; top: 10px; right: 10px; width: 32px; height: 32px;
+  position: absolute; top: 10px; right: 10px; width: 44px; height: 44px;
   border-radius: 50%; border: 1px solid var(--line); background: var(--surface-2);
-  color: var(--steel); font-size: 13px; cursor: pointer;
+  color: var(--steel); font-size: 15px; cursor: pointer;
 }
-.ph-a2hs-title { font-size: 16px; font-weight: 700; color: var(--chalk); padding-right: 34px; }
+.ph-a2hs-x:active { background: var(--surface); border-color: var(--focus); color: var(--chalk); }
+.ph-a2hs-title { font-size: 17px; font-weight: 700; color: var(--chalk); padding-right: 44px; }
 .ph-a2hs-body { font-size: 14px; line-height: 1.55; color: var(--steel); margin-top: 8px; }
 .ph-a2hs-body b { color: var(--chalk); }
 .ph-a2hs-icon { color: var(--focus); }
 
-/* ============================ Drive | Actions ============================ */
-.ph-surfsel {
-  display: inline-flex; margin-left: auto; border: 1px solid var(--line);
-  border-radius: 10px; overflow: hidden; background: var(--surface);
-}
-.ph-surfbtn {
-  font-family: inherit; font-size: 13px; font-weight: 700; color: var(--steel);
-  background: transparent; border: 0; padding: 9px 16px; min-height: 44px;
-  cursor: pointer; touch-action: manipulation;
-}
-.ph-surfbtn + .ph-surfbtn { border-left: 1px solid var(--line); }
-.ph-surfbtn.current { color: var(--ink); background: var(--focus); }
-.ph-surfbtn:active { background: color-mix(in srgb, var(--focus) 25%, var(--surface)); }
-
-/* deck goes inert (dim + no touches) while the Actions surface is open */
+/* ============================ Gestures surface ============================ */
+/* deck goes inert (dim + no touches) while the Gestures surface is open */
 .ph-deck.inert { opacity: .32; filter: saturate(.5); pointer-events: none; }
 
-/* ============================ Actions surface ============================ */
 .ph-actions {
   position: fixed; inset: 0; z-index: 60;
-  display: flex; flex-direction: column; gap: 10px;
-  padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
-  background: color-mix(in srgb, var(--ink) 92%, #000); overflow-y: auto;
+  display: flex; flex-direction: column; gap: var(--sp-3);
+  padding: max(var(--sp-3), env(safe-area-inset-top)) var(--sp-3) calc(var(--sp-4) + env(safe-area-inset-bottom));
+  background: var(--ink); overflow-y: auto;
+  animation: ph-actions-in .2s ease-out;
 }
 .ph-actions[hidden] { display: none; }
-.ph-actions-head { display: flex; align-items: center; gap: 10px; }
-.ph-actions-title { font-size: 16px; font-weight: 800; color: var(--chalk); }
-.ph-actions-hint { font-size: 12px; color: var(--steel); }
-.ph-actions-stop {
-  margin-left: auto; font-weight: 800; letter-spacing: .1em; color: #fff;
-  background: var(--stop); border: 0; border-radius: 10px; padding: 10px 18px;
-  min-height: 44px; cursor: pointer; touch-action: manipulation;
+@keyframes ph-actions-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+
+/* head: title + ✕ Drive share row 1; the (variable, sometimes long) hint drops to a
+   full-width subtitle on row 2 so it never collides with the button. */
+.ph-actions-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--sp-3); row-gap: 3px;
+  padding-bottom: var(--sp-3); border-bottom: 1px solid var(--line);
 }
-.ph-actions-stop:active { transform: scale(.97); }
+.ph-actions-title { font-size: 17px; font-weight: 700; letter-spacing: .01em; color: var(--chalk); }
+.ph-actions-hint { order: 3; flex: 1 1 100%; font-size: 11px; color: var(--steel); line-height: 1.3; }
+.ph-actions-hint:empty { display: none; }
 .ph-actions-x {
+  order: 2; margin-left: auto;
   font-size: 13px; font-weight: 700; color: var(--chalk); background: var(--surface-2);
-  border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-height: 44px;
+  border: 1px solid var(--line); border-radius: var(--r-control); padding: 0 16px; min-height: 44px;
   cursor: pointer; touch-action: manipulation;
 }
 .ph-actions-x:active { border-color: var(--focus); }
 
+/* fixed 4-up so the 8 arm tiles always form a clean 4x2 block (auto-fit gave a ragged
+   3-col orphan at 360px). margin-top:auto + status margin-bottom:auto centre the whole
+   block in the panel, killing the dead space below. */
 .ph-gest-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)); gap: 8px;
+  margin-top: auto;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--sp-2);
 }
 .ph-gest {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 3px; min-height: 68px; padding: 8px 6px;
-  background: var(--surface-2); border: 1px solid var(--line); border-radius: 14px;
+  gap: 4px; min-height: 72px; padding: 10px 6px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-control);
   color: var(--chalk); cursor: pointer; touch-action: manipulation;
   transition: transform .06s, border-color .12s, opacity .12s;
 }
-.ph-gest span { font-size: 24px; line-height: 1; }
-.ph-gest small { font-size: 12px; color: var(--steel); letter-spacing: .02em; }
+.ph-gest span { font-size: 26px; line-height: 1; }
+.ph-gest small { font-size: 11px; color: var(--steel); letter-spacing: .02em; }
 .ph-gest:active { transform: scale(.95); border-color: var(--focus); }
 .ph-gest.disabled { opacity: .38; pointer-events: none; }
-.ph-gest-wide { grid-column: 1 / -1; flex-direction: row; gap: 10px; min-height: 52px; }
+.ph-gest-wide { grid-column: 1 / -1; flex-direction: row; justify-content: center; gap: 10px; min-height: 52px; }
 .ph-gest-wide span { font-size: 20px; }
 
-.ph-wholebody { margin-top: 2px; border-top: 1px solid var(--line); padding-top: 8px; }
+/* whole-body = one deliberate "this takes over the robot" danger container */
+.ph-wholebody {
+  margin-top: var(--sp-2); padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--caution) 24%, var(--line)); border-radius: var(--r-control);
+  background: color-mix(in srgb, var(--caution) 6%, transparent);
+}
 .ph-wb-label { display: block; font-size: 11px; color: var(--caution); letter-spacing: .06em; margin-bottom: 6px; }
-.ph-wb-row { display: flex; gap: 8px; }
+.ph-wb-row { display: flex; gap: var(--sp-2); }
 .ph-wb {
-  position: relative; flex: 1 1 0; overflow: hidden; min-height: 56px;
+  position: relative; flex: 1 1 0; overflow: hidden; min-height: 60px;
   background: var(--surface-2); border: 1px solid color-mix(in srgb, var(--caution) 45%, var(--line));
-  border-radius: 14px; color: var(--chalk); cursor: pointer; touch-action: none;
+  border-radius: var(--r-control); color: var(--chalk); cursor: pointer; touch-action: none;
 }
 .ph-wb-fill {
   position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
   background: color-mix(in srgb, var(--caution) 32%, transparent); pointer-events: none;
 }
-.ph-wb-txt { position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 8px; font-weight: 700; }
-.ph-wb-txt small { font-weight: 500; font-size: 10px; color: var(--steel); }
+.ph-wb-txt { position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 10px 8px; text-align: center; font-weight: 700; }
+.ph-wb-txt small { font-weight: 500; font-size: 10px; line-height: 1.3; color: var(--steel); }
 .ph-wb.holding { border-color: var(--caution); }
 .ph-wb.disabled { opacity: .4; pointer-events: none; }
 
-.ph-actions-status { min-height: 18px; font-size: 13px; color: var(--live); font-weight: 600; }
+.ph-actions-status { margin-bottom: auto; min-height: 18px; font-size: 13px; color: var(--live); font-weight: 600; }
+.ph-actions-status:empty { min-height: 0; }
 
 /* ===================== touch-target + tap-feedback fixes ===================== */
-.ph-feed-toggle button, #phStep [data-step] { min-height: 44px; }
-.ph-mbtn:active, .ph-feed-toggle button:active, #phStep [data-step]:active,
-.ph-chip:active, .ph-obs-btn:active { transform: scale(.97); }
-/* recess the dangerous Zero-Torque so it isn't one identical tap from Walk */
-.ph-mbtn[data-mode="zero_torque"] { opacity: .72; }
-.ph-mbtn[data-mode="zero_torque"].current { opacity: 1; }
-/* the "leave to desktop" link must read differently from the landscape toggle */
-.ph-fs[href] { color: var(--steel); }
+.ph-mbtn:active, .ph-chip:active { transform: scale(.97); }
 
-/* Take-over chip blocked (another device driving + robot moving -> wait for stop). */
+/* Take-over chip states: blocked (another device driving + robot moving -> wait for
+   stop) and the brief amber "denied" flash when the server refuses a take-over. */
 .ph-chip.blocked { opacity: .55; }
-
-/* Take-over denied flash: brief amber pulse on the header chip when the server refuses a
-   take-over because the robot is moving (visible on the Drive surface too). */
 .ph-chip.denied { color: #ffcf6b; border-color: #ffcf6b; }
+
+/* Respect reduced-motion: kill the entrance animations + transitions. */
+@media (prefers-reduced-motion: reduce) {
+  .ph-actions, .ph-sheet-card, .ph-overlay-card, .ph-a2hs-card { animation: none; }
+  * { transition-duration: .01ms !important; }
+}

@@ -3,11 +3,12 @@
 // Speaks the SAME /ws JSON protocol as the laptop console (controller.js) and
 // shares the server-side single-controller lock. Surface is intentionally tiny:
 //   - two analog thumbsticks (Move = fwd/strafe, Turn = yaw)
-//   - one obstacle-avoidance toggle
+//   - two live switches: obstacle avoidance + interaction mode (auto wave-back)
 //   - a Zero-Torque -> Damp -> Stand -> Walk mode ladder, each change gated behind
 //     a SWIPE-to-confirm so a mis-tap can't switch the robot's mode
+//   - a Gestures panel: arm greetings + whole-body Dance/Climb
 //   - a "Take control" affordance (lock arbitration across devices)
-// No camera / map / lidar / gestures -- those stay on the laptop console.
+// No camera / map / lidar feed -- those stay on the laptop console.
 
 (function () {
   "use strict";
@@ -19,19 +20,15 @@
   // ---- thumbstick shaping (tuned for FINE, granular control) ----
   // A LOW top speed (PHONE_SPEED) is what makes it precise: the whole stick travel maps
   // to a small speed range, so every bit of push is a distinguishable "step". EXPO is
-  // only a mild curve (gentle near centre, but the mid-range stays usable -- a strong
-  // expo made the middle nearly dead, which felt like just a few speeds). Long TRAVEL =
-  // lots of thumb distance per unit speed. Raise PHONE_SPEED for more top-end; raise
-  // EXPO for a softer centre; lower EXPO toward 0 for a perfectly linear feel.
+  // only a mild curve (gentle near centre, but the mid-range stays usable). Long TRAVEL =
+  // lots of thumb distance per unit speed.
   const DEADZONE = 0.04, TRAVEL = 0.90, EXPO = 0.45;
   const PHONE_SPEED = 0.5;    // fraction of the robot's max speed used from the phone
 
   // ---- identity: ONE id per page load. Not persisted, so two tabs are two
-  // distinct clients (the lock arbitrates between them); a module const so a ws
-  // reconnect keeps the same identity. ----
-  // crypto.randomUUID exists only in a SECURE context; over plain http:// on a LAN IP
-  // it's undefined, so the fallback must be bulletproof (and never throw, or the whole
-  // module dies and the page half-works).
+  // distinct clients (the lock arbitrates between them). crypto.randomUUID exists
+  // only in a SECURE context; over plain http:// on a LAN IP it's undefined, so the
+  // fallback must be bulletproof (and never throw, or the whole module dies). ----
   const CLIENT_ID = (function () {
     try { if (window.crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (_) {}
     return "phone-" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
@@ -42,18 +39,16 @@
   const axes = { fwd: 0, strafe: 0, turn: 0 };
   let uiMode = "damp", transitioning = false;
   let hasControl = false, ownerLabel = null;
-  let robotMoving = false;   // fsm_state.moving — you can only take the drive lock while stopped
+  let robotMoving = false;   // fsm_state.moving -- you can only take the drive lock while stopped
   // Arm "greeting" gestures any client may fire WITHOUT the drive lock (match the server's
   // OPEN_GESTURES). Driving, modes and Dance/Climb still take control first.
   const OPEN_GESTURES = new Set(["high_wave", "high_five", "clap", "shake", "hug", "heart", "kiss"]);
-  let actionsOpen = false;                 // Actions surface shown -> deck inert
+  let actionsOpen = false;                 // Gestures surface shown -> deck inert
   let comboReady = { dance: false, climb: false };   // server-captured whole-body FSM ids
   let gestureBusyUntil = 0;                // optimistic double-fire lock (monotonic ms)
   let obstacleEnabled = false;
+  let interactEnabled = false;             // interaction (auto wave-back / greeting) mode
   let connected = false, ws = null;
-  let lastObs = null;          // last obstacle frame, for on-demand radar redraw
-  let curFeed = "radar";       // "radar" | "sphere" | "cloud"
-  let currentStep = "continuous";  // discrete-step size (server-authoritative)
   const sticks = [];   // {reset} handles
 
   const $ = (id) => document.getElementById(id);
@@ -62,15 +57,15 @@
     status: $("phStatus"), statusText: $("phStatusText"),
     batt: $("phBatt"), battText: $("phBattText"), battFill: $("phBattFill"),
     chip: $("phControlChip"), fsBtn: $("phFsBtn"), landExit: $("phLandExit"),
-    obsView: $("phObsView"), bigRadar: $("bigRadar"),
     obsBtn: $("phObsBtn"), obsState: $("phObsState"),
-    deckHint: $("phDeckHint"), stop: $("phStop"),
+    interactBtn: $("phInteractBtn"), interactState: $("phInteractState"), interactStatus: $("phInteractStatus"),
+    deckHint: $("phDeckHint"),
     takeOverlay: $("phTakeOverlay"), takeBtn: $("phTakeBtn"),
     overlayTitle: $("phOverlayTitle"), overlaySub: $("phOverlaySub"),
     sheet: $("phSheet"), sheetTitle: $("phSheetTitle"), sheetNote: $("phSheetNote"),
     sheetX: $("phSheetX"), swipe: $("phSwipe"), swipeKnob: $("phSwipeKnob"),
     swipeFill: $("phSwipeFill"), swipeHint: $("phSwipeHint"),
-    actions: $("phActions"), actionsX: $("phActionsX"), actionsStop: $("phActionsStop"),
+    actions: $("phActions"), actionsX: $("phActionsX"),
     actionsHint: $("phActionsHint"), actionsStatus: $("phActionsStatus"),
     gestGrid: $("phGestGrid"), deck: $("phDeck"),
   };
@@ -95,7 +90,7 @@
         case "obstacle":  applyObstacle(msg); break;
         case "control":   applyControl(msg); break;
         case "takeover_denied":
-          // Visible on BOTH surfaces: the Actions status line AND a brief flash on the
+          // Visible on BOTH surfaces: the Gestures status line AND a brief flash on the
           // always-on header chip (the Drive surface has no actions status).
           setActionStatus("Robot moving — stop it to take control");
           if (el.chip) {
@@ -104,7 +99,6 @@
             setTimeout(() => { el.chip.classList.remove("denied"); renderChip(); }, 1600);
           }
           break;
-        case "step_mode": applyStep(msg.name || msg.mode || msg.step_mode); break;
       }
     };
     ws.onclose = () => {
@@ -128,7 +122,6 @@
     if (typeof msg.max_vy === "number")   MAX_VY = msg.max_vy;
     if (typeof msg.max_vyaw === "number") MAX_VYAW = msg.max_vyaw;
     if (msg.obstacle && typeof msg.obstacle.enabled === "boolean") setObstacle(msg.obstacle.enabled);
-    if (msg.step && msg.step.mode) applyStep(msg.step.mode);
     // whole-body Dance/Climb are only replayable once the server captured their FSM id
     if (msg.mode_combos && typeof msg.mode_combos === "object") {
       comboReady.dance = !!msg.mode_combos.dance;
@@ -145,6 +138,9 @@
     document.body.dataset.transitioning = transitioning ? "1" : "";
     if (el.mode) el.mode.textContent = uiMode || "—";
     if (el.transit) el.transit.hidden = !transitioning;
+    // Interaction (auto wave-back) mode rides fsm_state; the server is authoritative so
+    // the switch reflects reality even if another device flipped it.
+    if (msg.greeting_mode !== undefined) setInteract(!!msg.greeting_mode, msg.greeting_status);
     renderModes();
     renderDeckHint();
     renderActions();                  // arm-gating + whole-body status track the mode
@@ -155,24 +151,18 @@
 
   function applyTelemetry(msg) {
     updateBattery(msg.battery_soc, msg.battery_v);
-    if (msg.step_mode) applyStep(msg.step_mode);
   }
 
   function applyObstacle(msg) {
     if (typeof msg.enabled === "boolean") setObstacle(msg.enabled);
-    lastObs = msg;
-    // Feed all three views every frame (like the dashboard) so switching is instant.
-    if (curFeed === "radar") drawRadarInto(el.bigRadar, msg);
-    if (window.LidarOverlay && window.LidarOverlay.updateObstacle) window.LidarOverlay.updateObstacle(msg);
-    if (window.Obstacle3D && window.Obstacle3D.update) window.Obstacle3D.update(msg);
   }
 
   function applyControl(msg) {
     const ownerId = msg.owner_id || null;
     // Auto-claim the lock ONLY when it is FREE (nobody driving) -- so a lone phone,
-    // or the phone after the driver leaves / after a server restart, just works
-    // instead of getting stuck on "nobody has control". It never auto-steals from an
-    // active driver; stealing still needs an explicit "Take control" tap.
+    // or the phone after the driver leaves / after a server restart, just works instead
+    // of getting stuck on "nobody has control". It never auto-steals from an active
+    // driver; stealing still needs an explicit "Take control" tap.
     if (ownerId === null) { requestControl(); return; }
     setControl(ownerId === CLIENT_ID, msg.owner_label || null);
   }
@@ -320,98 +310,32 @@
   }
 
   // =====================================================================
-  // Obstacle toggle
+  // Switches: obstacle avoidance + interaction mode
   // =====================================================================
   function setObstacle(on) {
     obstacleEnabled = !!on;
-    if (el.obsBtn) el.obsBtn.classList.toggle("on", obstacleEnabled);
+    if (el.obsBtn) {
+      el.obsBtn.classList.toggle("on", obstacleEnabled);
+      el.obsBtn.setAttribute("aria-pressed", obstacleEnabled ? "true" : "false");
+    }
     if (el.obsState) el.obsState.textContent = obstacleEnabled ? "ON" : "OFF";
   }
 
-  // Discrete-step size selector (server-authoritative; mirror the dashboard).
-  function applyStep(name) {
-    if (!name) return;
-    currentStep = name;
-    document.querySelectorAll("#phStep [data-step]").forEach((b) =>
-      b.classList.toggle("on", b.dataset.step === name));
-  }
-
-  // =====================================================================
-  // 2D obstacle ring (ported from web/obstacle.js drawRadarGeom/drawRadarInto)
-  // =====================================================================
-  const Z_STOP = 0.7, Z_SLOW = 2.0, RADAR_RANGE_M = 3.0;
-  const RC = { stop: "#FF4747", slow: "#FF8636", clear: "#3FD39B", grid: "#232C3E", dim: "#7E879B" };
-  function radarZoneColor(d) {
-    if (d == null) return null;
-    if (d < Z_STOP) return RC.stop;
-    if (d < Z_SLOW) return RC.slow;
-    return RC.clear;
-  }
-  function drawRadarGeom(ctx, size, msg) {
-    const cx = size / 2, cy = size / 2, R = (size / 2) * 0.9;
-    ctx.clearRect(0, 0, size, size);
-    ctx.strokeStyle = RC.grid; ctx.lineWidth = 1;
-    [Z_STOP, Z_SLOW, RADAR_RANGE_M].forEach((rm) => {
-      ctx.beginPath();
-      ctx.arc(cx, cy, R * Math.min(1, rm / RADAR_RANGE_M), 0, Math.PI * 2);
-      ctx.stroke();
-    });
-    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - R); ctx.stroke();  // forward crosshair
-    const ring = msg && msg.ring;
-    if (ring && Array.isArray(ring.dist)) {
-      const n = ring.dist.length, binRad = (ring.bin_deg * Math.PI) / 180;
-      for (let i = 0; i < n; i++) {
-        const d = ring.dist[i], col = radarZoneColor(d);
-        if (!col) continue;
-        const cRad = ((ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI) / 180;
-        const r = R * Math.min(1, d / RADAR_RANGE_M);
-        const a0 = cRad - binRad / 2, a1 = cRad + binRad / 2;
-        ctx.fillStyle = col; ctx.globalAlpha = 0.85;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(cx - r * Math.sin(a0), cy - r * Math.cos(a0));
-        ctx.lineTo(cx - r * Math.sin(a1), cy - r * Math.cos(a1));
-        ctx.closePath(); ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-    } else {
-      ctx.fillStyle = RC.dim;
-      ctx.font = Math.max(11, Math.round(size / 16)) + "px sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText("no ring data", cx, cy);
+  function setInteract(on, status) {
+    interactEnabled = !!on;
+    if (el.interactBtn) {
+      el.interactBtn.classList.toggle("on", interactEnabled);
+      el.interactBtn.setAttribute("aria-pressed", interactEnabled ? "true" : "false");
     }
-  }
-  function drawRadarInto(canvas, msg) {
-    if (!canvas) return;
-    const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
-    if (!cssW || !cssH) return;                 // not laid out / hidden feed
-    const size = Math.min(cssW, cssH);
-    const DPR = Math.min(window.devicePixelRatio || 1, 2);
-    const needW = Math.round(cssW * DPR), needH = Math.round(cssH * DPR);
-    if (canvas.width !== needW || canvas.height !== needH) { canvas.width = needW; canvas.height = needH; }
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(DPR, 0, 0, DPR, ((cssW - size) / 2) * DPR, ((cssH - size) / 2) * DPR);
-    drawRadarGeom(ctx, size, msg);
+    if (el.interactState) el.interactState.textContent = interactEnabled ? "ON" : "OFF";
+    // When ON, the sub-line becomes the robot's live feedback ("saw wave → waving back").
+    if (el.interactStatus) el.interactStatus.textContent = interactEnabled
+      ? (status || "Watching for gestures…")
+      : "Robot greets people back";
   }
 
   // =====================================================================
-  // Feed switcher (2D ring / 3D sphere / cloud feed) -- one visible at a time
-  // =====================================================================
-  function setFeed(mode) {
-    if (mode !== "radar" && mode !== "sphere" && mode !== "cloud") return;
-    curFeed = mode;
-    if (el.obsView) el.obsView.dataset.feed = mode;
-    document.body.dataset.feed = mode;
-    document.querySelectorAll("[data-feed-btn]").forEach((b) =>
-      b.classList.toggle("active", b.dataset.feedBtn === mode));
-    // Let the three.js modules size to the now-visible box, then redraw the radar.
-    window.dispatchEvent(new Event("resize"));
-    if (mode === "radar") drawRadarInto(el.bigRadar, lastObs);
-  }
-
-  // =====================================================================
-  // Fullscreen + landscape lock (immersive driving surface; ported from
-  // web/drive_mode.js). Both require a user gesture, so they're wired to taps.
+  // Fullscreen + landscape lock (immersive driving surface)
   // =====================================================================
   function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
   // iPhone Safari exposes NO Fullscreen API for elements (only <video>/iPad), so
@@ -420,10 +344,6 @@
   function fsSupported() {
     const d = document.documentElement;
     return !!(d.requestFullscreen || d.webkitRequestFullscreen);
-  }
-  function isStandalone() {
-    return window.navigator.standalone === true ||
-      (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
   }
   function requestFS(elm) {
     const fn = elm.requestFullscreen || elm.webkitRequestFullscreen;
@@ -444,7 +364,7 @@
   }
   function showA2HS(on) { const h = $("phA2hs"); if (h) h.hidden = !on; }
 
-  // --- Forced landscape (the ⛶ button) --------------------------------------
+  // --- Forced landscape (the ⤢ button) --------------------------------------
   // iOS blocks the Fullscreen API + orientation lock for web pages, so we FAKE a
   // landscape driving screen by CSS-rotating the whole surface 90deg (see phone.css)
   // -- turn the phone sideways with the system rotation lock ON and it reads upright.
@@ -468,19 +388,15 @@
     if (on) { if (fsSupported()) requestFS(document.documentElement).then(lockLandscape, lockLandscape); }
     else if (fsElement()) { unlockOrientation(); exitFS(); }
     resetSticks();                                   // rotation changes the stick frame
-    window.dispatchEvent(new Event("resize"));       // re-fit three.js views + ring
-    if (curFeed === "radar") drawRadarInto(el.bigRadar, lastObs);
   }
   function toggleImmersive() { setLandscape(!document.body.classList.contains("ph-landscape")); }
   // Take-control gesture: best-effort REAL fullscreen only (no rotation); no-op on iOS.
   function goImmersive() { if (fsSupported()) requestFS(document.documentElement).then(lockLandscape, lockLandscape); }
 
   // =====================================================================
-  // Thumbsticks (ported shaping from web/drive_mode.js)
+  // Thumbstick shaping
   // =====================================================================
-  // mild cubic expo: a soft centre but the whole travel stays usable + granular (a
-  // quartic/strong expo bunched all the speed into the last bit -> felt like few steps).
-  // Reaches 1.0 at full deflection.
+  // mild cubic expo: a soft centre but the whole travel stays usable + granular.
   function curveOf(lin) { return EXPO * lin * lin * lin + (1 - EXPO) * lin; }
   function shape(v) {
     const a = Math.abs(v);
@@ -495,7 +411,9 @@
     return { x: nx * s, y: ny * s };
   }
 
-  // ---- Actions surface: gestures + whole-body --------------------------------
+  // =====================================================================
+  // Gestures surface: arm greetings + whole-body
+  // =====================================================================
   const GEST_LABEL = {
     high_wave: "Waving", high_five: "High-fiving", clap: "Clapping", shake: "Shaking hand",
     hug: "Hugging", heart: "Heart", kiss: "Kiss", hands_up: "Hands up", release_arm: "Releasing arms",
@@ -608,8 +526,11 @@
       btn.addEventListener(ev, cancel));
   }
 
+  // =====================================================================
+  // Thumbsticks
+  // =====================================================================
   // Sticks bite only in live walk AND while this phone owns the control lock AND the
-  // Actions surface is closed (opening it makes the deck inert + zeroes velocity).
+  // Gestures surface is closed (opening it makes the deck inert + zeroes velocity).
   function drivable() {
     return hasControl && uiMode === "walk" && !transitioning && !actionsOpen;
   }
@@ -628,9 +549,8 @@
     // RELATIVE origin: "neutral" is wherever the thumb FIRST lands, not the base centre.
     // A fixed-centre stick reads a big deflection the instant a thumb touches off-centre
     // -> "goes to max velocity immediately". Anchoring to the touch-down point makes
-    // first contact 0 and every push from there analog + shaped -> smooth/precise, like
-    // the desktop mouse (which happens to click near the centre). Deflection is measured
-    // from the origin, still de-rotated via toLocal for forced-landscape.
+    // first contact 0 and every push from there analog + shaped -> smooth/precise.
+    // Deflection is de-rotated via toLocal for forced-landscape.
     function track(e) {
       const max = (base.getBoundingClientRect().width / 2) * TRAVEL;
       const L = toLocal(e.clientX - originX, e.clientY - originY);
@@ -709,51 +629,54 @@
     const moveBase = $("phStickMove"), turnBase = $("phStickTurn");
     if (moveBase) sticks.push(makeStick(moveBase, (nx, ny) => {
       const v = shapeVec(nx, ny);       // radial deadzone + expo -> honest diagonals
-      axes.strafe = -v.x;               // screen-left -> strafe-left (+vy), matches drive_mode.js
+      axes.strafe = -v.x;               // screen-left -> strafe-left (+vy)
       axes.fwd    = -v.y;               // screen-up   -> forward (+vx)
     }));
     if (turnBase) sticks.push(makeStick(turnBase, (nx /*, ny */) => {
       axes.turn = shape(-nx);           // screen-left -> turn-left (+vyaw)
     }));
 
-    // STOP: zero velocity now + recentre sticks (server halts, gait stays ready)
-    if (el.stop) el.stop.addEventListener("click", () => { resetSticks(); send({ type: "stop" }); });
-
     // mode ladder -> swipe sheet (needs control; otherwise prompt for it)
     document.querySelectorAll(".ph-mbtn").forEach((btn) => {
       btn.addEventListener("click", () => withControl(() => openSheet(btn.dataset.mode)));
     });
 
-    // Drive | Actions surface selector + the Actions surface controls
+    // Drive | Gestures surface selector + the Gestures surface controls
     document.querySelectorAll(".ph-surfbtn").forEach((b) =>
       b.addEventListener("click", () => (b.dataset.surf === "actions" ? openActions() : closeActions())));
     if (el.actionsX) el.actionsX.addEventListener("click", closeActions);
-    if (el.actionsStop) el.actionsStop.addEventListener("click", () => { resetSticks(); send({ type: "stop" }); });
     document.querySelectorAll("#phGestGrid .ph-gest").forEach((b) =>
       b.addEventListener("click", () => fireGesture(b.dataset.cmd, !!b.dataset.arm)));
     document.querySelectorAll(".ph-wb").forEach(wireHold);
 
-    // obstacle toggle (needs control)
+    // obstacle avoidance toggle (owner-gated; grab control then flip)
     if (el.obsBtn) el.obsBtn.addEventListener("click", () => {
       if (!hasControl) { requestControl(); return; }
       send({ type: "obstacle", action: obstacleEnabled ? "disable" : "enable" });
     });
 
-    // step-size selector (needs control)
-    document.querySelectorAll("#phStep [data-step]").forEach((b) =>
-      b.addEventListener("click", () => {
-        if (!hasControl) { requestControl(); return; }
-        send({ type: "step_mode", name: b.dataset.step });
-      }));
+    // interaction (auto wave-back) toggle (owner-gated; server is authoritative)
+    if (el.interactBtn) el.interactBtn.addEventListener("click", () => {
+      if (!hasControl) { requestControl(); return; }
+      send({ type: "greeting", on: !interactEnabled });
+    });
 
     // take-control affordances (taking control is a natural moment to go immersive)
     if (el.takeBtn) el.takeBtn.addEventListener("click", () => { tryTakeControl(); goImmersive(); });
     if (el.chip) el.chip.addEventListener("click", () => { tryTakeControl(); });
 
-    // fullscreen + landscape lock toggle (⛶). Hidden if already launched standalone
-    // (Add-to-Home-Screen) since we're already chromeless there.
-    // ⤢ toggles forced-landscape (needed even in standalone fullscreen, which is
-    // exactly where you want a landscape driving screen).
+    // Immersive by default: the FIRST tap anywhere requests REAL fullscreen (hides the
+    // browser URL bar / chrome) wherever the platform allows it (Android). No orientation
+    // lock -- portrait stays usable for the switches + gestures; the ⤢ button is still
+    // there for the joysticks-only landscape view. iOS exposes no Fullscreen API, so this
+    // is a no-op there (Add-to-Home-Screen is the only route -- see the ⤢ hint).
+    if (fsSupported()) {
+      document.addEventListener("pointerdown", function enterFS() {
+        if (!fsElement()) requestFS(document.documentElement).catch(function () {});
+      }, { once: true, passive: true });
+    }
+
+    // fullscreen + landscape lock toggle (⤢). Toggles the joysticks-only landscape view.
     if (el.fsBtn) el.fsBtn.addEventListener("click", toggleImmersive);
     // ✕ exits the joysticks-only landscape view (the ⤢ toggle is in the hidden header).
     if (el.landExit) el.landExit.addEventListener("click", () => setLandscape(false));
@@ -761,21 +684,13 @@
     { const x = $("phA2hsX"); if (x) x.addEventListener("click", () => showA2HS(false)); }
     { const h = $("phA2hs"); if (h) h.addEventListener("click", (e) => { if (e.target === h) showA2HS(false); }); }
 
-    // obstacle feed switcher (2D ring / 3D sphere / cloud feed)
-    document.querySelectorAll("[data-feed-btn]").forEach((b) =>
-      b.addEventListener("click", () => setFeed(b.dataset.feedBtn)));
-
     // swipe sheet controls
     if (el.sheetX) el.sheetX.addEventListener("click", closeSheet);
     if (el.sheet) el.sheet.addEventListener("click", (e) => { if (e.target === el.sheet) closeSheet(); });
     wireSwipe();
 
-    // redraw the 2D ring when its box resizes (orientation change / fullscreen).
-    window.addEventListener("resize", () => { if (curFeed === "radar") drawRadarInto(el.bigRadar, lastObs); });
-
-    // start read-only until the server tells us who owns the lock
-    // restore forced-landscape preference (CSS-only on load; a real FS request needs
-    // a user gesture, so that only happens when the ⛶ button is tapped).
+    // restore forced-landscape preference (CSS-only on load; a real FS request needs a
+    // user gesture, so that only happens when the ⤢ button is tapped).
     try {
       if (localStorage.getItem("g1.phoneLandscape") === "1") {
         document.body.classList.add("ph-landscape");
@@ -783,12 +698,12 @@
       }
     } catch (_) {}
 
+    // start read-only until the server tells us who owns the lock
     setControl(false, null);
     setStatus(false, "connecting…");
-    setFeed("radar");
-    applyStep(currentStep);
+    setObstacle(false);       // reads OFF until the server's config/obstacle message lands
+    setInteract(false);       // reads OFF until the first fsm_state lands
     renderModes();
-    window.dispatchEvent(new Event("resize"));
   }
 
   // =====================================================================

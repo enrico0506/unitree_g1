@@ -3,20 +3,47 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <!-- Phone auto-detect: a phone-sized touch device is sent to the stripped-down
-       /phone teleop surface before the heavy dashboard loads. Escape hatches:
-       open /?full=1 to force the full dashboard (remembered), and /phone has a
-       "Full" link back. Tablets / touch-laptops (min side > 600px) stay here. -->
+  <!-- Phone auto-detect: a phone is sent to the stripped-down /phone teleop surface
+       before the heavy dashboard loads. Escape hatches: /?full=1 forces the full
+       dashboard (remembered); /?phone=1 forces the phone page; /phone has a "Full"
+       link back. Robust detection (the old screen.width<=600 test missed phones whose
+       browser reports screen size in DEVICE pixels, e.g. a 1080px-wide Android):
+         1. mobile User-Agent  -> definitely a phone (covers iPhone / Android / iPadOS).
+         2. otherwise coarse pointer + no hover + a small CSS-pixel viewport -> a phone
+            too. The hover/CSS-viewport gate keeps touch LAPTOPS (hover + big screen) on
+            the full dashboard, and uses innerWidth (CSS px), not screen.* (device px). -->
   <script>
   (function () {
+    // Read the stored preference DEFENSIVELY: a throw here (storage-blocked / enterprise
+    // browsers, sandboxed frames) must not abort detection, or a real phone would be left
+    // on the heavy dashboard -- the exact failure class this detector fixes.
+    var pref = null;
+    try { pref = localStorage.getItem("g1.surface"); } catch (e) {}
     try {
       var q = new URLSearchParams(location.search);
-      if (q.get("full") === "1") { localStorage.setItem("g1.surface", "full"); return; }
-      if (localStorage.getItem("g1.surface") === "full") return;   // user chose full dashboard
-      var small = Math.min(screen.width || 9999, screen.height || 9999) <= 600;
-      var coarse = (navigator.maxTouchPoints || 0) > 0
-        || (window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
-      if (small && coarse) location.replace("/phone");            // a phone -> phone teleop
+      if (q.get("full") === "1")  { try { localStorage.setItem("g1.surface", "full"); } catch (e) {} return; }
+      if (q.get("phone") === "1") { location.replace("/phone"); return; }
+      if (pref === "full") return;                                 // user chose full dashboard
+      var ua = navigator.userAgent || "";
+      var maxTouch = navigator.maxTouchPoints || 0;
+      // "Mobile" is in phone UAs (iPhone, Android phones) but NOT Android tablets (Chrome
+      // drops it on tablets), so matching "Mobile" instead of a bare "Android" keeps big
+      // Android tablets on the dashboard. iPadOS 13+ masquerades as desktop "Macintosh"
+      // but reports touch points.
+      var uaPhone = /iPhone|iPod|Windows Phone|IEMobile|BlackBerry|Opera Mini|Mobile/i.test(ua)
+        || (/iPad|Macintosh/.test(ua) && maxTouch > 1);
+      var mm = window.matchMedia ? window.matchMedia.bind(window) : null;
+      var coarse  = maxTouch > 0 || (mm && mm("(pointer: coarse)").matches);
+      var noHover = mm && mm("(hover: none)").matches;
+      // CSS-pixel viewport (NOT screen.*, which some Android browsers report in physical
+      // device pixels). 820px covers large phones / phablets in either rotation.
+      var vw = Math.max(document.documentElement.clientWidth  || 0, window.innerWidth  || 0);
+      var vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+      var smallViewport = Math.min(vw || 9999, vh || 9999) <= 820;
+      // Physical-screen sanity bound so a merely SNAPPED / narrow window on a big touch
+      // desktop (mouse-less all-in-one) isn't misrouted; genuine small panels still pass.
+      var smallScreen = Math.min(screen.width || 9999, screen.height || 9999) <= 900;
+      if (uaPhone || (coarse && noHover && smallViewport && smallScreen)) location.replace("/phone");
     } catch (e) {}
   })();
   </script>

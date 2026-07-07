@@ -2,9 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <!-- Locked viewport: no pinch-zoom / double-tap-zoom so thumbs on the sticks
-       never accidentally zoom the page. viewport-fit=cover for notched phones. -->
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <!-- Locked viewport: no pinch-zoom / double-tap-zoom so thumbs on the sticks never
+       accidentally zoom the page. viewport-fit=CONTAIN (not cover): the browser keeps the
+       whole layout INSIDE the safe area, so content can never slide under the status-bar
+       battery or a camera notch/cutout -- in normal browsing OR real fullscreen. (cover
+       drew edge-to-edge under the status bar, and Android reports safe-area-inset-top=0 for
+       a plain status bar, so the header ended up hidden behind the battery.) -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=contain">
   <meta name="mobile-web-app-capable" content="yes">
   <!-- iPhone Safari blocks the Fullscreen API + orientation lock for web pages;
        the ONLY route to real chromeless fullscreen on iOS is "Add to Home Screen"
@@ -16,18 +20,9 @@
   <title>G1 · Phone Teleop</title>
   <link rel="manifest" href="/static/phone.webmanifest">
   <link rel="apple-touch-icon" href="/static/phone-icon.svg">
-  <link rel="stylesheet" href="/static/phone.css?v=14">
-  <!-- three.js (shared vendored copy) for the LiDAR cloud feed + 3D obstacle sphere -->
-  <script type="importmap">
-  {
-    "imports": {
-      "three": "/static/vendor/three/three.module.js",
-      "three/addons/OrbitControls.js": "/static/vendor/three/OrbitControls.js"
-    }
-  }
-  </script>
+  <link rel="stylesheet" href="/static/phone.css?v=18">
 </head>
-<body data-mode="damp" data-feed="radar">
+<body data-mode="damp">
 
   <!-- ================= top bar ================= -->
   <header class="ph-top">
@@ -57,10 +52,10 @@
     <button class="ph-mbtn" data-mode="damp" type="button">Damp</button>
     <button class="ph-mbtn" data-mode="stand" type="button">Stand</button>
     <button class="ph-mbtn ph-walk" data-mode="walk" type="button">Walk</button>
-    <!-- Drive | Actions surface selector: Actions dims the deck + opens gestures -->
+    <!-- Drive | Gestures surface selector: Gestures dims the deck + opens the panel -->
     <div class="ph-surfsel" role="tablist" aria-label="surface">
       <button class="ph-surfbtn current" data-surf="drive" type="button" role="tab">Drive</button>
-      <button class="ph-surfbtn" data-surf="actions" type="button" role="tab">Actions</button>
+      <button class="ph-surfbtn" data-surf="actions" type="button" role="tab">Gestures</button>
     </div>
   </nav>
 
@@ -72,36 +67,25 @@
       <div class="ph-stick-cap">Move<small>fwd · strafe</small></div>
     </div>
 
-    <!-- CENTER: obstacle view + feed switch + obstacle on/off + STOP -->
+    <!-- CENTER: the two live switches (obstacle avoidance + interaction) -->
     <section class="ph-center">
-      <div class="ph-obsview" id="phObsView" data-feed="radar">
-        <div class="ph-feed-toggle">
-          <button data-feed-btn="radar"  type="button">2D</button>
-          <button data-feed-btn="sphere" type="button">3D</button>
-          <button data-feed-btn="cloud"  type="button">Feed</button>
-          <span class="ph-feed-badge" id="lidarBadge">…</span>
-        </div>
-        <!-- one visible at a time (CSS keys off #phObsView[data-feed]) -->
-        <canvas id="bigRadar" class="ph-feed-layer" data-layer="radar"></canvas>
-        <div id="bigSphere"   class="ph-feed-layer" data-layer="sphere"></div>
-        <div id="lidarView"   class="ph-feed-layer" data-layer="cloud"></div>
-      </div>
-
-      <button class="ph-obs-btn" id="phObsBtn" type="button">
-        <span class="ph-obs-led" aria-hidden="true"></span>
-        <span class="ph-obs-label">Obstacle avoidance</span>
-        <span class="ph-obs-state" id="phObsState">—</span>
+      <button class="ph-switch" id="phObsBtn" type="button" aria-pressed="false">
+        <span class="ph-switch-led" aria-hidden="true"></span>
+        <span class="ph-switch-body">
+          <span class="ph-switch-name">Obstacle avoidance</span>
+          <span class="ph-switch-sub">Robot stops for obstacles</span>
+        </span>
+        <span class="ph-switch-state" id="phObsState">OFF</span>
       </button>
 
-      <!-- Step size (continuous / medium / small) — same as the dashboard selector. -->
-      <div class="ph-step" id="phStep" role="group" aria-label="step size">
-        <span class="ph-step-label">Step</span>
-        <button data-step="continuous" type="button">Normal</button>
-        <button data-step="medium" type="button">Med</button>
-        <button data-step="small" type="button">Small</button>
-      </div>
-
-      <button class="ph-stop" id="phStop" type="button">STOP</button>
+      <button class="ph-switch ph-switch-interact" id="phInteractBtn" type="button" aria-pressed="false">
+        <span class="ph-switch-led" aria-hidden="true"></span>
+        <span class="ph-switch-body">
+          <span class="ph-switch-name">Interaction mode</span>
+          <span class="ph-switch-sub" id="phInteractStatus">Robot greets people back</span>
+        </span>
+        <span class="ph-switch-state" id="phInteractState">OFF</span>
+      </button>
     </section>
 
     <!-- RIGHT thumbstick -->
@@ -114,15 +98,14 @@
     <div class="ph-deck-hint" id="phDeckHint" hidden>Switch to <b>Walk</b> to drive</div>
   </main>
 
-  <!-- ================= ACTIONS surface (gestures + whole-body) ============== -->
-  <!-- Overlays the deck; opening it zeroes the sticks + makes the deck inert. A STOP
-       stays live in its header. Arm gestures are gated on Stand/Walk; Dance/Climb are
-       hold-to-fire and gated on the server's captured FSM ids (mode_combos). -->
-  <section class="ph-actions" id="phActions" hidden aria-label="actions">
+  <!-- ================= GESTURES surface (arm gestures + whole-body) ========= -->
+  <!-- Overlays the deck; opening it zeroes the sticks + makes the deck inert. Arm
+       gestures are gated on Stand/Walk; Dance/Climb are hold-to-fire and gated on the
+       server's captured FSM ids (mode_combos). -->
+  <section class="ph-actions" id="phActions" hidden aria-label="gestures">
     <div class="ph-actions-head">
-      <span class="ph-actions-title">Actions</span>
-      <span class="ph-actions-hint" id="phActionsHint">—</span>
-      <button class="ph-actions-stop" id="phActionsStop" type="button">STOP</button>
+      <span class="ph-actions-title">Gestures</span>
+      <span class="ph-actions-hint" id="phActionsHint"></span>
       <button class="ph-actions-x" id="phActionsX" type="button" aria-label="back to drive">✕ Drive</button>
     </div>
 
@@ -199,10 +182,6 @@
     </div>
   </div>
 
-  <script src="/static/phone.js?v=15"></script>
-  <!-- viz modules (ES modules, deferred): render on the PHONE's GPU; phone.js feeds
-       them obstacle frames + drives the feed switch. -->
-  <script type="module" src="/static/obstacle3d.js?v=10"></script>
-  <script type="module" src="/static/lidar.js?v=13"></script>
+  <script src="/static/phone.js?v=17"></script>
 </body>
 </html>
