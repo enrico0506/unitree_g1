@@ -1784,6 +1784,26 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
+# --- Motion tab (record -> recreate; motion/PLAN.md Phase 1). Routes under /motion/*.
+# Wrapped defensively: a motion import error prints one line and never takes the dashboard
+# down. get_control_owner reads the LIVE control_owner_id each request (lambda, not a value),
+# so record/recreate are gated to whoever currently holds the single-controller lock. ---
+try:
+    from motion.app.jobs import JobStore
+    from motion.app.replay import StubProvider
+    from motion.app.routes import build_motion_router
+    _motion_store = JobStore(BASE_DIR / "motion" / "data" / "clips")
+    app.include_router(build_motion_router(
+        get_control_owner=lambda: control_owner_id,
+        store=_motion_store,
+        provider=StubProvider(),
+        frame_source=CAMERA_SHM,
+        record_hz=30.0, max_seconds=30.0,
+    ))
+    print("Motion tab mounted at /motion/*", flush=True)
+except Exception as e:
+    print(f"[MOTION] disabled (mount failed): {e}", flush=True)
+
 
 # The HTML shells reference their JS/CSS with ?v= cache-busting query strings, but
 # the shells THEMSELVES had no Cache-Control, so phones/tunnels served a stale copy

@@ -343,6 +343,10 @@ function updateControl(msg) {
   hasControl = (ownerId !== null && ownerId === CLIENT_ID);
   ownerLabel = msg.owner_label || null;
   renderControlChip();
+  // Seam for the Motion tab: expose our client id (for the X-Client-Id header the /motion
+  // routes gate on) + announce control changes so motion.js enables/disables in lock-step.
+  window.G1_CLIENT_ID = CLIENT_ID;
+  window.dispatchEvent(new CustomEvent("g1:control", { detail: { isOwner: hasControl } }));
   // The laptop is the DEFAULT driver: whenever the lock is FREE (nobody driving),
   // reclaim it automatically so a lone laptop -- or the laptop after a phone leaves
   // -- keeps working exactly as before. It never auto-steals from another device
