@@ -23,6 +23,11 @@ If `--ff-only` refuses (office diverged), stop and reconcile — do NOT force. T
 
 ## What's new this cycle
 
+> The **LiDAR + depth obstacle-detection rebuild** that preceded these features (fine
+> detection, depth fusion, the measurement bench, viz overhaul, safety hardening) is
+> documented in full — with per-area *what-to-do* — in **`PERCEPTION-REBUILD.md`**. Read
+> that for the obstacle pipeline; this section covers the features that came after it.
+
 **Odometry**
 - `722030c` — Fused SE2 odometry (leg + IMU + lidar): a pure-numpy complementary filter that fuses leg-odom, IMU yaw-rate and FAST-LIO into one smooth, non-drifting pose (sim: leg-only 4.33 m RMSE → fused 0.04 m). **It is a library, not yet wired in** — zero consumers, and the on-robot adapter's `start()` raises `NotImplementedError` (the FAST-LIO subscribe is a stub). Nothing changes on the robot until someone finishes the wiring.
 
