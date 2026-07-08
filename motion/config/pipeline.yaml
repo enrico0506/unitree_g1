@@ -25,7 +25,9 @@ deploy:
                                          #   (a version mismatch produces WRONG motion)
 
 models:
-  smpl_dir: models/smpl                  # SMPL body model (MPI registration required)
+  smpl_dir: models/smpl                  # ROMP's SMPL body model (register: smpl.is.tue.mpg.de)
+  smplx_dir: models/smplx                # GMR's SMPL-X body model (register: smpl-x.is.tue.mpg.de)
+  g1_mjcf: models/g1/g1_29dof.xml        # G1 MuJoCo model for sim render (unitree_mujoco / menagerie)
   sonic_encoder: models/sonic/model_encoder.onnx
   sonic_decoder: models/sonic/model_decoder.onnx
   sonic_obs_cfg: models/sonic/observation_config.yaml
