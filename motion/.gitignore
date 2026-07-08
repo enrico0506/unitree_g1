@@ -1,6 +1,8 @@
 # weights + artifacts + third-party build outputs are large / regenerable — keep them out of git
 models/**
 !models/**/.gitkeep
+!models/README.md
+!models/**/README.md
 data/**
 !data/**/.gitkeep
 third_party/*/            # submodule working trees pull their own code; don't vendor build outputs
