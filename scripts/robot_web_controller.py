@@ -1790,17 +1790,21 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 # so record/recreate are gated to whoever currently holds the single-controller lock. ---
 try:
     from motion.app.jobs import JobStore
-    from motion.app.replay import StubProvider
+    from motion.app.replay import StubProvider, SonicProvider
     from motion.app.routes import build_motion_router
     _motion_store = JobStore(BASE_DIR / "motion" / "data" / "clips")
+    # StubProvider (copies the clip) by default; the real ROMP->GMR->SONIC pipeline is
+    # opt-in with MOTION_PROVIDER=sonic (ON-DEVICE only -- needs the Orin's ML stack).
+    _use_sonic = os.environ.get("MOTION_PROVIDER", "").lower() == "sonic"
+    _motion_provider = SonicProvider() if _use_sonic else StubProvider()
     app.include_router(build_motion_router(
         get_control_owner=lambda: control_owner_id,
         store=_motion_store,
-        provider=StubProvider(),
+        provider=_motion_provider,
         frame_source=CAMERA_SHM,
         record_hz=30.0, max_seconds=30.0,
     ))
-    print("Motion tab mounted at /motion/*", flush=True)
+    print(f"Motion tab mounted at /motion/* (provider={_motion_provider.name})", flush=True)
 except Exception as e:
     print(f"[MOTION] disabled (mount failed): {e}", flush=True)
 
