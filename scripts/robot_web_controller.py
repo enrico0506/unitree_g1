@@ -37,7 +37,8 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.core.channel import (ChannelFactoryInitialize, ChannelSubscriber,
+                                         ChannelPublisher)
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.g1.loco.g1_loco_api import (
     ROBOT_API_ID_LOCO_SET_VELOCITY,
@@ -278,6 +279,38 @@ def _valid_dance_id(fsm):
     return 0 <= fsm <= _FSM_ID_MAX and fsm not in _BASE_FSM_IDS
 
 
+# Remote key bit layout (matches config/mapping.yaml remote_keys) + name->mask helper.
+# Defined HERE (above load_dances) because load_dances runs at import to build DANCES,
+# and it calls combo_mask() to turn a child dance's `combo` into a key mask.
+REMOTE_BIT_NAMES = {
+    0: "R1", 1: "L1", 2: "start", 3: "select", 4: "R2", 5: "L2",
+    6: "F1", 7: "F2", 8: "A", 9: "B", 10: "X", 11: "Y",
+    12: "up", 13: "left", 14: "down", 15: "right",
+}
+REMOTE_NAME_BITS = {name.lower(): bit for bit, name in REMOTE_BIT_NAMES.items()}
+
+
+def combo_mask(spec):
+    """['R1','up'] or 'R1+up' -> the uint16 key mask (0 if unparseable/empty).
+
+    This is how a child dance mimics the physical remote: some whole-body sub-dances
+    (e.g. 503 -> 801) are NOT reachable with SetFsmId -- the firmware only enters them
+    from a button combo pressed WHILE in the parent mode. We reproduce that exact combo
+    by publishing a WirelessController_ frame (press_remote_combo)."""
+    if isinstance(spec, str):
+        parts = spec.replace("+", " ").split()
+    elif isinstance(spec, (list, tuple)):
+        parts = spec
+    else:
+        return 0
+    mask = 0
+    for p in parts:
+        bit = REMOTE_NAME_BITS.get(str(p).strip().lower())
+        if bit is not None:
+            mask |= (1 << bit)
+    return mask
+
+
 def load_dances(path=DANCES_PATH):
     """Read the named-dance catalog. Returns [{name, fsm_id, space_m, note, verified}].
 
@@ -306,19 +339,40 @@ def load_dances(path=DANCES_PATH):
             space = float(d.get("space_m", 2.0))
         except (TypeError, ValueError):
             space = 2.0
+        # is_hub: this id is a "dance mode" you enter first (e.g. 503). parent_fsm:
+        # this dance only fires from WITHIN that hub fsm (e.g. 801 lives inside 503).
+        # combo: the remote buttons that trigger it from the hub (e.g. ['R1','up']) --
+        # some sub-dances are unreachable via SetFsmId, so we mimic the remote instead.
+        # All optional; carried verbatim so the two-step Dance panel can render them.
+        parent = d.get("parent_fsm")
+        parent = int(parent) if _valid_dance_id(parent) else None
+        combo = d.get("combo")
         out.append({"name": name, "fsm_id": fsm,
                     "space_m": round(max(0.0, space), 1),
                     "note": str(d.get("note") or "")[:200],
-                    "verified": bool(d.get("verified", True))})
+                    "verified": bool(d.get("verified", True)),
+                    "is_hub": bool(d.get("is_hub", False)),
+                    "parent_fsm": parent,
+                    "combo": combo if combo else None,
+                    "combo_keys": combo_mask(combo) if combo else 0})
     return out
 
 
 def save_dances(dances, path=DANCES_PATH):
     """Persist the dance catalog back to config/dances.yaml (Dance Lab Save)."""
-    payload = {"dances": [{"name": d["name"], "fsm_id": int(d["fsm_id"]),
-                           "space_m": float(d["space_m"]), "note": d.get("note", ""),
-                           "verified": bool(d.get("verified", True))}
-                          for d in dances]}
+    def _entry(d):
+        e = {"name": d["name"], "fsm_id": int(d["fsm_id"]),
+             "space_m": float(d["space_m"]), "note": d.get("note", ""),
+             "verified": bool(d.get("verified", True))}
+        # Only emit the hierarchy keys when set, so ordinary flat dances stay clean.
+        if d.get("is_hub"):
+            e["is_hub"] = True
+        if d.get("parent_fsm") is not None:
+            e["parent_fsm"] = int(d["parent_fsm"])
+        if d.get("combo"):
+            e["combo"] = list(d["combo"]) if isinstance(d["combo"], (list, tuple)) else d["combo"]
+        return e
+    payload = {"dances": [_entry(d) for d in dances]}
     tmp = Path(str(path) + ".tmp")
     header = ("# G1 DANCE CATALOG — named whole-body FSM routines (see git history\n"
               "# for the full guide). Auto-written by the dashboard's Dance Lab.\n")
@@ -628,16 +682,43 @@ def call_with_timeout(fn, timeout):
 # ---------------------------------------------------------------------------
 
 # Remote button bit -> name (matches config/mapping.yaml + capture_combo_fsm.py).
-REMOTE_BIT_NAMES = {
-    0: "R1", 1: "L1", 2: "start", 3: "select", 4: "R2", 5: "L2",
-    6: "F1", 7: "F2", 8: "A", 9: "B", 10: "X", 11: "Y",
-    12: "up", 13: "left", 14: "down", 15: "right",
-}
-
-
 def _remote_combo_name(mask):
     names = [REMOTE_BIT_NAMES.get(b, f"bit{b}") for b in range(16) if mask & (1 << b)]
     return "+".join(names) if names else "-"
+
+
+# Publisher for synthetic remote frames (created in lifespan). None until then / if the
+# WirelessController_ IDL is unavailable -> press_remote_combo becomes a logged no-op.
+wireless_pub = None
+
+
+def press_remote_combo(mask, hold_s=0.35, hz=50.0):
+    """Publish a button-press burst to rt/wirelesscontroller: a few released frames for a
+    clean rising edge, the combo held for hold_s, then released. Mimics one press of the
+    physical remote so the robot's onboard FSM reacts exactly as it does to that combo.
+    Sticks are all zero. Returns True if anything was published."""
+    if wireless_pub is None or WirelessController_ is None or not mask:
+        print(f"[REMOTE-TX] cannot send combo 0x{mask:04x} -- publisher/IDL unavailable",
+              flush=True)
+        return False
+    period = 1.0 / max(1.0, float(hz))
+    try:
+        for _ in range(3):                       # baseline release -> guarantee an edge
+            wireless_pub.Write(WirelessController_(0.0, 0.0, 0.0, 0.0, 0))
+            time.sleep(period)
+        n = max(1, int(hold_s * hz))
+        for _ in range(n):                       # hold the combo
+            wireless_pub.Write(WirelessController_(0.0, 0.0, 0.0, 0.0, int(mask)))
+            time.sleep(period)
+        for _ in range(3):                       # release
+            wireless_pub.Write(WirelessController_(0.0, 0.0, 0.0, 0.0, 0))
+            time.sleep(period)
+        print(f"[REMOTE-TX] sent combo {_remote_combo_name(mask)} "
+              f"(0x{mask:04x}) for {hold_s:.2f}s", flush=True)
+        return True
+    except Exception as e:
+        print(f"[REMOTE-TX] publish failed: {e}", flush=True)
+        return False
 
 
 # FSM ids WE asked the robot to enter -> the monotonic time we asked. A transition
@@ -1152,7 +1233,7 @@ def apply_cmd(name):
         print(f"[cmd error: unknown '{name}']", flush=True)
 
 
-def fire_whole_body(name, fsm, require_upright=False):
+def fire_whole_body(name, fsm, require_upright=False, allow_from_fsm=None):
     """Hand the whole body to a routine FSM (climb / dance / a Dance Lab probe).
 
     Serialized with enter_mode via _mode_lock: a routine must not race a mode
@@ -1164,16 +1245,24 @@ def fire_whole_body(name, fsm, require_upright=False):
 
     require_upright: refuse unless the robot is settled + upright (stand/walk) and
     not locomoting -- the safety gate for operator-fired dances and probes.
+    allow_from_fsm: also accept the fire when the robot is currently in this fsm
+    (a dance-mode hub, e.g. 503) even though state.mode isn't stand/walk -- this is
+    how a child dance (801) is triggered from WITHIN dance mode, mirroring the
+    remote's R1+Up after R1+B.
     """
     if not _valid_dance_id(fsm):
         print(f"[CMD] {name} refused -- {fsm!r} is not a valid dance id "
               f"(base modes 0/1/4/802 and out-of-range are rejected)", flush=True)
         return False
-    if require_upright and (state.mode not in ("stand", "walk")
-                            or state.transitioning or _locomoting()):
-        print(f"[CMD] {name} refused -- robot not upright/settled "
-              f"(mode={state.mode} moving={_locomoting()})", flush=True)
-        return False
+    if require_upright:
+        in_parent = allow_from_fsm is not None and state.fsm_id == allow_from_fsm
+        settled = (state.mode in ("stand", "walk")
+                   and not state.transitioning and not _locomoting())
+        if not (settled or in_parent):
+            print(f"[CMD] {name} refused -- robot not upright/settled and not in "
+                  f"dance mode (mode={state.mode} fsm={state.fsm_id} "
+                  f"moving={_locomoting()})", flush=True)
+            return False
     if not _mode_lock.acquire(blocking=False):
         print(f"[CMD] {name} ignored -- mode transition in progress", flush=True)
         return False
@@ -1201,6 +1290,44 @@ def fire_whole_body(name, fsm, require_upright=False):
     # Wait for the robot to actually enter the routine, then drop the transitioning
     # flag -- but only if WE still own this handoff (a concurrent Stand/Walk that
     # grabbed the lock now owns state.mode + its own transitioning; don't stomp it).
+    try:
+        wait_for_fsm(fsm, timeout=5.0)
+    finally:
+        if state.mode == name:
+            state.transitioning = False
+    return True
+
+
+def fire_child_combo(name, fsm, parent_fsm, combo_keys):
+    """Trigger a sub-dance that SetFsmId can't reach by MIMICKING its remote combo from
+    inside the hub fsm (e.g. R1+Up while in dance mode 503 -> 801). Only fires when the
+    robot is actually in parent_fsm. Registers the resulting fsm as a routine so
+    Stand/Walk recover the robot. Serialized with enter_mode via _mode_lock, like
+    fire_whole_body. Returns True if the combo was published."""
+    if not combo_keys:
+        print(f"[CMD] {name} refused -- no remote combo configured", flush=True)
+        return False
+    if state.fsm_id != parent_fsm:
+        print(f"[CMD] {name} refused -- robot not in dance mode "
+              f"(fsm={state.fsm_id}, need {parent_fsm}); enter dance mode first",
+              flush=True)
+        return False
+    if not _mode_lock.acquire(blocking=False):
+        print(f"[CMD] {name} ignored -- mode transition in progress", flush=True)
+        return False
+    try:
+        register_routine_fsm(fsm, name)   # so Stand/Walk exit the sub-dance via 802
+        state.vx = state.vy = state.vyaw = 0.0
+        state.is_moving = False
+        state.gait_enabled = False
+        state.transitioning = True
+        state.mode = name
+        note_fsm_intent(fsm)              # our doing, not an external remote press
+        print(f"[CMD] {name} -> remote combo {_remote_combo_name(combo_keys)} "
+              f"(mimicked, in dance mode {parent_fsm})", flush=True)
+    finally:
+        _mode_lock.release()
+    press_remote_combo(combo_keys)
     try:
         wait_for_fsm(fsm, timeout=5.0)
     finally:
@@ -1515,7 +1642,7 @@ async def broadcast_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf, depth_dumper
-    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting
+    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting, wireless_pub
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -1545,6 +1672,18 @@ async def lifespan(app: FastAPI):
     # the physical remote vs the robot's onboard firmware from the very first flip.
     remote_watcher = RemoteWatcher()
     remote_watcher.start()
+
+    # Publisher for SYNTHETIC remote frames -- lets a child dance mimic the exact button
+    # combo (e.g. R1+Up in dance mode) that SetFsmId can't reach. Optional: if the IDL is
+    # missing, press_remote_combo just logs and no-ops.
+    if WirelessController_ is not None:
+        try:
+            wireless_pub = ChannelPublisher("rt/wirelesscontroller", WirelessController_)
+            wireless_pub.Init()
+            print("[REMOTE-TX] synthetic wireless publisher ready.", flush=True)
+        except Exception as e:
+            wireless_pub = None
+            print(f"[REMOTE-TX] publisher init failed ({e}); child combos disabled.", flush=True)
 
     fsm_thread = threading.Thread(target=fsm_poll_loop, daemon=True)
     fsm_thread.start()
@@ -2235,10 +2374,25 @@ async def ws_endpoint(ws: WebSocket):
                     fsm = None
                 entry = next((d for d in DANCES if d["fsm_id"] == fsm), None) if fsm is not None else None
                 if entry is not None:
-                    threading.Thread(target=fire_whole_body,
-                                     args=(entry["name"], entry["fsm_id"]),
-                                     kwargs={"require_upright": True},
-                                     daemon=True).start()
+                    parent = entry.get("parent_fsm")
+                    if entry.get("combo_keys") and parent is not None:
+                        # Sub-dance unreachable via SetFsmId -> mimic its remote combo
+                        # (only fires while the robot is in the hub fsm).
+                        threading.Thread(
+                            target=fire_child_combo,
+                            args=(entry["name"], entry["fsm_id"],
+                                  int(parent), int(entry["combo_keys"])),
+                            daemon=True).start()
+                    else:
+                        kwargs = {"require_upright": True}
+                        # A child dance without a combo may still fire from within its
+                        # hub fsm via SetFsmId (if the firmware accepts it).
+                        if parent is not None:
+                            kwargs["allow_from_fsm"] = int(parent)
+                        threading.Thread(target=fire_whole_body,
+                                         args=(entry["name"], entry["fsm_id"]),
+                                         kwargs=kwargs,
+                                         daemon=True).start()
                 else:
                     print(f"[DANCE] rejected unknown fsm_id {msg.get('fsm_id')!r} "
                           f"(not in catalog)", flush=True)
@@ -2274,9 +2428,18 @@ async def ws_endpoint(ws: WebSocket):
                     print(f"[DANCE-LAB] save rejected (fsm={fsm!r} name={dname!r})", flush=True)
                 else:
                     fsm = int(fsm)
+                    prev = next((d for d in DANCES if d["fsm_id"] == fsm), None)
                     cat = [d for d in DANCES if d["fsm_id"] != fsm]
-                    cat.append({"name": dname, "fsm_id": fsm, "space_m": space,
-                                "note": str(msg.get("note") or "")[:200], "verified": True})
+                    entry = {"name": dname, "fsm_id": fsm, "space_m": space,
+                             "note": str(msg.get("note") or "")[:200], "verified": True}
+                    # Re-saving an existing dance keeps its hub/child role (a probe of
+                    # a brand-new id is just a flat top-level dance -- no hierarchy).
+                    if prev is not None:
+                        if prev.get("is_hub"):
+                            entry["is_hub"] = True
+                        if prev.get("parent_fsm") is not None:
+                            entry["parent_fsm"] = int(prev["parent_fsm"])
+                    cat.append(entry)
                     cat.sort(key=lambda d: d["fsm_id"])
                     try:
                         save_dances(cat)

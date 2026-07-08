@@ -163,6 +163,30 @@ window.Dance = (function () {
     send && send({ type: "dance", fsm_id: d.fsm_id });
   }
 
+  // A HUB dance (is_hub) -> "Enter Dance Mode". Fires the hub fsm (e.g. 503) from
+  // upright; once the robot is in it, the child dances below unlock. Mirrors R1+B.
+  function enterHub(d) {
+    if (!upright()) { flashWarn(); return; }
+    const ok = confirm(
+      `Enter “${d.name}” — the robot hands its whole body to dance mode and needs ` +
+      `about ${d.space_m} m of clear space all round. Left alone it plays the ` +
+      `classic dance; or press a dance button once it's in.\n\n` +
+      `Keep the e-stop in reach. Press Stand/Walk (or Stop) to exit.\n\nContinue?`
+    );
+    if (!ok) return;
+    if (window.logEvent) window.logEvent(`dance → enter ${d.name}`);
+    send && send({ type: "dance", fsm_id: d.fsm_id });
+  }
+
+  // A CHILD dance (parent_fsm set) -> only fireable while the robot is in that hub
+  // fsm (dance mode). No heavy confirm: we're already committed to dancing, this
+  // just switches which dance. Mirrors pressing a direction after R1+B.
+  function playChild(d) {
+    if (fsmId !== d.parent_fsm) { flashWarn(); return; }
+    if (window.logEvent) window.logEvent(`dance → ${d.name} (from mode ${d.parent_fsm})`);
+    send && send({ type: "dance", fsm_id: d.fsm_id });
+  }
+
   // A CANDIDATE (unverified) tile -> Test it exactly like a Dance Lab probe: same
   // supervised confirm, and prefill the Lab's Save form so a good result is one click
   // from becoming a verified dance.
@@ -221,7 +245,45 @@ window.Dance = (function () {
       return;
     }
     const dis = up ? "" : "disabled";
-    els.grid.innerHTML = dances.map((d) => {
+
+    // Partition into: hubs (dance modes you ENTER), their children (dances that
+    // fire from inside a hub), and standalone tiles (flat dances / candidates). A
+    // child whose parent isn't actually a hub falls back to standalone so it stays
+    // reachable rather than vanishing.
+    const hubs = dances.filter(d => d.is_hub);
+    const hubFsms = new Set(hubs.map(h => h.fsm_id));
+    const childrenOf = (fsm) => dances.filter(d => d.parent_fsm === fsm);
+    const standalone = dances.filter(d =>
+      !d.is_hub && !(d.parent_fsm != null && hubFsms.has(d.parent_fsm)));
+
+    const hubHtml = (h) => {
+      const inMode = fsmId === h.fsm_id;                 // robot IS in this dance mode
+      const enterDis = (up && !inMode) ? "" : "disabled";
+      const kids = childrenOf(h.fsm_id);
+      const kidsHtml = kids.map((c) => {
+        const cactive = fsmId === c.fsm_id;             // this child is dancing now
+        const cdis = (inMode && !cactive) ? "" : "disabled";
+        return `<button class="dt-sub${cactive ? " active" : ""}" data-fsm="${c.fsm_id}" ${cdis}
+                  title="${esc(c.note || "")}">
+              <span class="dt-sub-name">${cactive ? "● " : ""}${esc(c.name)}</span>
+              <span class="dt-sub-space">~${c.space_m} m</span>
+            </button>`;
+      }).join("");
+      return `<div class="dance-hub${inMode ? " active" : ""}">
+          <div class="dance-hub-head">
+            <div class="dt-name">${esc(h.name)}</div>
+            <div class="dt-space">needs ~${h.space_m} m clear</div>
+          </div>
+          ${h.note ? `<div class="dt-note" title="${esc(h.note)}">${esc(h.note)}</div>` : ""}
+          <button class="dt-enter" data-fsm="${h.fsm_id}" ${enterDis}>${inMode ? "● in dance mode" : "▶ Enter Dance Mode"}</button>
+          ${kids.length ? `<div class="dance-subwrap">
+              <div class="dance-sub-label">${inMode ? "Pick a dance:" : "Enter dance mode to unlock these:"}</div>
+              <div class="dance-subrow">${kidsHtml}</div>
+            </div>` : ""}
+        </div>`;
+    };
+
+    const tileHtml = (d) => {
       const active = d.fsm_id === fsmId;
       const action = d.verified
         ? `<button class="dt-play" data-fsm="${d.fsm_id}" ${dis}>${active ? "● dancing" : "▶ Play"}</button>`
@@ -233,9 +295,15 @@ window.Dance = (function () {
           ${d.note ? `<div class="dt-note" title="${esc(d.note)}">${esc(d.note)}</div>` : ""}
           ${action}
         </div>`;
-    }).join("");
+    };
+
+    els.grid.innerHTML = hubs.map(hubHtml).join("") + standalone.map(tileHtml).join("");
 
     const find = (btn) => dances.find(x => x.fsm_id === parseInt(btn.dataset.fsm, 10));
+    els.grid.querySelectorAll(".dt-enter").forEach(b =>
+      b.addEventListener("click", () => { const d = find(b); if (d) enterHub(d); }));
+    els.grid.querySelectorAll(".dt-sub").forEach(b =>
+      b.addEventListener("click", () => { const d = find(b); if (d) playChild(d); }));
     els.grid.querySelectorAll(".dt-play").forEach(b =>
       b.addEventListener("click", () => { const d = find(b); if (d) playDance(d); }));
     els.grid.querySelectorAll(".dt-test").forEach(b =>

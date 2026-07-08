@@ -20,7 +20,7 @@
   <title>G1 · Phone Teleop</title>
   <link rel="manifest" href="/static/phone.webmanifest">
   <link rel="apple-touch-icon" href="/static/phone-icon.svg">
-  <link rel="stylesheet" href="/static/phone.css?v=18">
+  <link rel="stylesheet" href="/static/phone.css?v=19">
 </head>
 <body data-mode="damp">
 
@@ -125,11 +125,17 @@
       <span class="ph-wb-label">Whole-body — takes over the robot</span>
       <div class="ph-wb-row">
         <button class="ph-wb" data-combo="dance" type="button">
-          <span class="ph-wb-fill"></span><span class="ph-wb-txt">💃 Dance <small>hold to start</small></span>
+          <span class="ph-wb-fill"></span><span class="ph-wb-txt">💃 Dance Mode <small>hold to enter</small></span>
         </button>
         <button class="ph-wb" data-combo="climb" type="button">
           <span class="ph-wb-fill"></span><span class="ph-wb-txt">🧗 Climb <small>hold · Stand→Walk to exit</small></span>
         </button>
+      </div>
+      <!-- Child dances live INSIDE dance mode: enabled only once the robot is in the
+           hub fsm (503). Populated from the dances catalog by renderDanceSub(). -->
+      <div class="ph-dance-sub" id="phDanceSub" hidden>
+        <span class="ph-dance-sub-label" id="phDanceSubLabel">Enter dance mode to pick a dance</span>
+        <div class="ph-dance-pills" id="phDancePills"></div>
       </div>
     </div>
 
@@ -182,6 +188,6 @@
     </div>
   </div>
 
-  <script src="/static/phone.js?v=17"></script>
+  <script src="/static/phone.js?v=18"></script>
 </body>
 </html>

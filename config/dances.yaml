@@ -24,12 +24,27 @@
 # note    : short free-text description shown on the tile's tooltip.
 # ----------------------------------------------------------------------------
 dances:
-  # ---- VERIFIED (green ▶ Play) — confirmed working on this robot ----
-  - name: "Classic Dance"
+  # ---- DANCE MODE (hub) — enter this FIRST, then pick a dance from inside it ----
+  # is_hub: true renders an "Enter Dance Mode" button. On the remote this is R1+B.
+  # Left alone, 503 plays the classic dance and returns to walk on its own; press a
+  # child dance below (while the robot is in 503) to switch into that specific dance.
+  - name: "Dance Mode"
     fsm_id: 503
     space_m: 2.0
     verified: true
-    note: "Built-in whole-body dance (remote R1+B). Returns to walk on its own."
+    is_hub: true
+    note: "Enter dance mode (remote R1+B). Left alone it plays the classic dance; or pick a dance below."
+
+  # ---- DANCES reachable from WITHIN Dance Mode (parent_fsm: 503) ----
+  # These only fire while the robot is already in 503 (mirrors pressing a direction
+  # on the remote after R1+B). The dashboard enables them once you're in dance mode.
+  - name: "Dance ↑ (Up)"
+    fsm_id: 801
+    parent_fsm: 503
+    combo: ["R1", "up"]
+    space_m: 1.0
+    verified: true
+    note: "From dance mode, remote R1+Up (mimicked — SetFsmId can't reach it). Captured 2026-07-08."
 
   # ---- CANDIDATES (amber 🧪 Test) — UNVERIFIED neighbours of the known dance id.
   # These are NOT confirmed to be dances; they are here so you can Test each one at

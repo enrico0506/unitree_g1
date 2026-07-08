@@ -681,3 +681,35 @@ main, main.controls, main.diag { gap: var(--sp-3); }
 }
 .dt-test:hover:not(:disabled) { border-color: var(--caution); }
 .dt-test:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ---- Dance Mode hub (two-step: Enter Dance Mode -> pick a dance) ---- */
+.dance-hub {
+  grid-column: 1 / -1;            /* the hub spans the whole modal width */
+  display: flex; flex-direction: column; gap: 7px;
+  background: var(--inset); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 12px;
+}
+.dance-hub.active { border-color: var(--live); box-shadow: 0 0 0 1px var(--live), 0 0 16px rgba(63,211,155,0.2); }
+.dance-hub-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.dt-enter {
+  margin-top: 2px; padding: 9px 11px; font-size: 12.5px; font-weight: 600;
+  background: var(--surface-2); color: var(--chalk);
+  border: 1px solid var(--line); border-radius: 7px;
+}
+.dt-enter:hover:not(:disabled) { border-color: var(--focus); }
+.dt-enter:disabled { opacity: 0.45; cursor: not-allowed; }
+.dance-hub.active .dt-enter { color: var(--live); border-color: var(--live); }
+
+.dance-subwrap { margin-top: 4px; border-top: 1px dashed var(--line-soft); padding-top: 9px; }
+.dance-sub-label { font-size: 11px; color: var(--steel); margin-bottom: 7px; }
+.dance-subrow { display: flex; flex-wrap: wrap; gap: 8px; }
+.dt-sub {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 8px 12px; font-size: 12px; font-weight: 600;
+  background: color-mix(in srgb, var(--live) 12%, var(--surface-2)); color: var(--chalk);
+  border: 1px solid color-mix(in srgb, var(--live) 40%, var(--line)); border-radius: 999px;
+}
+.dt-sub:hover:not(:disabled) { border-color: var(--live); }
+.dt-sub:disabled { opacity: 0.4; cursor: not-allowed; background: var(--surface-2); }
+.dt-sub.active { color: var(--live); border-color: var(--live); box-shadow: 0 0 10px rgba(63,211,155,0.25); }
+.dt-sub-space { font-family: var(--font-data); font-size: 10.5px; color: var(--st-stand); }

@@ -47,6 +47,8 @@
   let comboReady = { dance: false, climb: false };   // server-captured whole-body FSM ids
   let gestureBusyUntil = 0;                // optimistic double-fire lock (monotonic ms)
   let obstacleEnabled = false;
+  let fsmId = null;                        // robot's live FSM id (for the in-dance-mode gate)
+  let dances = [];                         // catalog [{name, fsm_id, is_hub, parent_fsm, ...}]
   let interactEnabled = false;             // interaction (auto wave-back / greeting) mode
   let connected = false, ws = null;
   const sticks = [];   // {reset} handles
@@ -68,6 +70,7 @@
     actions: $("phActions"), actionsX: $("phActionsX"),
     actionsHint: $("phActionsHint"), actionsStatus: $("phActionsStatus"),
     gestGrid: $("phGestGrid"), deck: $("phDeck"),
+    danceSub: $("phDanceSub"), danceSubLabel: $("phDanceSubLabel"), dancePills: $("phDancePills"),
   };
 
   // =====================================================================
@@ -85,6 +88,7 @@
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
       switch (msg.type) {
         case "config":    applyConfig(msg); break;
+        case "dances":    applyDances(msg); break;
         case "fsm_state": applyFsm(msg); break;
         case "telemetry": applyTelemetry(msg); break;
         case "obstacle":  applyObstacle(msg); break;
@@ -128,11 +132,19 @@
       comboReady.climb = !!msg.mode_combos.climb;
       renderActions();
     }
+    // Dance catalog: the child dances (parent_fsm set) selectable once in dance mode.
+    if (Array.isArray(msg.dances)) { dances = msg.dances; renderDanceSub(); }
+  }
+
+  // Also handle a live catalog update (Dance Lab save/delete broadcasts {type:"dances"}).
+  function applyDances(msg) {
+    if (msg && Array.isArray(msg.dances)) { dances = msg.dances; renderDanceSub(); }
   }
 
   function applyFsm(msg) {
     uiMode = msg.ui_mode || "";
     transitioning = !!msg.transitioning;
+    if (msg.fsm_id !== undefined) fsmId = msg.fsm_id;   // drives the in-dance-mode gate
     if (msg.moving !== undefined) { robotMoving = !!msg.moving; renderChip(); }
     document.body.dataset.mode = uiMode;
     document.body.dataset.transitioning = transitioning ? "1" : "";
@@ -144,8 +156,8 @@
     renderModes();
     renderDeckHint();
     renderActions();                  // arm-gating + whole-body status track the mode
-    if (msg.fsm_id === 503) setActionStatus("Dancing… (Stand→Walk to exit)");
-    else if (msg.fsm_id === 812) setActionStatus("Climbing… (Stand→Walk to exit)");
+    renderDanceSub();                 // child-dance pills unlock once we're in dance mode
+    if (msg.fsm_id === 812) setActionStatus("Climbing… (Stand→Walk to exit)");
     if (!drivable()) resetSticks();   // left walk (or transition began) -> drop velocity
   }
 
@@ -437,6 +449,55 @@
       b.classList.toggle("disabled", !ready);
       b.title = ready ? "" : b.dataset.combo + ": FSM id not captured yet";
     });
+  }
+
+  // Child dances (parent_fsm set) only fire from INSIDE their hub fsm (dance mode).
+  // The sub-row hides unless the catalog has children; each pill enables only while
+  // the robot is currently in the parent hub fsm (503) AND this phone holds control.
+  let _danceSubSig = null;
+  function phEsc(s) {
+    return String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+  function renderDanceSub() {
+    if (!el.danceSub) return;
+    const kids = dances.filter((d) => d.parent_fsm != null);
+    if (!kids.length) { el.danceSub.hidden = true; _danceSubSig = null; return; }
+    el.danceSub.hidden = false;
+
+    const hubSet = new Set(kids.map((d) => d.parent_fsm));
+    const inMode = fsmId != null && hubSet.has(fsmId);     // robot IS in a dance-mode hub
+    if (el.danceSubLabel)
+      el.danceSubLabel.textContent = inMode ? "Pick a dance:" : "Enter dance mode to pick a dance";
+
+    // Status echo (only for dance states, so a gesture status elsewhere isn't clobbered).
+    if (inMode) setActionStatus("In dance mode — pick a dance below");
+    else if (kids.some((d) => d.fsm_id === fsmId)) setActionStatus("Dancing… (Stand→Walk to exit)");
+
+    const sig = JSON.stringify(kids) + "|" + fsmId + "|" + inMode + "|" + hasControl;
+    if (sig === _danceSubSig) return;
+    _danceSubSig = sig;
+
+    el.dancePills.innerHTML = kids.map((d) => {
+      const active = fsmId === d.fsm_id;
+      const enabled = inMode && hasControl;
+      return `<button class="ph-dance-pill${active ? " active" : ""}" data-fsm="${d.fsm_id}" ${enabled ? "" : "disabled"}>
+          <span>${active ? "● " : ""}${phEsc(d.name)}</span><small>~${d.space_m} m</small>
+        </button>`;
+    }).join("");
+
+    el.dancePills.querySelectorAll(".ph-dance-pill").forEach((b) =>
+      b.addEventListener("click", () => {
+        const id = parseInt(b.dataset.fsm, 10);
+        const d = dances.find((x) => x.fsm_id === id);
+        if (!d) return;
+        if (fsmId !== d.parent_fsm) { setActionStatus("Enter dance mode first"); return; }
+        withControl(() => {
+          send({ type: "dance", fsm_id: d.fsm_id });
+          setActionStatus("→ " + d.name);
+          if (navigator.vibrate) navigator.vibrate(20);
+        });
+      }));
   }
 
   function openActions() {
