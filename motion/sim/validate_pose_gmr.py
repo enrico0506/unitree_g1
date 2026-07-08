@@ -63,9 +63,17 @@ def _preflight(smplx_dir: pathlib.Path, gmr_dir: pathlib.Path):
     gmr_script = gmr_dir / "scripts" / "smplx_to_robot.py"
     if not gmr_script.exists():
         missing.append(
-            f"GMR not installed at {gmr_dir} — clone + install:\n"
-            "    git clone https://github.com/YanjieZe/GMR third_party/GMR\n"
-            "    conda run -n g1 pip install -e third_party/GMR")
+            f"GMR not cloned at {gmr_dir}:\n"
+            "    git clone https://github.com/YanjieZe/GMR third_party/GMR")
+    else:
+        try:
+            import general_motion_retargeting  # noqa: F401  (GMR installed?)
+        except Exception:
+            missing.append(
+                "GMR cloned but not INSTALLED — finish the pip install (CPU torch avoids the\n"
+                "    multi-GB CUDA download):\n"
+                "    conda run -n g1 pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
+                "    conda run -n g1 pip install -e third_party/GMR")
     smplx_models = list(smplx_dir.glob("SMPLX_*.npz")) + list(smplx_dir.glob("SMPLX_*.pkl"))
     if not smplx_models:
         missing.append(
@@ -137,8 +145,11 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="/tmp/g1_pose_gmr")
     ap.add_argument("--smplx-dir", default=str(_REPO / "motion" / "models" / "smplx"))
     ap.add_argument("--gmr-dir", default=str(_REPO / "motion" / "third_party" / "GMR"))
-    ap.add_argument("--model", default="/home/enrico/Dokumente/g1_bot/unitree_mujoco/"
-                                       "unitree_robots/g1/g1_29dof.xml")
+    # Default to GMR's OWN g1_mocap_29dof.xml — the exact model it retargets to (dof order
+    # == joint_maps.G1_MJCF_ORDER), meshes shipped in the clone. Fall back to unitree_mujoco.
+    _gmr_model = _REPO / "motion" / "third_party" / "GMR" / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"
+    _fallback = "/home/enrico/Dokumente/g1_bot/unitree_mujoco/unitree_robots/g1/g1_29dof.xml"
+    ap.add_argument("--model", default=str(_gmr_model) if _gmr_model.exists() else _fallback)
     a = ap.parse_args(argv)
     return run(pathlib.Path(a.out), pathlib.Path(a.smplx_dir), pathlib.Path(a.gmr_dir), a.model)
 
