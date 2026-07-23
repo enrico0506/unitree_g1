@@ -41,6 +41,5 @@ state/
 sim/.venv/
 sim/models/g1/
 
-# --- Take-home export bundles (personal, regeneratable, not source) ---
-*.zip
+# --- Runtime debug cruft ---
 MUJOCO_LOG.TXT
