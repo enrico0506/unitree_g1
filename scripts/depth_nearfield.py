@@ -69,6 +69,19 @@ _DEFAULTS = {
     "map_max_range_m": 4.0,      # far enough to add real map context beyond the near-field band
     "map_ground_clearance_m": 0.03,  # drop the floor, keep low cables/objects
     "map_max_height_m": 2.0,     # drop overhead / ceiling
+    # --- "Full Depth" 3D-sphere toggle -- unlike map_cloud() (which strips the floor
+    #     and caps range/height for the SLAM map export), this keeps almost everything
+    #     the sensor returns, floor included, so the user can see literally what the
+    #     D435i sees and compare it against the narrow ground-only safety band above.
+    #     Still only ever the forward ~87 deg wedge the camera is physically mounted to
+    #     see -- that's the sensor's real FOV, not a software restriction. Demand-gated
+    #     by the client toggle (see robot_web_controller.py state.depth_full_view) so it
+    #     costs nothing while off. ---
+    "full_min_range_m": 0.30,    # D435i physical min range
+    "full_max_range_m": 6.0,     # generous -- depth gets noisy/sparse well before this
+    "full_min_height_m": -0.30,  # BELOW the floor plane on purpose: shows real floor + noise
+    "full_max_height_m": 2.5,    # generous ceiling; still bounded to reject wild outliers
+    "full_cap": 4000,            # point cap for the WS payload when the toggle is on
 }
 
 
@@ -118,6 +131,11 @@ class DepthNearField:
         self.map_max_range = float(cfg.get("map_max_range_m", 4.0))
         self.map_ground_clear = float(cfg.get("map_ground_clearance_m", 0.03))
         self.map_max_height = float(cfg.get("map_max_height_m", 2.0))
+        self.full_min_range = float(cfg.get("full_min_range_m", 0.30))
+        self.full_max_range = float(cfg.get("full_max_range_m", 6.0))
+        self.full_min_height = float(cfg.get("full_min_height_m", -0.30))
+        self.full_max_height = float(cfg.get("full_max_height_m", 2.5))
+        self.full_cap = max(1, int(cfg.get("full_cap", 4000)))
 
         self._lock = threading.Lock()
         self._front = None         # last computed nearest forward distance (m) or None
@@ -126,6 +144,8 @@ class DepthNearField:
         self._n_near = 0           # qualifying point count (for telemetry / validation)
         self._frame_ok = True      # last frame passed the floor-ramp sanity check
         self._floor_ramp = 0.0     # last measured floor-height ramp (m) across the forward band
+        self._floor_offset = 0.0   # last measured |median floor height| (m)
+        self._floor_nf = 0         # last measured candidate floor-point count
         self._warn_ct = 0          # throttle for the frame-rejected warning
         self._live = False
         self._stop = threading.Event()
@@ -295,6 +315,8 @@ class DepthNearField:
                         self._n_near = n
                         self._frame_ok = ok
                         self._floor_ramp = ramp
+                        self._floor_offset = offset
+                        self._floor_nf = nf
                         self._live = cloud is not None
                 except Exception as e:
                     with self._lock:
@@ -389,6 +411,48 @@ class DepthNearField:
             return None
         return np.column_stack((fwd[keep], left[keep], height[keep])).astype(np.float32)
 
+    def full_points(self):
+        """MINIMALLY-FILTERED DEPTH cloud (floor included, generous range/height) as a flat
+        [x0,y0,z0, ...] list -- same frame as front_points() (x-fwd, y-left, z = height
+        above floor). Backs the 3D sphere's "Full Depth" toggle, so the user can see
+        literally what the D435i returns and compare it against the narrow ground-only
+        safety band front_points() exposes. Unlike map_cloud() (which strips the floor and
+        caps range/height for the SLAM export), this keeps the floor plane -- reuses the
+        same validated derotation + frame-sanity gate, different mask. Still only ever the
+        camera's actual forward ~87 deg wedge, not a software-imposed limit. Demand-gated
+        by the caller (only invoke while the toggle is on). None when disabled / frame
+        rejected / no points."""
+        if not self.enabled or self.lidar is None:
+            return None
+        cloud = self.lidar.get_cloud()
+        if cloud is None or len(cloud) == 0:
+            return None
+        if self.frame_check:
+            ramp, offset, nf = self._frame_sanity(cloud)
+            if not (nf >= self.frame_min_floor_pts
+                    and ramp <= self.frame_ramp_tol
+                    and offset <= self.frame_offset_tol):
+                return None
+        X = cloud[:, 0]
+        Y = cloud[:, 1]
+        Zc = cloud[:, 2] - self.ls_mount_height
+        fwd = X * self._ct + Zc * self._st
+        up = -X * self._st + Zc * self._ct
+        left = Y
+        height = up + self.cam_h
+        rng = np.hypot(fwd, left)
+        keep = (
+            (height > self.full_min_height) & (height < self.full_max_height)
+            & (rng > self.full_min_range) & (rng < self.full_max_range)
+        )
+        if not np.any(keep):
+            return None
+        out = np.column_stack((fwd[keep], left[keep], height[keep])).astype(np.float32)
+        if out.shape[0] > self.full_cap:
+            idx = np.random.choice(out.shape[0], self.full_cap, replace=False)
+            out = out[idx]
+        return [round(float(v), 2) for v in out.ravel()]
+
     def telemetry(self):
         with self._lock:
             return {
@@ -398,4 +462,11 @@ class DepthNearField:
                 "live": bool(self._live),
                 "frame_ok": bool(self._frame_ok),        # watch this on-robot to validate the frame
                 "floor_ramp_m": round(float(self._floor_ramp), 3),
+                # Which frame_ok sub-check is failing, if any -- ramp>tol (bad pitch), or
+                # offset>tol (bad height), or n_floor<min (no clean floor patch in view).
+                "floor_offset_m": round(float(self._floor_offset), 3),
+                "n_floor": int(self._floor_nf),
+                "ramp_tol_m": self.frame_ramp_tol,
+                "offset_tol_m": self.frame_offset_tol,
+                "min_floor_pts": self.frame_min_floor_pts,
             }

@@ -55,7 +55,9 @@ const CLIENT_ID = (window.crypto && crypto.randomUUID)
   ? crypto.randomUUID()
   : "laptop-" + Math.random().toString(36).slice(2);
 const CLIENT_LABEL = "Laptop";
-const ALWAYS_ALLOWED_MSGS = new Set(["hello", "take_control"]);
+// depth_full: view-only 3D-sphere toggle (like Skeleton/Object Detection), doesn't
+// touch robot behaviour -- any viewer can flip it, not just the device holding control.
+const ALWAYS_ALLOWED_MSGS = new Set(["hello", "take_control", "depth_full", "ir_toggle"]);
 // Arm "greeting" gestures any connected client may fire WITHOUT the drive lock (must match
 // the server's OPEN_GESTURES). Driving, mode changes and Dance/Climb stay owner-exclusive.
 const OPEN_GESTURES = new Set(["high_wave", "high_five", "clap", "shake", "hug", "heart", "kiss"]);
@@ -104,6 +106,7 @@ function connect() {
       else if (msg.type === "takeover_denied")
         logEvent("can't take control while the robot is moving — wait until it stops", "warn");
       else if (msg.type === "gesture_event") handleGesture(msg);
+      else if (msg.type === "nav_state") window.Nav && window.Nav.update(msg);
     } catch (e) { /* ignore */ }
   };
 
@@ -302,8 +305,6 @@ function updateFsmState(msg) {
       gt.setAttribute("aria-pressed", greetingOn ? "true" : "false");
       gt.textContent = greetingOn ? "🤝 Interaction: ON" : "🤝 Interaction: off";
     }
-    const gs = document.getElementById("greetingStatus");
-    if (gs) gs.textContent = greetingOn ? (msg.greeting_status || "watching for gestures…") : "";
   }
 
   // Suppress auto-climb (flat-ground/presentation): reflect the server's truth on the
@@ -343,10 +344,6 @@ function updateControl(msg) {
   hasControl = (ownerId !== null && ownerId === CLIENT_ID);
   ownerLabel = msg.owner_label || null;
   renderControlChip();
-  // Seam for the Motion tab: expose our client id (for the X-Client-Id header the /motion
-  // routes gate on) + announce control changes so motion.js enables/disables in lock-step.
-  window.G1_CLIENT_ID = CLIENT_ID;
-  window.dispatchEvent(new CustomEvent("g1:control", { detail: { isOwner: hasControl } }));
   // The laptop is the DEFAULT driver: whenever the lock is FREE (nobody driving),
   // reclaim it automatically so a lone laptop -- or the laptop after a phone leaves
   // -- keeps working exactly as before. It never auto-steals from another device
@@ -810,6 +807,6 @@ document.querySelectorAll(".tab").forEach(tab => {
       p.classList.toggle("current", p.id === `tab-${name}`);
     });
     // The 3D canvas needs a resize when its tab becomes visible again.
-    if (name === "drive") window.dispatchEvent(new Event("resize"));
+    if (name === "drive" || name === "nav") window.dispatchEvent(new Event("resize"));
   });
 });

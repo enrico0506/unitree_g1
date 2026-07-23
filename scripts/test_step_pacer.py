@@ -255,5 +255,6 @@ check("no vel_fb -> still pulses on pure off_s timing (back-compat)",
       any(v[0] != 0.0 for v in seqc) and any(v == (0.0, 0.0, 0.0) for v in seqc))
 
 print("\n" + ("ALL PASS" if fails == 0 else f"{fails} FAILED"))
-import sys
-sys.exit(1 if fails else 0)
+if __name__ == "__main__":
+    import sys
+    sys.exit(1 if fails else 0)

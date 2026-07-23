@@ -39,6 +39,7 @@ process. Confirm on the robot. -- <ASK ENRICO: verify single-process dual-domain
 """
 
 import json
+import sys
 
 import rclpy
 from rclpy.node import Node
@@ -50,6 +51,20 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.g1.loco.g1_loco_api import ROBOT_API_ID_LOCO_SET_VELOCITY
 
+# Track A4 (reactive safety floor under Nav2): the SAME ObstacleGuard class the
+# teleop path (scripts/robot_web_controller.py) governs velocity with, pointed at
+# costmap_to_obstacle.py's republished /dev/shm/g1_obstacle.json. This gives the
+# bridge its own independent hard-stop/scale-down floor that can't be defeated by
+# a DWB/costmap misbehavior (stuck costmap, planner bug, stale goal) -- exactly
+# the role it plays under teleop. Not fully sensor-independent redundancy (both
+# derive from the same Mid-360 pipeline DWB itself scores against) -- the D435i
+# near-field ring is the genuinely independent channel and is fused in the SAME
+# way the teleop guard already does (see obstacle.yaml's depth-fusion config;
+# this bridge doesn't add a second D435i reader -- see costmap_to_obstacle.py).
+sys.path.insert(0, "/home/unitree/projects/g1")
+from obstacle.guard import ObstacleGuard   # noqa: E402  (path insert must precede this import)
+
+OBSTACLE_CFG_PATH = "/home/unitree/projects/g1/obstacle/obstacle.yaml"
 
 # Safety caps (config/robot.yaml). The bridge is the last clamp before the robot.
 MAX_VX = 1.5      # m/s
@@ -77,6 +92,19 @@ class G1CmdVelBridge(Node):
             "This node DRIVES THE ROBOT from Nav2 /cmd_vel."
         )
 
+        # --- Reactive safety floor (Track A4) -- see the module-level comment
+        # above the import. Force-enabled regardless of obstacle.yaml's
+        # `enabled_default` (that default governs the teleop dashboard's opt-in
+        # toggle; this autonomous path has no equivalent human-in-the-loop toggle,
+        # so the floor must always be on here).
+        self.guard = ObstacleGuard(cfg_path=OBSTACLE_CFG_PATH,
+                                    limits=(MAX_VX, MAX_VY, MAX_VYAW))
+        self.guard.enabled = True
+        self.guard.start()
+        self.get_logger().info(
+            f"obstacle guard ready (safety floor, always-on, cfg={OBSTACLE_CFG_PATH})."
+        )
+
         # --- Nav2 /cmd_vel on domain 99 (rclpy uses ROS_DOMAIN_ID=99) ---------
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -99,6 +127,11 @@ class G1CmdVelBridge(Node):
         vx = _clamp(float(msg.linear.x), -MAX_VX, MAX_VX)
         vy = _clamp(float(msg.linear.y), -MAX_VY, MAX_VY)
         vyaw = _clamp(float(msg.angular.z), -MAX_VYAW, MAX_VYAW)
+        # Reactive safety floor: govern DWB's own output through the same
+        # ObstacleGuard the teleop path uses, so a stuck costmap / planner bug /
+        # stale goal can't push the robot into something DWB itself failed to see
+        # coming (Track A4). apply() re-clamps to the __init__ limits itself.
+        vx, vy, vyaw = self.guard.apply((vx, vy, vyaw))
         self._send_velocity(vx, vy, vyaw, MOVE_DURATION_S)
         self._last_cmd_t = self.get_clock().now()
         self._moving = not (vx == 0.0 and vy == 0.0 and vyaw == 0.0)
@@ -128,6 +161,10 @@ def main(args=None):
     finally:
         try:
             node._send_velocity(0.0, 0.0, 0.0, MOVE_DURATION_S)  # stop on exit
+        except Exception:
+            pass
+        try:
+            node.guard.stop()
         except Exception:
             pass
         node.destroy_node()

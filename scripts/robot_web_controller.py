@@ -64,6 +64,7 @@ from step_pacer import StepPacer
 # Interactive "wave back" demo: the pose->gesture reactor + its safety-gated robot bridge.
 # All robot coupling in GreetingService is via callbacks, so it imports nothing back here.
 from gesture_reactor import GreetingService, describe as greeting_describe
+from voice_command_bridge import VoiceCommandBridge
 
 
 # --- Paths ---
@@ -97,6 +98,10 @@ else:
     OBSTACLE_RUN_CMD = BASE_DIR / "obstacle" / "run_obstacle.sh"
 print(f"Obstacle source: {OBSTACLE_SOURCE} -> {OBSTACLE_RUN_CMD}", flush=True)
 CAMERA_SHM = "/dev/shm/g1_camera.jpg"   # frames written here by camera_service.py
+CAMERA_IR_SHM = "/dev/shm/g1_camera_ir.jpg"   # frames written here by ir_service.py
+CAMERA_IR_DEVICE = "/dev/video2"   # D435i infrared/stereo-module node (GREY)
+IR_DEMAND = "/dev/shm/g1_ir_demand"   # heartbeat: pose_service.py wants ir_service.py alive
+IR_DEMAND_TTL = 3.0   # matches pose_service.py's own DEMAND_TTL pattern
 
 # Depth-for-map handoff: the web process (this file) owns the D435i cloud and, while
 # mapping is active, dumps DepthNearField's full leveled cloud here for map_bridge
@@ -219,8 +224,6 @@ LIDAR_CAMERA_HEIGHT = CFG["lidar"]["camera_height_m"]
 MAP_DIR = str((BASE_DIR / CFG["map"]["dir"]).resolve())
 MAP_VOXEL = CFG["map"]["voxel_size_m"]
 MAP_MAX_POINTS = CFG["map"]["max_points"]
-MAP_MAX_RANGE = CFG["map"]["max_range_m"]
-MAP_YAW_SIGN = CFG["map"]["yaw_sign"]
 MAPPING_RUN_CMD = CFG["mapping"]["run_cmd"]   # on-demand FAST-LIO launch wrapper
 
 # --- Whole-body mode combos (climb/dance), sourced from config/mapping.yaml ---
@@ -529,8 +532,34 @@ class ControlState:
         # from persisted UI settings just after construction. A real climb/stairs
         # will NOT happen while this is on -- see _suppress_autoclimb.
         self.suppress_autoclimb = False
+        # 3D-sphere "Full Depth" toggle: when True, broadcast_loop computes and sends
+        # depth_nf.full_points() (the D435i's dense all-height cloud) instead of leaving
+        # it out. Off by default -- demand-gated so the extra derotation pass only runs
+        # while someone is actually looking at it. Not persisted (viz-only, not a setting).
+        self.depth_full_view = False
+        # True while a client's Infrared toggle is on -- ir_demand_watch_loop must not
+        # stop ir_service.py out from under a manual viewer just because pose_service.py
+        # isn't currently in its own IR fallback (see IR_DEMAND below).
+        self.ir_manual_on = False
         self.greeting_status = ""    # e.g. "saw wave -> waving back"
         self.greeting_busy_until = 0.0   # wall-clock until which a greeting gesture is mid-motion
+        # --- Voice command mode (fixed-vocabulary wake-word bridge; see
+        # scripts/voice_command_bridge.py). Master opt-in toggle, OFF by default,
+        # mirrors greeting_mode exactly (including the "dashboard button lights up,
+        # voice_status shows the last recognized phrase" pattern).
+        self.voice_mode = False
+        self.voice_status = ""
+        # --- Nav dashboard tab (Track B): which position source the "Nav" tab
+        # renders, "real" (this robot's own odom) or "sim" (scripts/sim_runner.py's
+        # mujoco dry-run via /dev/shm/g1_sim_state.json). Purely a VIEW toggle --
+        # does NOT affect who owns velocity (that's g1_patrol_state.json's
+        # active/phase fields; see _locomoting()/command_loop()).
+        self.nav_mode = "real"
+        # Exhibition mode: wall-clock until which a just-fired autonomous dance
+        # (mtype=="exhibition_dance_fire") stays on cooldown -- see
+        # EXHIBITION_DANCE_COOLDOWN_S. Separate from greeting_busy_until/
+        # _arm_busy() (those are sized for ~3-5s arm gestures, not an 8+s dance).
+        self.exhibition_dance_busy_until = 0.0
         # Discrete gesture events handed from the greeting daemon thread to broadcast_loop
         # (append/popleft are atomic under the GIL; single-producer/single-consumer, no lock).
         # Each is a ready-to-send {type:"gesture_event", ...} for the feed label + log line.
@@ -576,12 +605,27 @@ MOVE_HOLD_S = 0.7
 _ARM_BUSY_S = {"wave": 3.5, "high_five": 5.0, "hug": 5.0, "heart": 5.0,
                "shake": 4.0, "clap": 2.5, "kiss": 2.5, "high_wave": 3.5}
 
+# Cooldown after an autonomous exhibition dance fire (see mtype=="exhibition_dance_fire"
+# below) -- much longer than any _ARM_BUSY_S window since a whole-body dance routine
+# runs far longer than an arm gesture; prevents back-to-back re-fires if the conductor
+# somehow requests twice in quick succession.
+EXHIBITION_DANCE_COOLDOWN_S = 30.0
+
 
 def _locomoting():
     """True iff the robot is actively translating in walk. Mode-guarded (a non-walk robot is
     NEVER locomoting, so it is always take-able -- fixes the is_moving latch after an
     uncommanded FSM drop, review #2) + a short hold window (review #3) so the step-mode settle
-    gaps don't momentarily read as 'stopped' and open the take-over gate mid-drive."""
+    gaps don't momentarily read as 'stopped' and open the take-over gate mid-drive.
+
+    Also true while g1_nav's autonomous patrol reports itself as moving (Track A
+    velocity-ownership handoff, cross-workstream decision #4): this process's own
+    state.mode/moving_hold_until say nothing about motion driven by a SEPARATE
+    process (g1_cmd_vel_bridge.py), so without this a shared arm gesture could pass
+    the "not locomoting" gate and fire mid-stride during an autonomous walk."""
+    patrol = _patrol_state()
+    if patrol and patrol.get("moving"):
+        return True
     return (state.mode == "walk" and not state.transitioning
             and time.time() < state.moving_hold_until)
 
@@ -599,7 +643,96 @@ def _gesture_exec_ok():
     return (state.mode in ("stand", "walk") and not state.transitioning
             and not _locomoting() and not state.arm_raised)
 
+
+# --- Cross-process autonomous-patrol state (g1_nav's circle_patrol.py /
+# patrol_supervisor.py, Track A) + the Nav dashboard tab (Track B: real vs mujoco
+# sim). All read-only from here except PATROL_STATE_PATH, which this process ALSO
+# writes to (see _write_patrol_override) as the other half of the velocity-
+# ownership handoff -- see _locomoting()/command_loop() below.
+PATROL_STATE_PATH = "/dev/shm/g1_patrol_state.json"
+PERSON_TRACK_PATH = "/dev/shm/g1_person_track.json"
+SIM_STATE_PATH = "/dev/shm/g1_sim_state.json"
+NAV_DEFAULT_RADIUS_M = 3.0   # matches g1_nav/config/patrol.yaml's circle_patrol.radius_m default
+# Exhibition mode's dashboard-requested dance queue: this process only ever WRITES
+# this file (on the "exhibition_dance_request" WS message, owner-gated); it never
+# reads it back. g1_nav's exhibition_conductor.py is the sole reader -- it decides
+# WHEN it's safe to actually perform the requested dance and fires it back via the
+# separate "exhibition_dance_fire" WS message (see the new safety-gated exemption
+# in ws_endpoint below), which is why this is a queue/request rather than a direct
+# fire from here.
+EXHIBITION_DANCE_REQUEST_PATH = "/dev/shm/g1_exhibition_dance_request.json"
+
+
+def _read_json_if_fresh(path, ttl=2.0):
+    """Read+parse a shm JSON file, but only if it was written within `ttl` seconds --
+    a stale file (writer never started, or died) must read as "nothing," not as
+    frozen last-known state. Used for every cross-process (g1_nav / sim_runner)
+    signal this file reads."""
+    try:
+        if (time.time() - os.path.getmtime(path)) >= ttl:
+            return None
+    except OSError:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _patrol_state():
+    """g1_nav's autonomous-patrol status, or None if it isn't running / its file is
+    stale (fail-safe: an unknown patrol state reads as "not patrolling", never as
+    "definitely patrolling")."""
+    return _read_json_if_fresh(PATROL_STATE_PATH, ttl=2.0)
+
+
+def _write_patrol_override(active):
+    """Assert/clear manual_override on g1_nav's circle_patrol.py (Track A
+    cross-workstream decision #4: real teleop input always wins over the
+    autonomous patrol). circle_patrol.py re-reads this file's `phase` field fresh
+    every tick and backs off THE INSTANT it reads "manual_override" -- but that
+    module does not independently time out a stale "manual_override" (only its OWN
+    handoff/odom-health files are mtime-gated), so this must be REASSERTED every
+    tick teleop is actively driving, and explicitly cleared with one more write the
+    moment the operator releases the stick -- never just left to go stale, or the
+    patrol would stay frozen forever. Harmless no-op if g1_nav isn't running (no
+    reader for this file in that case)."""
+    obj = {"active": False, "phase": ("manual_override" if active else "circling"),
+           "moving": False, "updated_t": round(time.time(), 3)}
+    try:
+        tmp = PATROL_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f, separators=(",", ":"))
+        os.replace(tmp, PATROL_STATE_PATH)
+    except OSError:
+        pass
+
+
+def _nav_persons_from_bearing(persons, robot_x, robot_y, robot_yaw):
+    """Project person_fusion.py's robot-relative {bearing_rad, distance_m} into the
+    world-frame {x,y} the Nav tab renders -- person_fusion has no world pose of its
+    own; only this process (which owns odom) can do that projection. Bearing
+    convention (0=ahead, +=left) matches g1_nav.patrol_logic.pixel_x_to_bearing_rad;
+    (fwd, left) is the robot-frame vector, rotated into the world frame by yaw."""
+    out = []
+    for i, p in enumerate(persons or []):
+        dist = p.get("distance_m")
+        bearing = p.get("bearing_rad")
+        if dist is None or bearing is None:
+            continue   # no depth recovered this frame (occlusion/NaN/no cloud) -- skip
+        fwd = dist * math.cos(bearing)
+        left = dist * math.sin(bearing)
+        wx = robot_x + fwd * math.cos(robot_yaw) - left * math.sin(robot_yaw)
+        wy = robot_y + fwd * math.sin(robot_yaw) + left * math.cos(robot_yaw)
+        out.append({"x": round(wx, 3), "y": round(wy, 3), "dist": round(dist, 3),
+                     "id": (p.get("track_id") if p.get("track_id") is not None else i)})
+    return out
+
+
 camera: CameraSource = None
+camera_ir: CameraSource = None
+ir_proc = None   # subprocess.Popen | None -- lazily started/stopped, see _ir_start/_ir_stop
 pose: CameraSource = None
 detect: CameraSource = None
 lidar: LidarSource = None
@@ -614,6 +747,8 @@ shaper: CommandShaper = None
 pacer: StepPacer = None
 audio = None
 greeting: GreetingService = None   # safety-gated wave-back bridge (created in lifespan)
+voice: VoiceCommandBridge = None   # safety-gated fixed-vocabulary voice bridge (created in lifespan)
+sim_proc = None   # subprocess.Popen for scripts/sim_runner.py, started on demand (nav_mode=="sim")
 
 _mode_lock = threading.Lock()
 _arm_lock = threading.Lock()   # serialize arm-action RPCs (and the hands_up toggle)
@@ -748,6 +883,59 @@ def fsm_change_is_ours(fsm_id):
 # Monotonic times of recent forced climb->802 reversals, for the oscillation cap.
 _suppress_hist = deque(maxlen=16)
 
+# Speaker ducking around a suppress-autoclimb correction (see _suppress_mute_for_
+# announcement): the robot's own onboard firmware speaks an "entering main control"
+# announcement on ANY transition into 802, commanded or not, so a silent correction
+# needs a volume-0 window around the SetFsmId call, not a different SDK call.
+SUPPRESS_MUTE_S = 2.5             # covers the firmware's announcement duration
+_suppress_mute_lock = threading.Lock()
+_suppress_saved_volume = None     # volume to restore to; None = not currently ducked
+_suppress_unmute_timer = None
+
+
+def _suppress_mute_for_announcement(delay_s=SUPPRESS_MUTE_S):
+    """Duck AudioClient volume to 0 so the robot's onboard firmware doesn't audibly
+    announce the forced 802 correction, then restore it after `delay_s`.
+
+    Debounced with a resettable Timer: a burst of rapid reversals (the anti-
+    oscillation case) shares ONE saved volume and one restore, so a second mute
+    inside the same window never caches an already-ducked 0 as "the" volume to
+    restore to. No-ops if AudioClient failed to init (audio is None).
+    """
+    global _suppress_saved_volume, _suppress_unmute_timer
+    if audio is None:
+        return
+    with _suppress_mute_lock:
+        if _suppress_unmute_timer is not None:
+            _suppress_unmute_timer.cancel()
+        else:
+            try:
+                code, data = audio.GetVolume()
+                _suppress_saved_volume = data.get("volume", 100) if code == 0 and data else 100
+            except Exception as e:
+                _suppress_saved_volume = 100
+                print(f"[SUPPRESS] GetVolume failed ({e}); will restore to 100", flush=True)
+            try:
+                audio.SetVolume(0)
+            except Exception as e:
+                print(f"[SUPPRESS] mute SetVolume(0) failed: {e}", flush=True)
+        _suppress_unmute_timer = threading.Timer(delay_s, _suppress_unmute_after_announcement)
+        _suppress_unmute_timer.daemon = True
+        _suppress_unmute_timer.start()
+
+
+def _suppress_unmute_after_announcement():
+    global _suppress_saved_volume, _suppress_unmute_timer
+    with _suppress_mute_lock:
+        vol = _suppress_saved_volume
+        _suppress_saved_volume = None
+        _suppress_unmute_timer = None
+    if audio is not None and vol is not None:
+        try:
+            audio.SetVolume(vol)
+        except Exception as e:
+            print(f"[SUPPRESS] restore SetVolume({vol}) failed: {e}", flush=True)
+
 
 def _suppress_autoclimb(old, fsm):
     """Reverse an un-commanded firmware climb (802->812) back to main_control (802).
@@ -759,11 +947,16 @@ def _suppress_autoclimb(old, fsm):
     suppressed. SetFsmId(802) is the identical base FSM Walk mode commands -- no
     novel motion, just pinning the normal upright locomotion base.
 
+    The speaker is ducked around the SetFsmId call (_suppress_mute_for_announcement)
+    so this correction stays silent -- only here, never on a user-commanded mode
+    change, which should still announce normally.
+
     Anti-oscillation: if the firmware re-triggers SUPPRESS_MAX_IN_WINDOW times
     within SUPPRESS_WINDOW_S, suppression auto-disables (persisted + broadcast by
     the caller path) on the assumption this may be a REAL climb/stairs.
     """
     note_fsm_intent(FSM_MAIN_CONTROL)     # our forced return is OURS, not external
+    _suppress_mute_for_announcement()
     try:
         client.SetFsmId(FSM_MAIN_CONTROL)
     except Exception as e:
@@ -1182,9 +1375,6 @@ def apply_cmd(name):
     elif name == "high_stand":
         client.HighStand()
         print("[CMD] high_stand", flush=True)
-    elif name == "wave":
-        client.WaveHand()
-        print("[CMD] wave", flush=True)
     elif name == "shake":
         client.ShakeHand()
         print("[CMD] shake", flush=True)
@@ -1405,10 +1595,72 @@ def make_state_msg():
         # dashboard button reflects reality and shows what the robot just reacted to.
         "greeting_mode": state.greeting_mode,
         "greeting_status": state.greeting_status,
+        # Fixed-vocabulary voice-command toggle + last feedback line, mirrors
+        # greeting_mode/greeting_status exactly (see VoiceCommandBridge wiring below).
+        "voice_mode": state.voice_mode,
+        "voice_status": state.voice_status,
+        # Nav tab's Real/Simulation view toggle, so a late-joining client's Nav tab
+        # renders in the mode the operator last selected.
+        "nav_mode": state.nav_mode,
         # Flat-ground auto-climb-suppression toggle. Carried on every broadcast +
         # the on-connect send, so the UI reflects the current (possibly auto-
         # disabled) value on all clients.
         "suppress_autoclimb": state.suppress_autoclimb,
+    }
+
+
+def make_nav_state_msg():
+    """Nav tab telemetry ({type:"nav_state"}): the robot's position relative to the
+    patrol circle, tagged real/sim so one dashboard renderer (web/nav.js) handles
+    both. Real: this process's own odom + g1_nav's cross-process patrol/person shm
+    files. Sim: scripts/sim_runner.py's mujoco dry-run -- an entirely separate
+    process that never touches DDS/LocoClient (see that script's own docstring)."""
+    path = {"kind": "circle", "cx": 0.0, "cy": 0.0, "r": NAV_DEFAULT_RADIUS_M}
+    # NOTE: cx/cy are a placeholder origin, not the real anchor circle_patrol.py
+    # fixes at patrol start (that anchor isn't published anywhere yet) -- the
+    # radius is accurate (shared default with g1_nav/config/patrol.yaml), the
+    # center is not, until circle_patrol.py grows a `cx`/`cy` field of its own.
+    if state.nav_mode == "sim":
+        sim = _read_json_if_fresh(SIM_STATE_PATH, ttl=3.0)
+        if sim is None:
+            return {"type": "nav_state", "source": "sim", "x": 0.0, "y": 0.0,
+                    "yaw_deg": 0.0, "path": path, "phase": "fault",
+                    "persons": [], "ts": time.time()}
+        # sim_runner.py's persons carry {track_id, x, y, bearing_rad, distance_m} --
+        # x/y are already world-frame (no bearing projection needed, unlike the real
+        # branch below), just relabel to the nav_state contract's {id, dist} names.
+        sim_persons = [
+            {"x": p.get("x", 0.0), "y": p.get("y", 0.0),
+             "dist": p.get("distance_m", 0.0), "id": p.get("track_id", i)}
+            for i, p in enumerate(sim.get("persons") or [])
+        ]
+        return {
+            "type": "nav_state", "source": "sim",
+            "x": round(sim.get("x", 0.0), 3), "y": round(sim.get("y", 0.0), 3),
+            "yaw_deg": round(math.degrees(sim.get("yaw", 0.0)), 1),
+            "path": path, "phase": sim.get("phase", "circling"),
+            "activity": sim.get("activity"),   # exhibition mode: "roam"/"gesture:x"/"dance:n"/"idle"/null
+            "persons": sim_persons,
+            "ts": sim.get("ts", time.time()),
+        }
+    # Real: reuse the same pose source telemetry already uses (odom.get_pose()).
+    # Track A's fused_odometry is wired in as a health side-car in v1, not yet the
+    # TF/pose source here -- see the plan's cross-workstream decision #1.
+    x, y, yaw = odom.get_pose() if odom else (0.0, 0.0, 0.0)
+    patrol = _patrol_state()
+    tracks = _read_json_if_fresh(PERSON_TRACK_PATH, ttl=2.0)
+    persons = (_nav_persons_from_bearing(tracks.get("persons"), x, y, yaw)
+               if tracks else [])
+    return {
+        "type": "nav_state", "source": "real",
+        "x": round(x, 3), "y": round(y, 3), "yaw_deg": round(math.degrees(yaw), 1),
+        "path": path, "phase": (patrol or {}).get("phase", "circling"),
+        # exhibition_conductor.py writes this additive field into g1_patrol_state.json
+        # alongside `phase` (never renamed/replaced -- see the plan's decision #5);
+        # None whenever the exhibition conductor isn't the one currently driving
+        # (e.g. plain circle_patrol.py mode, or the field predates that node existing).
+        "activity": (patrol or {}).get("activity"),
+        "persons": persons, "ts": time.time(),
     }
 
 
@@ -1462,9 +1714,23 @@ def command_loop():
     last_rearm_time = 0.0
     last_gait_time = 0.0
     last_desired = (0.0, 0.0, 0.0)   # previous tick's shaped velocity -> pacer settle gate
+    patrol_override_active = False   # did WE last assert manual_override (see below)?
 
     while True:
         now = time.time()
+
+        # Velocity-ownership handoff (Track A cross-workstream decision #4): any real
+        # teleop joystick input immediately wins over g1_nav's autonomous patrol.
+        # Reasserted every tick while driving, cleared with exactly one write on
+        # release -- see _write_patrol_override()'s docstring for why a one-shot
+        # write here would leave the patrol frozen forever.
+        operator_driving = (state.vx, state.vy, state.vyaw) != (0.0, 0.0, 0.0)
+        if operator_driving:
+            _write_patrol_override(True)
+            patrol_override_active = True
+        elif patrol_override_active:
+            _write_patrol_override(False)
+            patrol_override_active = False
 
         # One-shot gesture command -- run in a thread so a blocking gesture RPC
         # (wave/shake) can't stall the velocity loop.
@@ -1562,7 +1828,14 @@ def command_loop():
 
         # Send only on CHANGE or as a low-rate refresh -- these are blocking RPCs;
         # flooding them at loop rate saturates the DDS layer (kills movement+camera).
-        if in_walk and (changed or (now - last_send_time) >= RESEND_PERIOD):
+        # Suppressed entirely while g1_nav's autonomous patrol owns velocity (Track A
+        # decision #4): its own g1_cmd_vel_bridge.py sends real Move RPCs over a
+        # SEPARATE DDS path, so this process must not also call send_velocity() --
+        # two independent LocoClient callers must never race. desired/cmd_vx etc.
+        # above still update (harmless UI readout of what teleop WOULD send).
+        patrol_owns_velocity = bool((p := _patrol_state()) and p.get("active")
+                                     and p.get("phase") != "manual_override")
+        if in_walk and not patrol_owns_velocity and (changed or (now - last_send_time) >= RESEND_PERIOD):
             try:
                 if (moving and state.fsm_id == FSM_READY_STAND
                         and (now - last_rearm_time) > 5.0):
@@ -1608,6 +1881,7 @@ async def broadcast_loop():
         if should_broadcast:
             await broadcast(make_state_msg())
             await broadcast(make_telemetry_msg())
+            await broadcast(make_nav_state_msg())
             last_broadcast = now
             last_broadcast_fsm = state.fsm_id
             last_transitioning = state.transitioning
@@ -1625,6 +1899,9 @@ async def broadcast_loop():
                 # the 2D ring + 3D sphere show EXACTLY what the fused guard reacts to.
                 tm["depth_points"] = depth_nf.front_points()   # flat [x,y,z] (viz frame) or None
                 tm["depth_ring"] = depth_nf.front_ring()       # per-sector depth ring or None
+                # "Full Depth" 3D-sphere toggle -- only compute the dense all-height cloud
+                # while a client has actually asked for it (see mtype == "depth_full" below).
+                tm["depth_points_full"] = depth_nf.full_points() if state.depth_full_view else None
             await broadcast(tm)
 
         # Flush any discrete gesture events (feed label + log line) the greeting thread
@@ -1636,13 +1913,100 @@ async def broadcast_loop():
 
 
 # ---------------------------------------------------------------------------
+# Nav tab's Simulation mode: scripts/sim_runner.py, started on demand (only while
+# nav_mode=="sim") in its own isolated venv -- same demand-gated-subprocess idiom
+# as camera_service.py/ir_service.py below, just triggered by a WS toggle instead
+# of always running from boot.
+# ---------------------------------------------------------------------------
+SIM_RUNNER_PY = str(BASE_DIR / "sim" / ".venv" / "bin" / "python3")
+SIM_RUNNER_SCRIPT = str(BASE_DIR / "scripts" / "sim_runner.py")
+
+
+def _ensure_sim_proc_running():
+    global sim_proc
+    if sim_proc is not None and sim_proc.poll() is None:
+        return   # already running
+    try:
+        # --demo-person: without it, the dashboard's Simulation view would only
+        # ever show the robot circling -- nothing would exercise the pause/face/
+        # wave/resume interaction cycle, which is the more interesting half of
+        # what this Nav tab is meant to demonstrate.
+        sim_proc = subprocess.Popen([SIM_RUNNER_PY, SIM_RUNNER_SCRIPT, "--demo-person"])
+        print("[NAV] sim_runner.py started (Nav tab Simulation mode, --demo-person).",
+              flush=True)
+    except OSError as e:
+        sim_proc = None
+        # e.g. sim/.venv doesn't exist yet (setup_venv.sh never run) -- the Nav tab
+        # just shows phase:"fault" via make_nav_state_msg()'s stale-file fallback.
+        print(f"[NAV] sim_runner.py failed to start ({e}); run sim/setup_venv.sh first.",
+              flush=True)
+
+
+def _stop_sim_proc():
+    global sim_proc
+    if sim_proc is not None:
+        try:
+            sim_proc.terminate()
+        except Exception:
+            pass
+        sim_proc = None
+
+
+# Infrared lane (ir_service.py): a THIRD simultaneous V4L2 stream off the same
+# physical D435i whose depth feed backs the obstacle safety band + both 2D/3D
+# spheres -- so, like Full Depth, it only actually runs while a client has the
+# Infrared button on (mtype "ir_toggle" below), instead of always running from boot.
+def _ensure_ir_proc_running():
+    global ir_proc
+    if ir_proc is not None and ir_proc.poll() is None:
+        return   # already running
+    try:
+        ir_proc = subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "scripts" / "ir_service.py"),
+             CAMERA_IR_DEVICE, str(CAMERA_STREAM_HZ), CAMERA_IR_SHM])
+        print(f"[IR] ir_service.py started (pid {ir_proc.pid}).", flush=True)
+    except OSError as e:
+        ir_proc = None
+        print(f"[IR] ir_service.py failed to start ({e}).", flush=True)
+
+
+def _stop_ir_proc():
+    global ir_proc
+    if ir_proc is not None:
+        try:
+            ir_proc.terminate()
+        except Exception:
+            pass
+        ir_proc = None
+        print("[IR] ir_service.py stopped.", flush=True)
+
+
+async def ir_demand_watch_loop():
+    """Auto-starts/stops ir_service.py for pose_service.py's close-range IR fallback
+    (see perception/pose/pose_service.py), the same demand-gated-subprocess idiom as
+    the manual Infrared toggle above -- just triggered by a heartbeat file touched from
+    a different process/container instead of a WS message.
+    """
+    while True:
+        try:
+            demanded = (time.time() - os.path.getmtime(IR_DEMAND)) < IR_DEMAND_TTL
+        except OSError:
+            demanded = False
+        if demanded and not state.ir_manual_on:
+            _ensure_ir_proc_running()
+        elif not demanded and not state.ir_manual_on:
+            _stop_ir_proc()
+        await asyncio.sleep(1.0)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI lifecycle
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, reader, arm_client, camera, pose, detect, lidar, odom, mapper, depth_nf, depth_dumper
-    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting, wireless_pub
+    global client, reader, arm_client, camera, camera_ir, pose, detect, lidar, odom, mapper, depth_nf, depth_dumper
+    global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting, voice, wireless_pub
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -1710,6 +2074,16 @@ async def lifespan(app: FastAPI):
          INTERFACE, str(CAMERA_STREAM_HZ), CAMERA_SHM])
     camera = CameraSource(path=CAMERA_SHM)
     print("Camera service (separate process) started.", flush=True)
+
+    # Infrared lane: same D435i, but its wider-vertical-FOV stereo/IR node
+    # (/dev/video2) read directly via V4L2 -- separate device node from the
+    # depth node LidarSource holds (/dev/video0). NOT started here: it's a third
+    # simultaneous stream off the same physical sensor the obstacle depth-band
+    # reads, so it's demand-gated like Full Depth -- see _ir_start/_ir_stop and
+    # the "ir_toggle" WS handler -- and only actually runs while a client has the
+    # Infrared button on.
+    camera_ir = CameraSource(path=CAMERA_IR_SHM)
+    camera_ir.backend = "infrared"
 
     # Pose lane reader. The pose container (g1-pose.service) is OPTIONAL and runs
     # independently; if it's down, pose.is_live() is False and the skeleton view
@@ -1875,14 +2249,81 @@ async def lifespan(app: FastAPI):
     # every make_state_msg carries {greeting_mode, greeting_status} back so the button lights
     # and shows the last feedback line (e.g. "saw wave -> waving back").
 
+    # =========================================================================
+    # Fixed-vocabulary voice commands (Track C: scripts/voice_command_bridge.py).
+    # OPTIONAL and OFF by default, wired exactly like the greeting service above --
+    # same safety gate (_greeting_safe, reused unchanged), same "reads shm in a
+    # daemon thread, fires through the existing serialized command path" shape.
+    # `resume`/`come_here` are NOT wired to real patrol_supervisor.py hooks yet
+    # (that's a further-out integration step); they fall back to VoiceCommandBridge's
+    # own harmless log-only stubs until then.
+    def _voice_enabled():
+        return state.voice_mode
+
+    def _voice_dispatch(action):
+        kind = action.get("kind")
+        if kind == "stop":
+            # Exactly the WS mtype=="stop" fast path (see below) -- bypass the
+            # command queue entirely, never queued behind anything else.
+            state.vx = state.vy = state.vyaw = 0.0
+            state.is_moving = False
+        elif kind == "cmd":
+            # Exactly the WS mtype=="cmd" handler -- reuses apply_cmd()/ARM_GESTURES
+            # unchanged via the existing pending_cmd drain in command_loop.
+            state.pending_cmd = action.get("name", "")
+        elif kind == "dance":
+            # Exactly the WS mtype=="dance" handler's lookup+fire, reusing
+            # fire_whole_body/DANCES unchanged.
+            fsm = action.get("fsm_id")
+            entry = next((d for d in DANCES if d["fsm_id"] == fsm), None)
+            if entry is not None:
+                threading.Thread(target=fire_whole_body,
+                                  args=(entry["name"], entry["fsm_id"]),
+                                  kwargs={"require_upright": True}, daemon=True).start()
+
+    def _voice_on_event(decision):
+        # Mirrors _greeting_on_event: every classified voice command updates the
+        # dashboard feedback line, fired or not.
+        cmd = decision.get("cmd")
+        if decision.get("fire"):
+            state.voice_status = f"heard '{cmd}' -> acting"
+        else:
+            state.voice_status = f"heard '{cmd}' -- {decision.get('reason', 'skipped')}"
+        print(f"[VOICE] {state.voice_status}", flush=True)
+
+    def _voice_on_skip(decision):
+        # Gated out by safe_fn specifically (decide() already said "fire"), mirrors
+        # _greeting_on_skip's "saw it but not safe right now" feedback.
+        if decision.get("reason") == "unsafe":
+            state.voice_status = f"heard '{decision.get('cmd')}' -- holding (not safe)"
+            print(f"[VOICE] {decision.get('cmd')}: not safe right now", flush=True)
+
+    voice = VoiceCommandBridge(
+        shm_path="/dev/shm/g1_voice_cmd.json",
+        config_path=str(BASE_DIR / "config" / "voice_commands.yaml"),
+        pose_tracks_path=POSE_TRACKS,
+        enabled_fn=_voice_enabled, safe_fn=_greeting_safe,   # SAME predicate, reused
+        dispatch_fn=_voice_dispatch,
+        on_event=_voice_on_event, on_skip=_voice_on_skip)
+    voice.start()
+    print("Voice command bridge ready (fixed vocabulary; OFF until toggled).", flush=True)
+    # Dashboard toggle (once added): a "🎤 Voice" button sends {type:"voice", on:<bool>}
+    # -> the "voice" WS handler below sets state.voice_mode; make_state_msg carries
+    # {voice_mode, voice_status} back, mirroring the greeting button exactly.
+
     task = asyncio.create_task(broadcast_loop())
+    ir_watch_task = asyncio.create_task(ir_demand_watch_loop())
     print(f"Web controller live at http://<robot-ip>:{PORT}", flush=True)
 
     yield
 
     task.cancel()
+    ir_watch_task.cancel()
     if greeting is not None:
         greeting.stop()
+    if voice is not None:
+        voice.stop()
+    _stop_sim_proc()
     try:
         client.StopMove()
     except Exception:
@@ -1893,6 +2334,7 @@ async def lifespan(app: FastAPI):
         cam_proc.terminate()
     except Exception:
         pass
+    _stop_ir_proc()
     if lidar is not None:
         lidar.stop()
     if odom is not None:
@@ -1923,25 +2365,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
-# --- Motion tab (record -> recreate; motion/PLAN.md Phase 1). Routes under /motion/*.
-# Wrapped defensively: a motion import error prints one line and never takes the dashboard
-# down. get_control_owner reads the LIVE control_owner_id each request (lambda, not a value),
-# so record/recreate are gated to whoever currently holds the single-controller lock. ---
-try:
-    from motion.app.jobs import JobStore
-    from motion.app.replay import StubProvider
-    from motion.app.routes import build_motion_router
-    _motion_store = JobStore(BASE_DIR / "motion" / "data" / "clips")
-    app.include_router(build_motion_router(
-        get_control_owner=lambda: control_owner_id,
-        store=_motion_store,
-        provider=StubProvider(),
-        frame_source=CAMERA_SHM,
-        record_hz=30.0, max_seconds=30.0,
-    ))
-    print("Motion tab mounted at /motion/*", flush=True)
-except Exception as e:
-    print(f"[MOTION] disabled (mount failed): {e}", flush=True)
 
 
 # The HTML shells reference their JS/CSS with ?v= cache-busting query strings, but
@@ -1983,6 +2406,37 @@ async def camera_stream():
     async def gen():
         while True:
             jpeg = camera.get_jpeg() if camera else None
+            if jpeg:
+                yield (
+                    b"--" + boundary.encode() + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    + jpeg + b"\r\n"
+                )
+            await asyncio.sleep(period)
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
+
+
+@app.get("/camera/ir/status")
+async def camera_ir_status():
+    return JSONResponse({
+        "live": bool(camera_ir and camera_ir.is_live()),
+        "backend": camera_ir.backend if camera_ir else "none",
+    })
+
+
+@app.get("/camera/ir/stream")
+async def camera_ir_stream():
+    boundary = "frame"
+    period = 1.0 / CAMERA_STREAM_HZ
+
+    async def gen():
+        while True:
+            jpeg = camera_ir.get_jpeg() if camera_ir else None
             if jpeg:
                 yield (
                     b"--" + boundary.encode() + b"\r\n"
@@ -2311,6 +2765,40 @@ async def ws_endpoint(ws: WebSocket):
                     state.pending_cmd = gname   # arm-busy window starts at execution (drain)
                 continue
 
+            if mtype == "exhibition_dance_fire":
+                # Autonomous-fire exemption for EXACTLY ONE verified, self-limiting
+                # whole-body routine: FSM 503 "Dance Mode" -- per config/dances.yaml's
+                # own catalog note it "plays the classic dance and returns to walk on
+                # its own". This is NOT a general dance-firing lane (no other fsm_id is
+                # ever accepted here); it exists because g1_nav's exhibition_conductor.py
+                # is a SEPARATE process that decides WHEN to perform an operator's
+                # earlier dashboard request (see mtype=="exhibition_dance_request"
+                # below) -- possibly well after the button press -- so tying the fire
+                # itself to the requester's WS ownership at press-time wouldn't work.
+                # Gated by the SAME safety-predicate class as OPEN_GESTURES, plus its
+                # own cooldown (a dance runs far longer than a ~3.5s arm gesture).
+                fsm = msg.get("fsm_id")
+                now_ = time.time()
+                safe = (fsm == 503
+                        and state.mode in ("stand", "walk") and not state.transitioning
+                        and not _locomoting() and not state.arm_raised
+                        and state.pending_cmd is None and not _arm_busy()
+                        and now_ >= state.exhibition_dance_busy_until)
+                if safe:
+                    entry = next((d for d in DANCES if d["fsm_id"] == 503), None)
+                    if entry is not None:
+                        state.exhibition_dance_busy_until = now_ + EXHIBITION_DANCE_COOLDOWN_S
+                        threading.Thread(target=fire_whole_body,
+                                          args=(entry["name"], entry["fsm_id"]),
+                                          kwargs={"require_upright": True}, daemon=True).start()
+                    else:
+                        print("[EXHIBITION] fire rejected: FSM 503 missing from DANCES catalog",
+                              flush=True)
+                else:
+                    print(f"[EXHIBITION] dance fire rejected (fsm={fsm!r}, "
+                          f"mode={state.mode}, locomoting={_locomoting()})", flush=True)
+                continue
+
             # Every other message MUTATES robot state -> only the lock owner may send
             # it. A client that skipped 'hello' but is first to drive grabs a free lock.
             meta = client_meta.get(ws) or {}
@@ -2396,6 +2884,34 @@ async def ws_endpoint(ws: WebSocket):
                 else:
                     print(f"[DANCE] rejected unknown fsm_id {msg.get('fsm_id')!r} "
                           f"(not in catalog)", flush=True)
+
+            elif mtype == "exhibition_dance_request":
+                # Exhibition mode's "Dance" dashboard button: QUEUE a request for
+                # g1_nav's exhibition_conductor.py to perform when IT judges it safe
+                # (sufficient clearance, not mid-person-interaction, robot stationary)
+                # -- this does not fire anything itself. Owner-gated like "dance"
+                # above (only the controlling operator may queue one). Defaults to
+                # fsm_id 503 ("Dance Mode") since that's the only catalog entry the
+                # matching autonomous-fire exemption (mtype=="exhibition_dance_fire")
+                # will ever actually perform.
+                fsm = msg.get("fsm_id", 503)
+                entry = next((d for d in DANCES if d["fsm_id"] == fsm), None)
+                if entry is not None:
+                    obj = {"fsm_id": entry["fsm_id"], "name": entry["name"],
+                           "space_m": entry.get("space_m", 2.0),
+                           "requested_t": round(time.time(), 3)}
+                    try:
+                        tmp = EXHIBITION_DANCE_REQUEST_PATH + ".tmp"
+                        with open(tmp, "w") as f:
+                            json.dump(obj, f, separators=(",", ":"))
+                        os.replace(tmp, EXHIBITION_DANCE_REQUEST_PATH)
+                        print(f"[EXHIBITION] dance requested: {entry['name']} "
+                              f"(fsm {entry['fsm_id']}) -- queued for the conductor", flush=True)
+                    except OSError as e:
+                        print(f"[EXHIBITION] dance request write failed: {e}", flush=True)
+                else:
+                    print(f"[EXHIBITION] dance request rejected: unknown fsm_id {fsm!r}",
+                          flush=True)
 
             elif mtype == "dance_probe":
                 # Dance Lab: SUPERVISED probe of a candidate FSM id. Same safety gate +
@@ -2484,6 +3000,33 @@ async def ws_endpoint(ws: WebSocket):
                         greeting.reactor.reset()
                 await broadcast(make_state_msg())
 
+            elif mtype == "voice":
+                # Master toggle for fixed-vocabulary voice commands. Mirrors "greeting"
+                # exactly, including resetting the classifier's cooldown/refractory state
+                # on OFF so a phrase heard during the OFF window can't fire on the instant
+                # it flips back ON.
+                on = bool(msg.get("on"))
+                state.voice_mode = on
+                if not on:
+                    state.voice_status = ""
+                    if voice is not None:
+                        voice.classifier.reset()
+                await broadcast(make_state_msg())
+
+            elif mtype == "nav_mode":
+                # Nav tab Real/Simulation view toggle (Track B). Owner-gated (past the
+                # ownership check above) because "sim" lazily starts a real subprocess
+                # (scripts/sim_runner.py) -- a read-only viewer shouldn't be able to spin
+                # that up unilaterally.
+                mode = msg.get("mode")
+                if mode in ("real", "sim") and mode != state.nav_mode:
+                    state.nav_mode = mode
+                    if mode == "sim":
+                        _ensure_sim_proc_running()
+                    else:
+                        _stop_sim_proc()
+                    await broadcast(make_state_msg())
+
             elif mtype == "suppress_climb":
                 # Flat-ground/presentation toggle: arm/disarm dashboard-side
                 # reversal of the firmware's spontaneous climb. Owner-only (past the
@@ -2517,6 +3060,34 @@ async def ws_endpoint(ws: WebSocket):
                 elif action == "load":
                     mapper.load(msg.get("name", ""))
                 await broadcast(mapper.status())
+
+            elif mtype == "depth_full":
+                # 3D-sphere viz toggle only -- doesn't touch guard behaviour, so no
+                # ownership gate (same spirit as the Skeleton/Object Detection toggles).
+                state.depth_full_view = bool(msg.get("on"))
+                if guard is not None:
+                    tm = guard.telemetry()
+                    if depth_nf is not None:
+                        tm["depth"] = depth_nf.telemetry()
+                        tm["depth_points"] = depth_nf.front_points()
+                        tm["depth_ring"] = depth_nf.front_ring()
+                        tm["depth_points_full"] = (
+                            depth_nf.full_points() if state.depth_full_view else None)
+                    await broadcast(tm)
+
+            elif mtype == "ir_toggle":
+                # Camera-tab viz toggle only -- no ownership gate (same spirit as
+                # Skeleton/Object Detection/Full Depth). Starts/stops ir_service.py
+                # itself (not just a flag) since it's a real OS process holding the
+                # D435i's third video node -- see _ensure_ir_proc_running/_stop_ir_proc.
+                # state.ir_manual_on also tells ir_demand_watch_loop not to stop the
+                # process out from under the viewer just because pose_service isn't
+                # currently in its own IR fallback.
+                state.ir_manual_on = bool(msg.get("on"))
+                if state.ir_manual_on:
+                    _ensure_ir_proc_running()
+                else:
+                    _stop_ir_proc()
 
             elif mtype == "obstacle":
                 action = msg.get("action", "")

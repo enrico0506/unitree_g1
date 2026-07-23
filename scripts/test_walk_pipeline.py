@@ -123,4 +123,5 @@ ck("guard OFF: forward ramp is smooth (accel bounded)", acc7 <= A + 1e-3, f"acc=
 ck("guard OFF: reaches max exactly", abs(g7[-1][0] - 1.5) < 1e-6)
 
 print("\n" + ("ALL PASS -- pipeline smooth + safe" if fails == 0 else f"{fails} FAILED"))
-sys.exit(1 if fails else 0)
+if __name__ == "__main__":
+    sys.exit(1 if fails else 0)

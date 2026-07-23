@@ -216,7 +216,6 @@
     });
     return b;
   }
-  function btnOn(b) { return b.classList.contains("on"); }
 
   function mkRow(parent, label) {
     const row = document.createElement("div");

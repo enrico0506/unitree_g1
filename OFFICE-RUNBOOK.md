@@ -58,6 +58,7 @@ If `--ff-only` refuses (office diverged), stop and reconcile — do NOT force. T
 **Phone**
 - `5dafacd` — Phone "Actions" surface: arm gestures (wave/high-five/clap/shake/hug/heart/kiss/hands-up/release) + whole-body Dance (503) / Climb (812) via hold-to-fire, plus UI polish.
 - `f2686d9` — Grab-on-first-tap control: any stick touch or tap on a connected phone takes the single-controller lock instantly (no "take control" button gate); handoff zeroes velocity so there's no lurch.
+- `933bd38` — Phone teleop UI rebuild: cleaner, more minimal surface. Dropped the obstacle-feed viewer, step selector, STOP button, and three.js from the phone page (see the now-stale test items #14/#16 below, which referenced the removed STOP button).
 
 ---
 
@@ -176,11 +177,11 @@ Ordered so the highest-risk unknowns come first.
 
 13. **Phone: grab-on-first-tap steals from laptop, no lurch.** Laptop drives; tap the phone Move stick once → server logs a handoff, laptop chip flips to "○ Phone has control · Take back", robot does NOT jerk.
 
-14. **SAFETY — read-only phone STOP is a no-op.** Laptop drives; a *second* (read-only) phone taps STOP → **nothing happens**. The phone STOP button sends only `{type:"stop"}` with no take-control (`phone.js:686`); the server drops non-owner messages at the ownership gate (`robot_web_controller.py:1709`). Everyone must know: a bystander's phone STOP does not stop a laptop-driven robot — the physical e-stop is the only universal stop.
+14. **STALE — superseded by the `933bd38` phone-UI rebuild, which removed the phone's STOP button entirely.** (Was: "read-only phone STOP is a no-op" — a non-owner's `{type:"stop"}` was dropped at the ownership gate. That gate logic is presumably still true for whatever messages a non-owner phone *can* send, but there's no STOP button left to test it with. Needs a fresh test item once the current phone Actions surface is reviewed for the non-owner case.)
 
 15. **Laptop take-back is manual.** Phone driving → click laptop chip "Take back" → lock moves, phone sticks go inert. Laptop must NOT auto-reclaim while the phone still holds it.
 
-16. **STOP zeroes velocity, keeps gait hot.** In walk, drive, tap phone STOP → immediate halt, then drivable again WITHOUT re-entering walk (sends `Move(0,0,0)`, never `StopMove`). STOP does NOT lower raised arms or exit dance/climb.
+16. **STALE — superseded by the `933bd38` phone-UI rebuild, which removed the phone's STOP button entirely.** (Was: "STOP zeroes velocity, keeps gait hot" — releasing the stick/pagehide still sends `{type:"stop"}` per `phone.js`, so the underlying zero-velocity behavior likely still applies to those paths, but there's no dedicated STOP button left to test.)
 
 17. **Owner watchdog.** Drive from phone in walk, then lock the phone / kill wifi → stop within ~2 s. Owner closes tab → lock frees, robot stops.
 

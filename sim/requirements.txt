@@ -1,0 +1,15 @@
+# Isolated venv deps for the mujoco G1 sim runner (Track B, sim/setup_venv.sh).
+#
+# mujoco==3.2.3 is PINNED: confirmed (2026-07-23, on this actual Jetson Orin NX,
+# aarch64 + system python3.8) as the LAST mujoco release with prebuilt aarch64+cp38
+# PyPI wheels. Newer mujoco releases (3.3.x+) dropped cp38 wheels for aarch64 (only
+# manylinux x86_64 / cp39+ are published), which would force a from-source build on
+# this device. Do NOT bump this pin without re-verifying wheel availability first
+# (`pip download mujoco==<new version> --no-deps -d /tmp/x` on this machine).
+#
+# mujoco pulls in its own modern numpy as a transitive dependency. That numpy is
+# installed ONLY inside sim/.venv -- it must never leak into system site-packages,
+# which is why this whole tree is pip-installed into a dedicated venv rather than
+# `pip3 install --user`. The system numpy (1.17.4) is load-bearing for other
+# scripts (e.g. scripts/fused_odometry.py) and must not be touched.
+mujoco==3.2.3

@@ -45,6 +45,13 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
   // voxel columns). Remembered across reloads.
   let mode = "points";
   try { const s = localStorage.getItem("obs3dMode"); if (s === "columns" || s === "points") mode = s; } catch (e) {}
+  // "Full Depth" toggle: OFF (default) shows the fused Mid-360 + narrow ground-only
+  // D435i safety band (msg.points / msg.ring / msg.depth_points) -- what the guard
+  // actually reacts to. ON replaces that with msg.depth_points_full, the D435i's dense
+  // all-height cloud (server only computes it while this is on -- see robot_web_controller.py
+  // mtype "depth_full"). Not persisted: always starts OFF so nobody leaves it silently on.
+  let fullDepth = false;
+  let fullBtn = null;
   const _red = new THREE.Color(COL.stop), _amber = new THREE.Color(COL.slow),
         _c = new THREE.Color(), _c2 = new THREE.Color();
   const _m = new THREE.Matrix4(), _p = new THREE.Vector3(),
@@ -61,6 +68,19 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
     mode = m;
     try { localStorage.setItem("obs3dMode", m); } catch (e) {}
     applyMode();
+    if (lastMsg) refresh(lastMsg);
+  }
+
+  function applyFullBtn() {
+    if (!fullBtn) return;
+    fullBtn.textContent = fullDepth ? "◉ Full Depth" : "○ Full Depth";
+    fullBtn.style.color = fullDepth ? "#3fd39b" : "#E9EDF6";
+  }
+  function setFullDepth(on) {
+    fullDepth = !!on;
+    applyFullBtn();
+    // Server only computes depth_points_full while someone has asked for it; tell it now.
+    if (window.send) window.send({ type: "depth_full", on: fullDepth });
     if (lastMsg) refresh(lastMsg);
   }
 
@@ -213,6 +233,20 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
         setMode(mode === "points" ? "columns" : "points");
     });
 
+    // "Full Depth" toggle: stacked under the points/columns button on the right --
+    // top-left collides with the map-bar (top:40px;left:9px) when the cloud feed
+    // is showing the idle sphere.
+    fullBtn = document.createElement("button");
+    fullBtn.id = "obs3d-full";
+    fullBtn.title = "Toggle the D435i's dense all-height point cloud (vs. the narrow ground-only safety band the guard uses)";
+    fullBtn.style.cssText = "position:absolute;top:44px;right:9px;z-index:4;" +
+      "padding:5px 11px;font:600 12px system-ui,sans-serif;color:#E9EDF6;" +
+      "background:rgba(10,13,19,0.72);border:1px solid #232C3E;border-radius:8px;cursor:pointer;" +
+      "backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);";
+    fullBtn.onclick = () => setFullDepth(!fullDepth);
+    mount.appendChild(fullBtn);
+    applyFullBtn();
+
     booted = true;
     applyMode();
     if (lastMsg) refresh(lastMsg);
@@ -302,27 +336,37 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
     const ring = msg && msg.ring, pts = msg && msg.points;
     // gather (x,y,h) samples + keep a parallel raw-XYZ list for point rendering
     const px = [], py = [], ph = [];
-    if (Array.isArray(pts) && pts.length >= 3) {
-      const m = Math.min(pts.length - (pts.length % 3), MAX_POINTS * 3);
-      for (let i = 0; i < m; i += 3) { px.push(pts[i]); py.push(pts[i + 1]); ph.push(pts[i + 2]); }
-    } else if (ring && Array.isArray(ring.dist) && isFinite(ring.bin_deg) && isFinite(ring.start_deg)) {
-      const st = Array.isArray(ring.state) ? ring.state : null;
-      for (let i = 0; i < ring.dist.length; i++) {
-        const d = ring.dist[i];
-        if ((st ? st[i] !== 2 : d == null) || d == null) continue;
-        const a = ((ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI) / 180;
-        const dd = Math.min(d, RANGE_M);
-        px.push(dd * Math.cos(a)); py.push(dd * Math.sin(a)); ph.push(0.4);
+    if (fullDepth) {
+      // "Full Depth" mode: ONLY the D435i's dense all-height cloud -- no Mid-360, no
+      // ground-only corridor -- so it's a clean A/B against the fused safety view.
+      const fpts = msg && msg.depth_points_full;
+      if (Array.isArray(fpts) && fpts.length >= 3) {
+        const m = Math.min(fpts.length - (fpts.length % 3), MAX_POINTS * 3);
+        for (let i = 0; i < m; i += 3) { px.push(fpts[i]); py.push(fpts[i + 1]); ph.push(fpts[i + 2]); }
       }
-    }
-    // ALSO fold in the near-ground DEPTH points (cables / low objects the up-tilted
-    // Mid-360 cannot see) so the sphere shows EXACTLY what the fused guard reacts to.
-    // Same frame (x-fwd, y-left, z=height above floor); they cluster + box like the rest.
-    const dpts = msg && msg.depth_points;
-    if (Array.isArray(dpts) && dpts.length >= 3) {
-      const room = (MAX_POINTS - px.length) * 3;
-      const m = Math.min(dpts.length - (dpts.length % 3), Math.max(0, room));
-      for (let i = 0; i < m; i += 3) { px.push(dpts[i]); py.push(dpts[i + 1]); ph.push(dpts[i + 2]); }
+    } else {
+      if (Array.isArray(pts) && pts.length >= 3) {
+        const m = Math.min(pts.length - (pts.length % 3), MAX_POINTS * 3);
+        for (let i = 0; i < m; i += 3) { px.push(pts[i]); py.push(pts[i + 1]); ph.push(pts[i + 2]); }
+      } else if (ring && Array.isArray(ring.dist) && isFinite(ring.bin_deg) && isFinite(ring.start_deg)) {
+        const st = Array.isArray(ring.state) ? ring.state : null;
+        for (let i = 0; i < ring.dist.length; i++) {
+          const d = ring.dist[i];
+          if ((st ? st[i] !== 2 : d == null) || d == null) continue;
+          const a = ((ring.start_deg + (i + 0.5) * ring.bin_deg) * Math.PI) / 180;
+          const dd = Math.min(d, RANGE_M);
+          px.push(dd * Math.cos(a)); py.push(dd * Math.sin(a)); ph.push(0.4);
+        }
+      }
+      // ALSO fold in the near-ground DEPTH points (cables / low objects the up-tilted
+      // Mid-360 cannot see) so the sphere shows EXACTLY what the fused guard reacts to.
+      // Same frame (x-fwd, y-left, z=height above floor); they cluster + box like the rest.
+      const dpts = msg && msg.depth_points;
+      if (Array.isArray(dpts) && dpts.length >= 3) {
+        const room = (MAX_POINTS - px.length) * 3;
+        const m = Math.min(dpts.length - (dpts.length % 3), Math.max(0, room));
+        for (let i = 0; i < m; i += 3) { px.push(dpts[i]); py.push(dpts[i + 1]); ph.push(dpts[i + 2]); }
+      }
     }
 
     const cells = voxelize((emit) => { for (let i = 0; i < px.length; i++) emit(px[i], py[i], ph[i], i); });
@@ -409,7 +453,14 @@ import { OrbitControls } from "three/addons/OrbitControls.js";
         if (!target) return;
         if (!booted && !build()) return;
         if (renderer && renderer.domElement.parentElement !== target) {
-          target.appendChild(renderer.domElement); mount = target; onResize();
+          target.appendChild(renderer.domElement);
+          // The floating corner buttons are separate DOM nodes from the canvas --
+          // move them along with it, or they're stranded in whichever div build()
+          // happened to run in (e.g. the default "cloud" feed re-parents the canvas
+          // into #cloudSphere but the buttons would stay behind in #bigSphere).
+          if (toggleBtn) target.appendChild(toggleBtn);
+          if (fullBtn) target.appendChild(fullBtn);
+          mount = target; onResize();
         }
       } catch (e) { /* defensive */ }
     },

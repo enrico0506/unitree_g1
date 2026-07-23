@@ -16,6 +16,17 @@ Data flow (all via /dev/shm, bind-mounted into the container):
     read   POSE_LABELS    {"<id>": "name"} operator labels     <- /camera/pose/label
     read   POSE_DEMAND    heartbeat touched by the tracks poll -> only infer while watched
 
+IR fallback: the RGB head camera has a narrow ~42 deg vertical FOV, so a person
+standing close has their head cropped out of frame -- no head keypoints, and
+gesture_reactor's wave-back logic starves for confident keypoints. The D435i's
+IR/stereo node (scripts/ir_service.py) has a wider ~58 deg FOV. When the RGB
+frame looks head-cropped, this process opportunistically decodes and infers on
+the IR JPEG instead (same already-loaded model, no second GPU-resident copy),
+publishing IR-native w/h to POSE_TRACKS for that tick -- the browser overlay and
+gesture_reactor already read w/h per-payload, so no downstream changes needed.
+    read   IR_CAMERA_SHM  latest raw IR JPEG from ir_service.py
+    write  IR_DEMAND      heartbeat asking robot_web_controller to keep ir_service.py alive
+
 Config via environment variables (see run_pose.sh):
     MODEL        model file (default yolo11n-pose.pt; swap to .engine after TensorRT export)
     MODELS_DIR   working dir for weights/exports (default /models, a mounted volume)
@@ -23,6 +34,12 @@ Config via environment variables (see run_pose.sh):
     CONF         detection confidence threshold (default 0.5)
     IMGSZ        inference image size (default 640)
     ALWAYS_ON    "1" to ignore demand-gating (use for manual testing)
+    IR_FALLBACK          "1" to enable the IR fallback above (default on)
+    IR_EDGE_MARGIN_PX    box.y1 must be within this many px of the top edge (default 6)
+    IR_MIN_BOX_FRAC_H    box height must exceed this fraction of frame height (default 0.25)
+    IR_FALLBACK_DWELL_S  min seconds to stay on IR once switched (default 2.0)
+    IR_RECOVER_STABLE_N  consecutive clean RGB frames needed to switch back (default 3)
+    IR_FRESH_S           ignore the IR frame if older than this (default 1.0)
 """
 
 import json
@@ -38,6 +55,8 @@ POSE_SHM = os.environ.get("POSE_SHM", "/dev/shm/g1_pose.jpg")
 POSE_TRACKS = os.environ.get("POSE_TRACKS", "/dev/shm/g1_pose_tracks.json")
 POSE_LABELS = os.environ.get("POSE_LABELS", "/dev/shm/g1_pose_labels.json")
 POSE_DEMAND = os.environ.get("POSE_DEMAND", "/dev/shm/g1_pose_demand")
+IR_CAMERA_SHM = os.environ.get("IR_CAMERA_SHM", "/dev/shm/g1_camera_ir.jpg")
+IR_DEMAND = os.environ.get("IR_DEMAND", "/dev/shm/g1_ir_demand")
 
 # --- Tunables ---
 MODEL = os.environ.get("MODEL", "yolo11n-pose.pt")
@@ -46,11 +65,18 @@ INFER_HZ = float(os.environ.get("INFER_HZ", "12"))
 CONF = float(os.environ.get("CONF", "0.5"))
 IMGSZ = int(os.environ.get("IMGSZ", "640"))
 ALWAYS_ON = os.environ.get("ALWAYS_ON", "0") == "1"
+IR_FALLBACK = os.environ.get("IR_FALLBACK", "1") == "1"
+IR_EDGE_MARGIN_PX = float(os.environ.get("IR_EDGE_MARGIN_PX", "6"))
+IR_MIN_BOX_FRAC_H = float(os.environ.get("IR_MIN_BOX_FRAC_H", "0.25"))
+IR_FALLBACK_DWELL_S = float(os.environ.get("IR_FALLBACK_DWELL_S", "2.0"))
+IR_RECOVER_STABLE_N = int(os.environ.get("IR_RECOVER_STABLE_N", "3"))
+IR_FRESH_S = float(os.environ.get("IR_FRESH_S", "1.0"))
 
 DT = 1.0 / INFER_HZ
 DEMAND_TTL = 3.0          # infer only if POSE_DEMAND was touched within this many seconds
 CAMERA_FRESH_S = 2.0      # ignore the raw frame if it's older than this (camera down)
 KP_MIN_CONF = 0.3         # keypoints below this confidence are reported but flagged
+HEAD_KPT_IDXS = (0, 1, 2, 3, 4)   # COCO order: nose, l_eye, r_eye, l_ear, r_ear
 
 
 def atomic_write(path, data, mode="wb"):
@@ -70,18 +96,70 @@ def demand_fresh():
         return False
 
 
-def read_camera_frame():
-    """Latest raw JPEG -> BGR ndarray, or None if missing/stale/undecodable."""
+def read_frame(path, fresh_s):
+    """Latest raw JPEG at `path` -> BGR ndarray, or None if missing/stale/undecodable."""
     try:
-        if (time.time() - os.path.getmtime(CAMERA_SHM)) > CAMERA_FRESH_S:
+        if (time.time() - os.path.getmtime(path)) > fresh_s:
             return None
-        with open(CAMERA_SHM, "rb") as f:
+        with open(path, "rb") as f:
             buf = f.read()
     except OSError:
         return None
     if not buf:
         return None
     return cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+
+
+def read_camera_frame():
+    return read_frame(CAMERA_SHM, CAMERA_FRESH_S)
+
+
+def touch_ir_demand():
+    """Heartbeat asking robot_web_controller.py to keep ir_service.py running."""
+    try:
+        with open(IR_DEMAND, "wb") as f:
+            f.write(b"1")
+    except OSError:
+        pass
+
+
+def head_cropped(items, frame_h):
+    """True if a sizeable track has no confident head keypoint AND its box touches
+    the top edge -- a proxy for "the FOV cropped the head off", not "the person
+    turned away" (which wouldn't touch the edge, so shouldn't trigger a camera switch).
+    """
+    for it in items:
+        kpts = it.get("kpts") or []
+        if len(kpts) <= max(HEAD_KPT_IDXS):
+            continue
+        if any(kpts[i][2] >= KP_MIN_CONF for i in HEAD_KPT_IDXS):
+            continue
+        box = it.get("box") or [0, 0, 0, 0]
+        if box[1] > IR_EDGE_MARGIN_PX:
+            continue
+        if (box[3] - box[1]) <= IR_MIN_BOX_FRAC_H * frame_h:
+            continue
+        return True
+    return False
+
+
+def step_source(source, cropped, t0, switched_at, good_rgb_streak):
+    """Advance the rgb/ir fallback state machine one tick.
+
+    source: "rgb" or "ir" going in. cropped: this tick's head_cropped() verdict on the
+    RGB frame (always evaluated, even while sourcing from IR, so recovery can be
+    detected). Returns (new_source, new_switched_at, new_good_rgb_streak). Switching
+    is debounced both ways: IR_FALLBACK_DWELL_S before we'll consider recovering, and
+    IR_RECOVER_STABLE_N consecutive clean RGB reads before we actually do.
+    """
+    if source == "rgb":
+        if cropped:
+            return "ir", t0, 0
+        return "rgb", switched_at, good_rgb_streak
+    good_rgb_streak = 0 if cropped else good_rgb_streak + 1
+    if (t0 - switched_at) >= IR_FALLBACK_DWELL_S and good_rgb_streak >= IR_RECOVER_STABLE_N:
+        return "rgb", switched_at, good_rgb_streak
+    return "ir", switched_at, good_rgb_streak
 
 
 class Labels:
@@ -214,11 +292,15 @@ def main():
 
     model = YOLO(MODEL)
     print(f"[pose_service] model={MODEL} infer_hz={INFER_HZ} conf={CONF} imgsz={IMGSZ} "
-          f"always_on={ALWAYS_ON}", flush=True)
+          f"always_on={ALWAYS_ON} ir_fallback={IR_FALLBACK}", flush=True)
 
     labels = Labels()
     tracker = SimpleTracker()
+    ir_tracker = SimpleTracker()
     idle_logged = False
+    source = "rgb"          # or "ir", while a close person's head is cropped from RGB
+    switched_at = 0.0
+    good_rgb_streak = 0
     while True:
         t0 = time.time()
 
@@ -237,13 +319,44 @@ def main():
 
         try:
             result = model.predict(frame, conf=CONF, imgsz=IMGSZ, verbose=False)[0]
-            items = build_items(result, labels, tracker)
+            rgb_items = build_items(result, labels, tracker)
         except Exception as e:
             print(f"[pose_service] inference error: {e}", flush=True)
             time.sleep(DT)
             continue
 
-        h, w = frame.shape[:2]
+        rgb_h, rgb_w = frame.shape[:2]
+
+        if IR_FALLBACK:
+            cropped = head_cropped(rgb_items, rgb_h)
+            prev_source = source
+            source, switched_at, good_rgb_streak = step_source(
+                source, cropped, t0, switched_at, good_rgb_streak)
+            if source != prev_source:
+                print(f"[pose_service] {prev_source} -> {source} fallback switch", flush=True)
+        else:
+            source = "rgb"
+
+        if source == "ir":
+            touch_ir_demand()
+            ir_frame = read_frame(IR_CAMERA_SHM, IR_FRESH_S)
+            if ir_frame is None:
+                # ir_service.py may still be starting up (or stopped) -- nothing
+                # fresh to publish this tick; try again next tick.
+                dt = time.time() - t0
+                if dt < DT:
+                    time.sleep(DT - dt)
+                continue
+            try:
+                ir_result = model.predict(ir_frame, conf=CONF, imgsz=IMGSZ, verbose=False)[0]
+                items = build_items(ir_result, labels, ir_tracker)
+            except Exception as e:
+                print(f"[pose_service] IR inference error: {e}", flush=True)
+                items = []
+            h, w = ir_frame.shape[:2]
+        else:
+            items, h, w = rgb_items, rgb_h, rgb_w
+
         atomic_write(POSE_TRACKS,
                      json.dumps({"w": w, "h": h, "items": items}).encode(), "wb")
 

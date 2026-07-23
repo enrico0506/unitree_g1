@@ -15,6 +15,9 @@
 #   INFER_HZ=12  CONF=0.5  IMGSZ=640
 #   ALWAYS_ON=0                # set 1 to ignore demand-gating (manual testing)
 #   RESTART=unless-stopped     # set "no" for a throwaway run that dies with the host
+#   IR_FALLBACK=1              # set 0 to disable the close-range IR fallback
+#   IR_EDGE_MARGIN_PX=6  IR_MIN_BOX_FRAC_H=0.25
+#   IR_FALLBACK_DWELL_S=2.0  IR_RECOVER_STABLE_N=3  IR_FRESH_S=1.0
 set -euo pipefail
 
 IMAGE="${IMAGE:-g1-pose:latest}"
@@ -24,6 +27,12 @@ CONF="${CONF:-0.5}"
 IMGSZ="${IMGSZ:-640}"
 ALWAYS_ON="${ALWAYS_ON:-0}"
 RESTART="${RESTART:-unless-stopped}"
+IR_FALLBACK="${IR_FALLBACK:-1}"
+IR_EDGE_MARGIN_PX="${IR_EDGE_MARGIN_PX:-6}"
+IR_MIN_BOX_FRAC_H="${IR_MIN_BOX_FRAC_H:-0.25}"
+IR_FALLBACK_DWELL_S="${IR_FALLBACK_DWELL_S:-2.0}"
+IR_RECOVER_STABLE_N="${IR_RECOVER_STABLE_N:-3}"
+IR_FRESH_S="${IR_FRESH_S:-1.0}"
 POSE_DIR="/home/unitree/projects/g1/perception/pose"
 
 # Idempotent: drop any prior instance first. We no longer use --rm (it is
@@ -43,6 +52,12 @@ sudo docker run -d --name g1-pose \
   -e CONF="${CONF}" \
   -e IMGSZ="${IMGSZ}" \
   -e ALWAYS_ON="${ALWAYS_ON}" \
+  -e IR_FALLBACK="${IR_FALLBACK}" \
+  -e IR_EDGE_MARGIN_PX="${IR_EDGE_MARGIN_PX}" \
+  -e IR_MIN_BOX_FRAC_H="${IR_MIN_BOX_FRAC_H}" \
+  -e IR_FALLBACK_DWELL_S="${IR_FALLBACK_DWELL_S}" \
+  -e IR_RECOVER_STABLE_N="${IR_RECOVER_STABLE_N}" \
+  -e IR_FRESH_S="${IR_FRESH_S}" \
   "${IMAGE}" \
   python3 /app/pose_service.py
 

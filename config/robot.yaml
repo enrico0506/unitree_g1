@@ -148,8 +148,6 @@ map:
   dir: maps              # saved maps go here (under the project root)
   voxel_size_m: 0.05     # map resolution (smaller = denser, bigger files)
   max_points: 300000     # cap on accumulated map size
-  max_range_m: 4.0       # (legacy, unused) was for the old depth-based mapper
-  yaw_sign: 1            # (legacy, unused) the FAST-LIO mapper fixes the frame properly
 
 # Mapping is now real SLAM (FAST-LIO on the head Mid-360), run ON-DEMAND only
 # while recording. Start/Stop Mapping in the dashboard spawn/stop this launch.

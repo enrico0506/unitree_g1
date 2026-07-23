@@ -221,23 +221,11 @@ body[data-transitioning="1"] .live-flag { display: none; }
 .lidar-window[data-feed="cloud"][data-cloud="sphere"] #lidarView { visibility: hidden; }
 /* cloud-only overlays (nav pad / view bar / map bar / legend) hide off-cloud */
 .lidar-window:not([data-feed="cloud"]) .feed-cloud-only { display: none; }
-.orient-legend { position: absolute; left: 110px; bottom: 13px; z-index: 2; font-family: var(--font-data); font-size: 10px; color: var(--steel); background: rgba(10,13,19,0.66); backdrop-filter: blur(6px); padding: 3px 7px; border-radius: 6px; pointer-events: none; }
-
 /* Floating control clusters over the windows */
-.nav-pad, .view-bar, .map-bar, .cam-bar {
+.map-bar, .cam-bar {
   position: absolute; z-index: 2; background: rgba(10,13,19,0.72); backdrop-filter: blur(8px);
   border: 1px solid var(--line); border-radius: 10px; padding: 5px;
 }
-.nav-pad { right: 9px; bottom: 60px; display: grid; gap: 4px; grid-template-columns: repeat(3, 34px); grid-template-areas: ".    up    ." "left .     right" ".    down  ." "zout .     zin"; }
-.nav-pad button { width: 34px; height: 34px; padding: 0; font-size: 14px; background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; touch-action: none; user-select: none; -webkit-user-select: none; }
-.nav-pad button:active { background: var(--focus); color: #fff; border-color: var(--focus); }
-.n-up { grid-area: up; } .n-left { grid-area: left; } .n-right { grid-area: right; }
-.n-down { grid-area: down; } .n-zin { grid-area: zin; } .n-zout { grid-area: zout; }
-
-.view-bar { top: 9px; right: 9px; display: flex; gap: 4px; }
-.view-bar button { padding: 6px 9px; font-size: 12px; min-width: 30px; background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
-.view-bar button:hover { border-color: var(--focus); color: #fff; }
-
 .cam-bar { top: 9px; right: 9px; display: flex; gap: 4px; }
 .cam-bar button { padding: 6px 11px; font-size: 12px; background: var(--surface-2); color: var(--chalk); border: 1px solid var(--line); border-radius: 7px; }
 .cam-bar button:hover { border-color: var(--focus); color: #fff; }
@@ -385,9 +373,7 @@ input:focus-visible { outline-offset: 0; }
 
 /* Bigger hit areas on touch devices (keeps the tight desktop look on mouse) */
 @media (pointer: coarse) {
-  .nav-pad { bottom: 66px; grid-template-columns: repeat(3, 44px); }
-  .nav-pad button { width: 44px; height: 44px; font-size: 16px; }
-  .view-bar button, .cam-bar button, .map-bar button, .map-bar select, .map-bar input { min-height: 44px; }
+  .cam-bar button, .map-bar button, .map-bar select, .map-bar input { min-height: 44px; }
   .tab { padding: 11px 18px; }
   .modebar .mode-btn { min-height: 44px; padding: 8px 13px; }
 }
@@ -430,22 +416,13 @@ input:focus-visible { outline-offset: 0; }
 
 /* --- Greeting (auto wave-back) toggle — sits by the gesture picker in the header.
    Reuses .gesture-select sizing; .on lights it so the operator always sees when the
-   robot is allowed to greet on its own. .greeting-status is the live caption. --- */
+   robot is allowed to greet on its own. --- */
 .greeting-toggle { cursor: pointer; white-space: nowrap; }
 .greeting-toggle.on {
   background: #123b28;
   border-color: #2ecc71;
   color: #7bffb0;
   box-shadow: 0 0 0 1px #2ecc71 inset, 0 0 12px -2px #2ecc71;
-}
-.greeting-status {
-  font-size: 12px;
-  opacity: .75;
-  margin-left: 6px;
-  max-width: 20ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* Take-over chip blocked: another device is driving AND the robot is moving — you must
@@ -487,7 +464,6 @@ header { align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-4); }
   border-color: var(--focus); color: var(--chalk);
   box-shadow: inset 0 0 0 1px var(--focus), 0 0 12px -3px var(--focus);
 }
-.greeting-status { opacity: .85; color: var(--steel); font-size: var(--fs-mono); }
 /* base chips (Phone link, take-control) gain the same hover language as the tabs */
 .control-chip:not(.mine):hover { border-color: var(--focus); color: var(--chalk); }
 
@@ -713,3 +689,61 @@ main, main.controls, main.diag { gap: var(--sp-3); }
 .dt-sub:disabled { opacity: 0.4; cursor: not-allowed; background: var(--surface-2); }
 .dt-sub.active { color: var(--live); border-color: var(--live); box-shadow: 0 0 10px rgba(63,211,155,0.25); }
 .dt-sub-space { font-family: var(--font-data); font-size: 10.5px; color: var(--st-stand); }
+
+/* =========================================================================
+   NAV TAB (nav.js) — top-down circle-patrol view, Real/Simulation toggle.
+   The .sim state is deliberately loud (dashed amber border + watermark): an
+   operator must never mistake a simulated run for the live robot.
+   ========================================================================= */
+.nav-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-3); }
+.nav-mode-toggle { display: inline-flex; gap: 4px; padding: 3px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-card); }
+.nav-mode-btn {
+  font-family: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: .01em;
+  color: var(--steel); background: transparent; border: 1px solid transparent;
+  border-radius: var(--r-control); padding: 7px 14px; cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.nav-mode-btn:hover { color: var(--chalk); }
+.nav-mode-btn.current { background: var(--surface-2); color: var(--chalk); border-color: var(--line); }
+/* Confirmed (server-reported) source only -- see updateChrome() in nav.js. Real
+   lights the calm "live" green; Sim lights the same caution amber as the
+   watermark/border so the two cues always agree. */
+#navModeReal.current { color: var(--live); border-color: var(--live); }
+#navModeSim.current { color: var(--caution); border-color: var(--caution); }
+
+.nav-phase-chip {
+  font-family: var(--font-data); font-size: 12px; color: var(--steel);
+  background: var(--inset); border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill); padding: 6px 14px;
+}
+.nav-phase-chip.warn { color: var(--caution); border-color: color-mix(in srgb, var(--caution) 45%, var(--line-soft)); }
+
+/* Secondary sub-status line under the phase chip -- what the exhibition
+   conductor is doing during "circling" (roam/gesture/dance/idle). Muted vs.
+   the phase chip since it's supplementary; absent entirely (see [hidden])
+   until the server actually sends msg.activity. */
+.nav-activity-chip {
+  font-family: var(--font-data); font-size: 11.5px; color: var(--steel);
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--r-pill); padding: 6px 10px;
+}
+.nav-activity-chip[hidden] { display: none; }
+
+.nav-window { background: var(--inset); }
+/* Sim affordance: dashed amber border + a big translucent watermark. Loud on
+   purpose -- this is the one visual cue standing between an operator and
+   confusing a dry-run with the real robot. */
+.nav-window.sim {
+  border: 2px dashed var(--caution);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--caution) 55%, transparent), var(--shadow);
+}
+.nav-sim-watermark {
+  position: absolute; inset: 0; z-index: 3; display: flex; align-items: center; justify-content: center;
+  pointer-events: none; text-align: center;
+  font-family: var(--font-ui); font-size: clamp(18px, 4vw, 34px); font-weight: 800;
+  letter-spacing: .12em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--caution) 85%, white);
+  text-shadow: 0 0 18px rgba(255,134,54,0.55);
+  background: repeating-linear-gradient(135deg, rgba(255,134,54,0.06) 0 18px, rgba(0,0,0,0) 18px 36px);
+}
+.nav-sim-watermark[hidden] { display: none; }

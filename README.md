@@ -3,7 +3,7 @@
 Web-based teleop + perception dashboard for a Unitree G1, running on the robot's
 onboard NVIDIA Jetson Orin NX. Serves a control UI (drive, modes, LiDAR map) and a
 live head-camera feed, with optional **people-skeleton** (YOLO11-pose) and
-**object-detection** (YOLO-World, open-vocabulary) overlays.
+**object-detection** (NanoOWL+NanoSAM, open-vocabulary) overlays.
 
 Open it over WLAN at `http://<robot-ip>:8080`.
 
@@ -11,8 +11,10 @@ Open it over WLAN at `http://<robot-ip>:8080`.
 
 ## Quick start
 
-The dashboard is a FastAPI app. Start it manually in a terminal (it has a safety
-prompt, so it is not auto-started — see [Known issues](#known-issues)):
+The dashboard is a FastAPI app, installed as the `g1-web` systemd service (auto-starts
+on boot; `sudo systemctl restart g1-web` / `sudo systemctl status g1-web`). To run it
+manually in a terminal instead (e.g. for debugging — the interactive safety prompt is
+skipped automatically when not attached to a TTY, so it works either way):
 
 ```bash
 cd /home/unitree/projects/g1
@@ -147,17 +149,12 @@ Docker access requires root; a sudoers rule grants passwordless `sudo docker` fo
 | `config/robot.yaml` | Tuning: port, speed caps, stream rates |
 | `web/` | Frontend (`index.html`, `controller.js`, `camera.js`, `pose.js`, `lidar.js`, `style.css`) |
 | `perception/pose/` | People-pose service, Docker setup, models |
-| `perception/detect/` | Object-detection service (YOLO-World, open-vocab), Docker setup, models |
+| `perception/detect/` | Object-detection service (NanoOWL+NanoSAM, open-vocab), Docker setup, models |
 
 ---
 
 ## Known issues
 
-- **`g1-web` systemd service crash-loops.** The unit runs the script directly, but the
-  script has an interactive `input("Press Enter…")` safety prompt; systemd has no
-  TTY, so it exits with `EOFError` and retries every 5 s. **Run the dashboard manually**
-  (above). To silence the crash-loop: `sudo systemctl disable --now g1-web`. (A clean
-  fix would make the prompt TTY-only so it can run headlessly.)
 - **Only one camera consumer allowed.** Don't start a second `camera_service.py` or a
   second dashboard instance — both would fight the single-consumer videohub. Kill stray
   `camera_service.py` processes before starting a fresh dashboard.

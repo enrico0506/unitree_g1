@@ -34,6 +34,20 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <!-- circle_patrol.py / exhibition_conductor.py send nav2_msgs/action/NavigateToPose goals. -->
+  <exec_depend>nav2_msgs</exec_depend>
+  <!-- circle_patrol.py / fused_odom_health.py / person_fusion.py / patrol_supervisor.py /
+       exhibition_conductor.py (Track A circle-patrol + person-interaction + exhibition
+       nodes) also import PyYAML (config/patrol.yaml) and, for patrol_supervisor.py's WS
+       wave trigger and exhibition_conductor.py's gesture/dance WS trigger, the
+       pip-installed `websockets` package: neither is a rosdep-resolvable ROS
+       package on this Foxy robot (same reasoning as the yaml/numpy imports already
+       used unlisted by ground_seg.py / costmap_to_obstacle.py in this same
+       package); both are already present in this robot's system Python
+       (confirmed: PyYAML via the existing obstacle/guard.py usage, websockets
+       13.1 via `pip3 list`). Left undeclared here for the same rosdep-resolution
+       reason nav2_bringup is undeclared above. -->
+
   <!-- livox_to_pc2 imports livox_ros_driver2.msg.CustomMsg (in g1_mapping_ws). -->
   <exec_depend>livox_ros_driver2</exec_depend>
 

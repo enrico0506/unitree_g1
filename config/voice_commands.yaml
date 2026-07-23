@@ -1,0 +1,126 @@
+# ============================================================================
+# G1 VOICE COMMAND CATALOG — fixed-vocabulary spoken commands (Track C)
+# ============================================================================
+# Single source of truth for what the robot listens for and what each phrase does.
+# scripts/voice_command_bridge.py and perception/voice/voice_service.py both load this
+# file at startup -- adding a phrasing (or retuning a threshold) is a config edit, no
+# code change, mirroring config/dances.yaml's convention.
+#
+# PIPELINE (see perception/voice/RESEARCH.md for the full bench-spike writeup):
+#   mic -> wake-word spot (openWakeWord, always-on, cheap) -> on a hit, transcribe the
+#   next ~2-3s (whisper.cpp CLI binary) -> fuzzy-match the transcript against the
+#   `phrases` lists below -> ONLY on a match, write /dev/shm/g1_voice_cmd.json
+#   ({cmd, confidence, raw_text, t}). A raw always-on transcript is NEVER written to
+#   shm -- that only ever happens after a wake-word hit AND a phrase match (privacy/
+#   safety requirement).
+#
+# ACTION KINDS (dispatched by scripts/voice_command_bridge.py's VoiceCommandBridge):
+#   stop  -> bypasses the command queue entirely, mirrors the existing WS
+#            mtype=="stop" fast path (zero velocity directly, no cooldown/gating
+#            beyond staleness -- a spoken "stop" must never be rate-limited).
+#   cmd   -> state.pending_cmd = <name>, i.e. EXACTLY what the WS mtype=="cmd"
+#            handler already does in robot_web_controller.py. <name> must be a value
+#            apply_cmd() understands: verified below by reading
+#            scripts/robot_web_controller.py directly (NOT guessed):
+#              - "high_wave"  -> ARM_GESTURES["high_wave"] = (action 26, no
+#                                auto-release) -- the WORKING wave-back gesture.
+#                                (NB: plain "wave" calls client.WaveHand(), which
+#                                gesture_reactor.py's own docstring calls out as a
+#                                DEAD no-op on this G1 -- so voice "wave" maps to
+#                                high_wave, not wave.)
+#              - "high_stand" -> client.HighStand() (tall standing posture) --
+#                                closest existing action to voice "stand".
+#              - "low_stand"  -> client.LowStand() (crouched/lowered posture) --
+#                                closest existing action to voice "sit" (this G1 has
+#                                no literal sit action; low_stand is the nearest
+#                                lowered stance apply_cmd() actually implements).
+#   dance -> fires a catalog dance by fsm_id via the SAME path the dashboard's Dance
+#            chooser uses (fire_whole_body / SetFsmId), gated by require_upright.
+#            fsm_id 503 is config/dances.yaml's "Dance Mode" entry -- the ONE
+#            confirmed-working dance id on this robot (captured 2026-06-23,
+#            verified: true, is_hub: true). Verified by reading dances.yaml, not
+#            assumed.
+#   hook  -> an explicit, NOT-YET-IMPLEMENTED callback seam. voice_command_bridge.py
+#            calls resume_fn()/come_here_fn() (default: a harmless log-only stub) --
+#            a LATER workstream wires these to g1_nav/g1_nav/nodes/patrol_supervisor.py's
+#            control surface. Do not add real robot motion here.
+#
+# requires_person_nearby: gates the command behind a coarse "is anyone in frame and
+# fairly close/centered" heuristic (POSE_TRACKS box size/centrality -- see
+# scripts/voice_command_bridge.py's _person_nearby(), which deliberately mirrors
+# gesture_reactor.py's _target_score()). This is a PLACEHOLDER for real bearing/
+# distance fusion once g1_person_track.json exists (Track A); swap the implementation
+# then, not the config shape.
+#
+# cooldown_s: minimum seconds between two accepted firings of the SAME command (per-
+# command refractory, mirrors ReactorConfig.cooldown_s). "stop" ignores this by design
+# (see `kind: stop` above) -- a repeated "stop" must always work.
+# ----------------------------------------------------------------------------
+
+# Wake word: the phrase that must be heard before ANY command phrase is even looked
+# for. Deliberately NOT a common English word (lower false-accept from background
+# conversation/TV) -- see RESEARCH.md (c) for the full reasoning. UNVALIDATED against
+# real room audio (no mic attached yet) -- bench-test and swap here first if it
+# collides with anything before trusting it.
+wake_word:
+  phrase: "zephro"          # primary candidate: "ZEF-roh", 2 syllables, not a dictionary word
+  backup_phrase: "talvora"  # fallback if "zephro" false-accepts in real-room testing
+  fuzzy_threshold: 0.72     # difflib.SequenceMatcher ratio floor to count as "heard"; see
+                            # voice_service.py's match_wake_word(). Retune once real audio
+                            # false-accept/reject numbers exist.
+
+# Global confidence floor for a COMMAND match (post-wake-word transcript fuzzy match
+# against `phrases` below). Per-command override via `confidence_override`.
+default_confidence: 0.65
+
+# Max age (seconds) of a /dev/shm/g1_voice_cmd.json event before voice_command_bridge.py
+# rejects it as stale (mirrors the staleness gate every other shm consumer in this repo
+# uses, e.g. GreetingService's mtime-freshness check).
+max_event_age_s: 1.8
+
+commands:
+  - name: stop
+    phrases: ["stop", "stop stop", "halt", "freeze"]
+    action: { kind: stop }
+    requires_person_nearby: false
+    cooldown_s: 0.0        # no cooldown -- a repeated "stop" must always take effect
+
+  - name: resume
+    phrases: ["resume", "keep going", "carry on", "continue"]
+    # Placeholder seam only -- Track A's patrol_supervisor.py is not built yet. Wired
+    # to a log-only stub until that workstream lands (see resume_fn in
+    # voice_command_bridge.py).
+    action: { kind: hook, name: resume }
+    requires_person_nearby: false
+    cooldown_s: 3.0
+
+  - name: come_here
+    phrases: ["come here", "come to me", "over here"]
+    # Placeholder seam only -- same status as `resume` above.
+    action: { kind: hook, name: come_here }
+    requires_person_nearby: true   # only honour "come here" if someone is actually there
+    cooldown_s: 5.0
+
+  - name: dance
+    phrases: ["dance", "do a dance", "show me a dance"]
+    action: { kind: dance, fsm_id: 503 }   # config/dances.yaml "Dance Mode" -- verified working
+    requires_person_nearby: false
+    cooldown_s: 10.0        # a whole-body routine takes a while; keep this generous
+
+  - name: wave
+    phrases: ["wave", "wave hello", "say hi", "say hello"]
+    action: { kind: cmd, name: high_wave }   # the WORKING wave-back (see note above)
+    requires_person_nearby: true    # waving at nobody is a little sad; gate it
+    cooldown_s: 4.0                 # matches _ARM_BUSY_S["high_wave"] in robot_web_controller.py
+
+  - name: sit
+    phrases: ["sit", "sit down"]
+    action: { kind: cmd, name: low_stand }   # nearest existing lowered posture (no literal sit)
+    requires_person_nearby: false
+    cooldown_s: 3.0
+
+  - name: stand
+    phrases: ["stand", "stand up"]
+    action: { kind: cmd, name: high_stand }
+    requires_person_nearby: false
+    cooldown_s: 3.0

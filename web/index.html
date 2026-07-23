@@ -48,8 +48,7 @@
   })();
   </script>
   <title>G1 Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=27">
-  <link rel="stylesheet" href="/static/motion.css?v=1">
+  <link rel="stylesheet" href="/static/style.css?v=28">
   <script type="importmap">
   {
     "imports": {
@@ -74,8 +73,8 @@
 
     <nav class="tabs">
       <button class="tab current" data-tab="drive">Drive</button>
-      <button class="tab" data-tab="motion">Motion</button>
       <button class="tab" data-tab="setup">Setup</button>
+      <button class="tab" data-tab="nav">Nav</button>
       <button class="tab" data-tab="info">Logs &amp; Info</button>
     </nav>
 
@@ -156,6 +155,7 @@
         <div class="cam-bar">
           <button id="poseToggle" title="Overlay people skeletons (YOLO11-pose) + hand landmarks (MediaPipe)">Skeleton</button>
           <button id="detectToggle" title="Overlay object detection + segmentation masks (NanoOWL + NanoSAM, open-vocab)">Object Detection</button>
+          <button id="irToggle" title="Switch to the D435i's infrared/stereo node -- wider vertical FOV than RGB, keeps close-standing people in frame">Infrared</button>
         </div>
         <img id="camFeed" src="/camera/stream" alt="camera feed">
         <canvas id="camCanvas"></canvas>
@@ -233,41 +233,6 @@
     </main>
   </div>
 
-  <!-- ========================= MOTION TAB ========================= -->
-  <!-- Record a person on the clean camera feed, then Recreate (Phase 1 = stub replay).
-       Bare <img>, no canvas/overlay. motion.js drives it; the /motion/* routes serve it. -->
-  <div id="tab-motion" class="tab-panel">
-    <section class="windows motion-windows">
-      <div class="media-window">
-        <div class="window-title">Motion camera <span id="motionCamBadge" class="badge">…</span></div>
-        <img id="motionFeed" src="/camera/stream" alt="motion camera feed">
-      </div>
-      <div class="media-window" id="motionResult" hidden>
-        <div class="window-title">Original vs replay</div>
-        <div class="motion-result">
-          <video id="motionOriginal" class="motion-video" controls muted loop playsinline></video>
-          <video id="motionReplay" class="motion-video" controls muted loop playsinline></video>
-        </div>
-      </div>
-    </section>
-    <main class="controls motion-controls">
-      <section class="panel">
-        <h2>Record &amp; Recreate</h2>
-        <button id="motionPrimary" class="motion-primary" data-state="idle" type="button">● Record</button>
-        <div id="motionStepper" class="motion-stepper" hidden>
-          <span class="motion-step" data-step="POSE">Pose</span>
-          <span class="motion-step" data-step="GMR">GMR</span>
-          <span class="motion-step" data-step="SONIC">SONIC</span>
-        </div>
-        <div id="motionHint" class="mode-hint">Take control to record.</div>
-      </section>
-      <section class="panel">
-        <h2>Takes</h2>
-        <div id="motionTakes" class="motion-takes"><span class="people-empty">no takes yet</span></div>
-      </section>
-    </main>
-  </div>
-
   <!-- ========================= SETUP TAB ========================= -->
   <div id="tab-setup" class="tab-panel">
     <main class="setup">
@@ -316,6 +281,35 @@
     </main>
   </div>
 
+  <!-- ========================= NAV TAB ========================= -->
+  <!-- Live top-down view of the autonomous circle-patrol (g1_nav track): robot
+       position/heading, the static 3 m patrol circle, and person markers, driven
+       by the WS "nav_state" message (mounts/updates via web/nav.js). Also carries
+       the Real/Simulation toggle -- sends {type:"nav_mode"} back over the same
+       /ws connection. source:"sim" gets an unmistakable dashed-border + watermark
+       affordance (see .nav-window.sim in style.css) so a sim run can never be
+       mistaken for the live robot. -->
+  <div id="tab-nav" class="tab-panel">
+    <main class="controls">
+      <section class="panel span-all">
+        <h2>Nav — Circle Patrol</h2>
+        <div class="nav-toolbar">
+          <div id="navModeToggle" class="nav-mode-toggle" role="group" aria-label="Real robot or simulation">
+            <button type="button" id="navModeReal" class="nav-mode-btn current" data-nav-mode="real">● Real</button>
+            <button type="button" id="navModeSim" class="nav-mode-btn" data-nav-mode="sim">▶ Simulation</button>
+          </div>
+          <span id="navPhaseChip" class="nav-phase-chip">phase —</span>
+          <span id="navActivityChip" class="nav-activity-chip" hidden></span>
+        </div>
+        <div id="navWindow" class="media-window nav-window">
+          <div class="window-title">Top-down <span id="navBadge" class="badge">…</span></div>
+          <div id="navView" class="lidar-canvas"></div>
+          <div id="navSimWatermark" class="nav-sim-watermark" hidden>SIMULATED — not the real robot</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
   <!-- ====================== LOGS & INFO TAB ====================== -->
   <div id="tab-info" class="tab-panel">
     <main class="diag">
@@ -344,15 +338,15 @@
   <script src="/static/step_mode.js?v=3"></script>
   <script src="/static/drive_mode.js?v=5"></script>
   <script src="/static/dance.js?v=3"></script>
-  <script src="/static/controller.js?v=28"></script>
-  <script src="/static/motion.js?v=1"></script>
-  <script src="/static/camera.js?v=4"></script>
+  <script src="/static/controller.js?v=30"></script>
+  <script src="/static/camera.js?v=5"></script>
   <script src="/static/cam-overlay.js?v=7"></script>
   <script src="/static/hands.js?v=1"></script>
   <script src="/static/pose.js?v=5"></script>
   <script src="/static/detect.js?v=4"></script>
   <script type="module" src="/static/lidar.js?v=14"></script>
-  <script type="module" src="/static/obstacle3d.js?v=12"></script>
+  <script type="module" src="/static/obstacle3d.js?v=15"></script>
+  <script type="module" src="/static/nav.js?v=1"></script>
   <script src="/static/feedview.js?v=2"></script>
 </body>
 </html>
