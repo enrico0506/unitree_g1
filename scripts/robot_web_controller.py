@@ -81,21 +81,10 @@ from depth_nearfield import DepthNearField   # D435i near-ground depth fusion (d
 
 OBSTACLE_CFG_PATH = BASE_DIR / "obstacle" / "obstacle.yaml"
 
-# Which backend feeds the ObstacleGuard. Both write /dev/shm/g1_obstacle.json with
-# the same contract, so the guard/UI/voice/overlay are reused unchanged -- only the
-# spawned process differs. Selected by obstacle.yaml's 'source' key:
-#   lidar       -> obstacle/run_obstacle.sh     (raw-LiDAR obstacle node)
-#   nav2costmap -> g1_nav/teleop_guard.sh       (Nav2 local-costmap teleop guard)
-# Default to 'lidar' so a missing/unknown key keeps the existing behaviour.
-try:
-    with open(OBSTACLE_CFG_PATH) as _f:
-        OBSTACLE_SOURCE = (yaml.safe_load(_f) or {}).get("source", "lidar")
-except FileNotFoundError:
-    OBSTACLE_SOURCE = "lidar"
-if OBSTACLE_SOURCE == "nav2costmap":
-    OBSTACLE_RUN_CMD = BASE_DIR / "g1_nav" / "teleop_guard.sh"
-else:
-    OBSTACLE_RUN_CMD = BASE_DIR / "obstacle" / "run_obstacle.sh"
+# Backend feeding the ObstacleGuard: obstacle/run_obstacle.sh (raw-LiDAR obstacle
+# node), which writes /dev/shm/g1_obstacle.json for the guard/UI/voice/overlay.
+OBSTACLE_SOURCE = "lidar"
+OBSTACLE_RUN_CMD = BASE_DIR / "obstacle" / "run_obstacle.sh"
 print(f"Obstacle source: {OBSTACLE_SOURCE} -> {OBSTACLE_RUN_CMD}", flush=True)
 CAMERA_SHM = "/dev/shm/g1_camera.jpg"   # frames written here by camera_service.py
 CAMERA_IR_SHM = "/dev/shm/g1_camera_ir.jpg"   # frames written here by ir_service.py

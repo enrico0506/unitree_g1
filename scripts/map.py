@@ -8,7 +8,7 @@ Subscribes to rt/wirelesscontroller and prints whenever ANY input changes
     discover the true mapping
 
 USAGE
-    python3 scripts/remote_mapper.py
+    python3 scripts/map.py
 
 Workflow:
     1. Run this script.

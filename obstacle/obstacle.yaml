@@ -6,7 +6,7 @@
 # Distances are metres, angles degrees, rates rad/s or m/s as noted.
 
 # --- obstacle source (which backend writes /dev/shm/g1_obstacle.json) -------
-source: lidar   # lidar = obstacle/ raw-LiDAR node (run_obstacle.sh); nav2costmap = g1_nav costmap teleop-guard (g1_nav/teleop_guard.sh)
+source: lidar   # obstacle/ raw-LiDAR node (run_obstacle.sh)
 
 # --- LiDAR input -----------------------------------------------------------
 topic: /livox/lidar          # Livox Mid-360 topic. Our driver runs xfer_format=1 (CustomMsg) --

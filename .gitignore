@@ -34,12 +34,5 @@ perception/**/*_test*.jpg
 # runtime UI settings (suppress_autoclimb etc.)
 state/
 
-# --- Sim (Track B): isolated venv + vendored mujoco G1 model ---
-# g1.xml/g1_with_hands.xml + meshes are ~38 MB, fetched from
-# google-deepmind/mujoco_menagerie (BSD-3-Clause) by sim/fetch_model.sh -- not
-# source, re-download rather than bloat repo git history. See sim/models/README.md.
-sim/.venv/
-sim/models/g1/
-
 # --- Runtime debug cruft ---
 MUJOCO_LOG.TXT
