@@ -12,12 +12,11 @@ from pathlib import Path
 THIS_DIR = Path(__file__).resolve().parent
 FOURD_ROOT = THIS_DIR / "4D-Humans"
 INPUT_VIDEOS_DIR = THIS_DIR / "input_videos"
-VIDEO_TO_RESULTS_DIR = THIS_DIR / "video_to_results"
-RESULTS_TO_SONIC_DIR = THIS_DIR / "results_to_sonic"
+VIDEO_TO_POSE_DIR = THIS_DIR / "video_to_pose"
+POSE_TO_GMR_DIR = THIS_DIR / "pose_to_gmr"
 
-EXPORT_SCRIPT = VIDEO_TO_RESULTS_DIR / "export_primary_subject_sequence.py"
-CONVERT_SCRIPT = RESULTS_TO_SONIC_DIR / "convert_sequence_to_sonic.py"
-VALIDATE_SCRIPT = RESULTS_TO_SONIC_DIR / "validate_sonic_sequence.py"
+EXPORT_SCRIPT = VIDEO_TO_POSE_DIR / "export_primary_subject_sequence.py"
+ADAPT_SCRIPT = POSE_TO_GMR_DIR / "adapt_smpl_to_gmr_smplx.py"
 DEMO_SCRIPT = FOURD_ROOT / "demo.py"
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -25,7 +24,7 @@ SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="End-to-end video_to_sonic pipeline: video -> frames -> 4D-Humans -> SONIC."
+        description="End-to-end video_to_motion pipeline: video -> frames -> 4D-Humans -> GMR-ready SMPL-X."
     )
     parser.add_argument(
         "--video",
@@ -33,7 +32,7 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Source video path. If omitted, the script auto-picks the only video found in "
-            "video_to_sonic/input_videos/."
+            "video_to_motion/input_videos/."
         ),
     )
     parser.add_argument(
@@ -94,12 +93,25 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="When --render-demo is enabled, skip the full-frame overlay render.",
     )
+    parser.add_argument(
+        "--gmr_smoothing_window",
+        type=int,
+        default=15,
+        help="Passed through to the SMPL->SMPL-X adapter's --smoothing_window (see its own help for why 15).",
+    )
+    parser.add_argument(
+        "--gmr_gender",
+        type=str,
+        default="neutral",
+        choices=["male", "female", "neutral"],
+        help="Passed through to the adapter's --gender.",
+    )
     return parser.parse_args()
 
 
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
-    return slug or "video_to_sonic_run"
+    return slug or "video_to_motion_run"
 
 
 def _find_candidate_videos() -> list[Path]:
@@ -129,7 +141,7 @@ def _resolve_video(video_arg: str) -> Path:
         return candidates[0].resolve()
     if not candidates:
         raise FileNotFoundError(
-            "No source video found. Put one file in video_to_sonic/input_videos/ "
+            "No source video found. Put one file in video_to_motion/input_videos/ "
             "or pass --video explicitly."
         )
     available = "\n".join(f"- {path.name}" for path in candidates)
@@ -172,24 +184,22 @@ def main() -> None:
     source_video = _resolve_video(args.video)
     run_name = _slugify(args.name) if args.name else _slugify(source_video.stem)
 
-    frame_dir = VIDEO_TO_RESULTS_DIR / "inputs" / f"{run_name}_frames"
-    export_npz = VIDEO_TO_RESULTS_DIR / "exports" / f"{run_name}.npz"
-    demo_out_dir = VIDEO_TO_RESULTS_DIR / "outputs" / f"{run_name}_demo"
-    sonic_npz = RESULTS_TO_SONIC_DIR / "sonic_ready" / f"{run_name}_sonic.npz"
-    packed_message = RESULTS_TO_SONIC_DIR / "packed_messages" / f"{run_name}_pose_v3.bin"
+    frame_dir = VIDEO_TO_POSE_DIR / "inputs" / f"{run_name}_frames"
+    export_npz = VIDEO_TO_POSE_DIR / "exports" / f"{run_name}.npz"
+    demo_out_dir = VIDEO_TO_POSE_DIR / "outputs" / f"{run_name}_demo"
+    smplx_npz = POSE_TO_GMR_DIR / "gmr_ready" / f"{run_name}_smplx.npz"
 
     for path in (
         INPUT_VIDEOS_DIR,
-        VIDEO_TO_RESULTS_DIR / "inputs",
-        VIDEO_TO_RESULTS_DIR / "exports",
-        VIDEO_TO_RESULTS_DIR / "outputs",
-        RESULTS_TO_SONIC_DIR / "sonic_ready",
-        RESULTS_TO_SONIC_DIR / "packed_messages",
+        VIDEO_TO_POSE_DIR / "inputs",
+        VIDEO_TO_POSE_DIR / "exports",
+        VIDEO_TO_POSE_DIR / "outputs",
+        POSE_TO_GMR_DIR / "gmr_ready",
         FOURD_ROOT / ".local_home" / ".config" / "matplotlib",
     ):
         path.mkdir(parents=True, exist_ok=True)
 
-    for generated_path in (frame_dir, export_npz, demo_out_dir, sonic_npz, packed_message):
+    for generated_path in (frame_dir, export_npz, demo_out_dir, smplx_npz):
         _clean_path(generated_path)
     frame_dir.mkdir(parents=True, exist_ok=True)
 
@@ -271,23 +281,17 @@ def main() -> None:
         [
             sys.executable,
             "-u",
-            str(CONVERT_SCRIPT),
+            str(ADAPT_SCRIPT),
             "--input_npz",
             str(export_npz.resolve()),
             "--output_npz",
-            str(sonic_npz.resolve()),
-            "--packed_output",
-            str(packed_message.resolve()),
-        ]
-    )
-
-    _run(
-        [
-            sys.executable,
-            "-u",
-            str(VALIDATE_SCRIPT),
-            "--input_npz",
-            str(sonic_npz.resolve()),
+            str(smplx_npz.resolve()),
+            "--fps",
+            str(args.fps),
+            "--gender",
+            args.gmr_gender,
+            "--smoothing_window",
+            str(args.gmr_smoothing_window),
         ]
     )
 
@@ -296,8 +300,13 @@ def main() -> None:
     print(f"- stage1_export: {export_npz}", flush=True)
     if args.render_demo:
         print(f"- rendered_comparisons: {demo_out_dir}", flush=True)
-    print(f"- sonic_npz: {sonic_npz}", flush=True)
-    print(f"- packed_message: {packed_message}", flush=True)
+    print(f"- gmr_ready_smplx: {smplx_npz}", flush=True)
+    print(
+        "\nNext step (not run automatically): retarget onto G1 with GMR, e.g.\n"
+        f"  cd ../twist_deploy/GMR && python3 scripts/smplx_to_robot.py "
+        f"--smplx_file {smplx_npz.resolve()} --robot unitree_g1 --save_path <out>.pkl",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
