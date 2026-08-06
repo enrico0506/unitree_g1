@@ -1,0 +1,19 @@
+# How to visualise: gymnasts
+
+Live interactive MuJoCo window, name-based lookup:
+
+```bash
+python motion/motion_library/view.py gymnasts
+```
+
+Or point directly at the npz (works from any script, not just this helper):
+
+```bash
+python motion/motion_builder/combined/walk_and_wave/scripts/view_npz.py motion/motion_library/single/gymnasts/gymnasts_holomotion.npz
+```
+
+List every motion available in the library:
+
+```bash
+python motion/motion_library/view.py --list
+```

@@ -36,3 +36,4 @@ state/
 
 # --- Runtime debug cruft ---
 MUJOCO_LOG.TXT
+.local_home/
