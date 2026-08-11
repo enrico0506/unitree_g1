@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Run a motion_library clip through HoloMotion's MuJoCo sim2sim eval.
 
-Runs *inside* the holomotion_sim2sim container (see ../../run_sim2sim.sh for
-the host-side entrypoint that starts the container and calls this). Looks a
-motion up by name in the mounted motion_library (/workspace/motions), then
-drives holomotion/src/evaluation/eval_mujoco_sim2sim.py against the shared
-v1.4 general motion-tracking policy (/workspace/ckpt/exported/model_14000.onnx)
-so any clip in the library can be checked without a per-motion training run.
+Runs *inside* the holomotion_sim2sim container (see run_holomotion.sh, the
+host-side entrypoint that starts the container and calls this -- that's the
+one you actually want to run). Looks a motion up by name in the mounted
+motion_library (/workspace/motions), then drives
+holomotion/src/evaluation/eval_mujoco_sim2sim.py against the shared v1.4
+general motion-tracking policy (/workspace/ckpt/exported/model_14000.onnx) so
+any clip in the library can be checked without a per-motion training run.
 
 Output lands at /workspace/ckpt/exported/mujoco_output_<onnx_stem>/, which on
 the host is motion/holomotion_ckpt/exported/mujoco_output_<onnx_stem>/ --
 <motion>_holomotion.mp4 (rendered rollout) + <motion>_holomotion_robot.npz
 (actual robot trajectory, for replay_from_front.py or ref-vs-actual analysis).
 
-Usage (inside the container):
-    python scripts/sim2sim.py wave_v2
-    python scripts/sim2sim.py cartwheel --gui           # interactive viewer, needs a display
-    python scripts/sim2sim.py walk_circle --onnx /workspace/ckpt/exported/model_14000.onnx
-    python scripts/sim2sim.py --list
+Usage (inside the container, or just use ./run_holomotion.sh from the host):
+    python sim2sim.py wave_v2
+    python sim2sim.py cartwheel --gui           # interactive viewer, needs a display
+    python sim2sim.py walk_circle --onnx /workspace/ckpt/exported/model_14000.onnx
+    python sim2sim.py --list
 """
 
 from __future__ import annotations
