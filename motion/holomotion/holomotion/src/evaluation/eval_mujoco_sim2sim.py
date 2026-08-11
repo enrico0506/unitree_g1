@@ -17,6 +17,7 @@
 
 import os
 import csv
+import json
 import shutil
 import sys
 import threading
@@ -24,6 +25,9 @@ import time
 from collections import deque
 from pathlib import Path
 from threading import Thread
+
+from scipy.spatial.transform import Rotation as ScipyRotation
+from scipy.spatial.transform import Slerp as ScipySlerp
 
 import cv2
 import hydra
@@ -49,6 +53,31 @@ except ImportError:
     logger.warning("HB_ONNXRuntime not available!")
 
 ONNX_IO_DUMP_DIRNAME = "onnx_io_npy"
+
+# --- motion/sim live-view hook (not upstream HoloMotion) -------------------
+# Optional side-channel: drop the latest rendered frame as a JPEG so
+# motion/sim/live_view_server.py can serve it as an MJPEG stream to a
+# browser. No-op unless LIVE_STREAM_FRAME_PATH is set (motion/sim/sim2sim.py
+# sets it for headless runs) -- doesn't touch record_video/dump_npzs/the mp4
+# output or any other behavior. Added 2026-08-11: indirect GLX over X11
+# forwarding can't clear MuJoCo's OpenGL version floor on this hardware, so
+# this is the practical way to watch a run happen live instead.
+_LIVE_STREAM_FRAME_PATH = os.environ.get("LIVE_STREAM_FRAME_PATH")
+
+
+def _live_stream_write_frame(frame_bgr) -> None:
+    if not _LIVE_STREAM_FRAME_PATH:
+        return
+    ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return
+    tmp_path = _LIVE_STREAM_FRAME_PATH + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(buf.tobytes())
+    os.replace(tmp_path, _LIVE_STREAM_FRAME_PATH)
+
+
+# --- end motion/sim live-view hook ------------------------------------------
 
 try:
     import pynput.keyboard as pynput_kb
@@ -1828,6 +1857,93 @@ class MujocoEvaluator:
             f"Loaded motion data with {self.n_motion_frames} frames and {self.ref_dof_pos.shape[1]} DOFs"
         )
 
+        self._resample_motion_data_to_policy_rate(motion_npz_path)
+
+    def _resample_motion_data_to_policy_rate(self, motion_npz_path):
+        """--- motion/sim fps-mismatch fix (not upstream HoloMotion) ---
+
+        The eval steps exactly one npz frame per policy step (self.policy_dt,
+        default 1/50s) -- correct ONLY if the clip was authored at that same
+        rate. HoloMotion's own retargeting pipeline targets 50fps
+        (config/motion_retargeting/gmr_to_holomotion.yaml: target_fps: 50),
+        but every clip in this repo's motion_library is authored at 30fps
+        (Kimodo generation + motion_builder's own convention) and carries
+        that in its npz `metadata` JSON -- which this eval never read.
+        Without this, a 30fps clip plays back 1.67x too fast (50/30), and
+        the reference races through its frames faster than real dynamics
+        can track. Root cause of a systematic ~60-65% distance undershoot,
+        confirmed 2026-08-11 across every locomotion clip in the library
+        (walk_circle, walk_wave, walk_to_point_test) via 4 independent
+        investigations that converged on this + matched the predicted
+        30/50=60% ratio against the measured 63% within 5%.
+
+        Resamples every ref_* array from its authored fps to the eval's
+        actual consumption rate (1/policy_dt) via linear interpolation
+        (slerp for quaternions) so `motion_frame_idx += 1` per policy step
+        is correct again. No-op if metadata/motion_fps is absent (older/
+        external clips authored at the eval's native rate already) or
+        already matches -- so this doesn't touch behavior for any
+        correctly-authored-at-50fps clip."""
+        try:
+            with np.load(motion_npz_path, allow_pickle=True) as npz:
+                if "metadata" not in npz:
+                    return
+                meta = json.loads(str(npz["metadata"]))
+        except Exception as e:
+            logger.warning(
+                f"Could not read motion npz metadata for fps check: {e}"
+            )
+            return
+
+        source_fps = meta.get("motion_fps")
+        if source_fps is None:
+            return
+        target_fps = 1.0 / self.policy_dt
+        if abs(source_fps - target_fps) < 1e-3:
+            return  # already authored at the eval's native rate
+
+        n_src = self.n_motion_frames
+        duration = (n_src - 1) / source_fps
+        n_dst = max(2, int(round(duration * target_fps)) + 1)
+        t_src = np.arange(n_src) / source_fps
+        t_dst = np.linspace(0.0, duration, n_dst)
+
+        def lerp(arr):
+            if arr is None:
+                return None
+            flat = arr.reshape(n_src, -1)
+            out = np.empty((n_dst, flat.shape[1]), dtype=np.float32)
+            for c in range(flat.shape[1]):
+                out[:, c] = np.interp(t_dst, t_src, flat[:, c])
+            return out.reshape((n_dst,) + arr.shape[1:]).astype(np.float32)
+
+        def slerp_quat_xyzw(arr):
+            if arr is None:
+                return None
+            n_bodies = arr.shape[1]
+            out = np.empty((n_dst, n_bodies, 4), dtype=np.float32)
+            for b in range(n_bodies):
+                rots = ScipyRotation.from_quat(arr[:, b, :])
+                slerp = ScipySlerp(t_src, rots)
+                out[:, b, :] = slerp(t_dst).as_quat().astype(np.float32)
+            return out
+
+        self.ref_dof_pos = lerp(self.ref_dof_pos)
+        self.ref_dof_vel = lerp(self.ref_dof_vel)
+        self.ref_global_translation = lerp(self.ref_global_translation)
+        self.ref_global_velocity = lerp(self.ref_global_velocity)
+        self.ref_global_angular_velocity = lerp(
+            self.ref_global_angular_velocity
+        )
+        self.ref_global_rotation_quat_xyzw = slerp_quat_xyzw(
+            self.ref_global_rotation_quat_xyzw
+        )
+        self.n_motion_frames = n_dst
+        logger.info(
+            f"Resampled motion data from {source_fps:.1f}fps ({n_src} frames) "
+            f"to {target_fps:.1f}fps ({n_dst} frames) to match policy_dt"
+        )
+
     def load_mujoco_model(self):
         """Load the MuJoCo model."""
         xml_path = self.config.get("robot_xml_path", None)
@@ -2096,6 +2212,7 @@ class MujocoEvaluator:
             # Convert RGB (MuJoCo) -> BGR (OpenCV) before writing
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             self._video_writer.write(frame_bgr)
+            _live_stream_write_frame(frame_bgr)
             self._last_frame_time = now
 
     def _apply_control(self, sleep: bool):

@@ -76,6 +76,10 @@ clips have different frame counts). `combined/walk_wave/README.md` and
 
 - Look at it: `python motion/motion_library/view.py <name>` (see each motion's own
   `HOW_TO_VISUALISE.md`).
+- Sim2sim it: `./motion/sim/run_holomotion.sh <name>` runs it through HoloMotion's
+  real MuJoCo sim2sim eval against the shared general-purpose tracking policy —
+  no training needed, works for any clip in the library out of the box. See
+  `motion/sim/README.md`.
 - Train on it: point `train_hdf5_roots` in a
   `motion/holomotion/config/training/motion_tracking/*.yaml` at it and run
   `motion/holomotion/scripts/training/train_motion_tracking.sh` — see
