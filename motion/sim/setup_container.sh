@@ -16,12 +16,21 @@
 # Either way, the final container is recreated with all bind mounts fresh,
 # so a stale mount (e.g. after a motion_library reorg) always self-heals too.
 #
-# Also mounts /tmp/.X11-unix and ~/.Xauthority (as /root/.ssh-xauth +
-# XAUTHORITY env -- the base image ships /root/.Xauthority as a directory
-# already, which blocks a plain file bind mount there) so --gui (the real
-# interactive MuJoCo/GLFW window, X11-forwarded to your machine over
-# `ssh -X`) has something to attach to -- see run_holomotion.sh's --gui path
-# and motion/sim/README.md's X11 forwarding section.
+# Also: --network host, plus mounts of /tmp/.X11-unix and ~/.Xauthority (as
+# /root/.ssh-xauth + XAUTHORITY env -- the base image ships /root/.Xauthority
+# as a directory already, which blocks a plain file bind mount there), for
+# --gui (the real interactive MuJoCo/GLFW window, X11-forwarded to your
+# machine over `ssh -X`) -- see run_holomotion.sh's --gui path and
+# motion/sim/README.md's X11 forwarding section.
+#
+# --network host specifically: this sshd's X11 forwarding only creates a TCP
+# listener on 127.0.0.1:<6000+display> (X11UseLocalhost yes, the default) --
+# no /tmp/.X11-unix socket ever gets created despite that mount. On the
+# container's own (bridge) network, "localhost" in DISPLAY=localhost:10.0
+# means the CONTAINER's loopback, not the host's, so the connection goes
+# nowhere. --network host makes them the same loopback. Confirmed needed
+# 2026-08-11: GLFW errored "X11: Failed to open display localhost:10.0"
+# without this even with DISPLAY/XAUTHORITY correctly forwarded in.
 
 set -euo pipefail
 
@@ -58,6 +67,7 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" \
     --runtime nvidia \
     --restart unless-stopped \
+    --network host \
     --entrypoint sleep \
     -e ACCEPT_EULA=Y \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
