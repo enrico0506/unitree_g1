@@ -128,6 +128,18 @@ def main() -> None:
         # DISPLAY/XAUTHORITY forwarded in from the host (run_holomotion.sh
         # does this) and an X server on your end of the SSH connection.
         env.setdefault("MUJOCO_GL", "glfw")
+        # This image's NVIDIA driver has a proper EGL vendor registration
+        # (glvnd/egl_vendor.d) but NOT a GLX one -- and GLX vendor
+        # auto-negotiation is server-side anyway, which doesn't apply when
+        # the X server on the other end (your laptop's) isn't NVIDIA's.
+        # Force GLX through Mesa's software/indirect path explicitly instead
+        # of letting GLVND try NVIDIA's driver against a foreign X server,
+        # which crashes silently at context creation. Confirmed needed
+        # 2026-08-11 -- direct GLFW/GLX over X11 forwarding died with no
+        # traceback (just a bare nonzero exit) without this.
+        env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+        env.setdefault("LIBGL_ALWAYS_INDIRECT", "1")
+        env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
     env.setdefault("HYDRA_FULL_ERROR", "1")
     # The holomotion package (holomotion/src/...) isn't pip-installed in this
     # deploy image -- no editable install was ever run here. Put the repo

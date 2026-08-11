@@ -27,7 +27,11 @@ while true; do
             echo "Bye."
             exit 0
         elif [[ -n "$choice" ]]; then
-            "$HERE/run_holomotion.sh" "$choice" --gui || echo "(that run failed -- see errors above)"
+            "$HERE/run_holomotion.sh" "$choice" --gui
+            rc=$?
+            if [[ $rc -ne 0 ]]; then
+                echo "(that run failed -- exit code $rc, see errors above)"
+            fi
             break
         else
             echo "Invalid selection ($REPLY), try again."
