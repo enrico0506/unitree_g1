@@ -116,11 +116,18 @@ def main() -> None:
     ]
 
     env = dict(os.environ)
-    # osmesa (the vendored eval_mujoco_sim2sim.sh's headless default) needs
-    # libOSMesa, which isn't installed in this container and pulls in a heavy
-    # apt dependency to add. EGL renders headless straight through the Tegra
-    # GPU and just works here (confirmed 2026-08-11) -- use it for both modes.
-    env.setdefault("MUJOCO_GL", "egl")
+    if headless:
+        # osmesa (the vendored eval_mujoco_sim2sim.sh's headless default)
+        # needs libOSMesa, which isn't installed in this container and pulls
+        # in a heavy apt dependency to add. EGL renders headless straight
+        # through the Tegra GPU and just works here (confirmed 2026-08-11).
+        env.setdefault("MUJOCO_GL", "egl")
+    else:
+        # --gui opens a real GLFW/GLX window (mujoco.viewer.launch_passive)
+        # -- EGL is an offscreen-only context and can't back a window. Needs
+        # DISPLAY/XAUTHORITY forwarded in from the host (run_holomotion.sh
+        # does this) and an X server on your end of the SSH connection.
+        env.setdefault("MUJOCO_GL", "glfw")
     env.setdefault("HYDRA_FULL_ERROR", "1")
     # The holomotion package (holomotion/src/...) isn't pip-installed in this
     # deploy image -- no editable install was ever run here. Put the repo

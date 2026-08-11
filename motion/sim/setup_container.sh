@@ -13,8 +13,15 @@
 #      commit the result as `holomotion-sim2sim-provisioned` so this never
 #      has to happen again on this machine.
 #
-# Either way, the final container is recreated with all 4 bind mounts fresh,
+# Either way, the final container is recreated with all bind mounts fresh,
 # so a stale mount (e.g. after a motion_library reorg) always self-heals too.
+#
+# Also mounts /tmp/.X11-unix and ~/.Xauthority (as /root/.ssh-xauth +
+# XAUTHORITY env -- the base image ships /root/.Xauthority as a directory
+# already, which blocks a plain file bind mount there) so --gui (the real
+# interactive MuJoCo/GLFW window, X11-forwarded to your machine over
+# `ssh -X`) has something to attach to -- see run_holomotion.sh's --gui path
+# and motion/sim/README.md's X11 forwarding section.
 
 set -euo pipefail
 
@@ -61,6 +68,9 @@ docker run -d --name "$CONTAINER" \
     -v "$MOTION_ROOT/holomotion_ckpt:/workspace/ckpt" \
     -v "$MOTION_ROOT/motion_library:/workspace/motions" \
     -v "$MOTION_ROOT/sim:/workspace/sim" \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v "$HOME/.Xauthority:/root/.ssh-xauth:ro" \
+    -e XAUTHORITY=/root/.ssh-xauth \
     "$RUN_IMAGE" \
     infinity >/dev/null
 

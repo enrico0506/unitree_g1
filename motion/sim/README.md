@@ -25,6 +25,45 @@ docker stop g1-detect g1-pose g1-hands
 docker start g1-detect g1-pose g1-hands
 ```
 
+## Watching it live: `--gui`
+
+`./motion/sim/run_holomotion.sh <name> --gui` opens the real interactive
+MuJoCo window (`mujoco.viewer.launch_passive`) instead of writing a video —
+X11-forwarded from the container, through the Jetson, to your laptop.
+
+This needs an actual X11-forwarded SSH connection, which **VS Code's
+Remote-SSH tunnel does not provide** (it doesn't carry X11). Use a plain
+terminal instead:
+
+1. **Get an X server running on your laptop** (skip if Linux — you already
+   have one):
+   - macOS: install & launch [XQuartz](https://www.xquartz.org/)
+   - Windows: install & launch [VcXsrv](https://sourceforge.net/projects/vcxsrv/) (or Xming/X410)
+2. **Open a plain terminal** (not VS Code's) and connect with X11 forwarding:
+   ```bash
+   ssh -X unitree@192.168.123.164
+   ```
+3. **Sanity-check forwarding works before touching MuJoCo** — a window
+   should pop up on your laptop within a couple seconds:
+   ```bash
+   xclock
+   ```
+   If nothing appears: the X server on your laptop isn't running, or `-X`
+   didn't take (try `-Y` for trusted forwarding, some setups need it). This
+   is entirely laptop-side — the Jetson's sshd already has `X11Forwarding
+   yes` and `xauth` installed, so if `xclock` fails, the problem isn't here.
+4. **Run it**, from that same terminal:
+   ```bash
+   cd ~/projects/g1
+   ./motion/sim/run_holomotion.sh wave_v2 --gui
+   ```
+
+Expect it to feel laggy — GLX rendering over a forwarded X11 connection
+sends every draw command over the SSH link, unlike the default headless
+path (which renders locally via EGL and only ships out a finished video).
+Fine for eyeballing whether a motion tracks or falls; not fine for judging
+smoothness.
+
 ## How it's wired
 
 `run_holomotion.sh` (host) starts/creates the `holomotion_sim2sim` docker

@@ -4,7 +4,12 @@
 #
 # Usage:
 #   ./motion/sim/run_holomotion.sh wave_v2
-#   ./motion/sim/run_holomotion.sh cartwheel --gui
+#   ./motion/sim/run_holomotion.sh cartwheel --gui   # real interactive MuJoCo window,
+#                                                     # X11-forwarded to wherever you're
+#                                                     # ssh'd in from -- see README.md.
+#                                                     # Run this from a plain `ssh -X`
+#                                                     # terminal, not a VS Code Remote-SSH
+#                                                     # one (that tunnel doesn't carry X11).
 #   ./motion/sim/run_holomotion.sh --list
 #
 # Output (video + robot-trajectory npz) lands in
@@ -39,6 +44,6 @@ if [[ "$status" != "running" ]]; then
     docker start "$CONTAINER" >/dev/null
 fi
 
-exec docker exec -i "$CONTAINER" \
+exec docker exec -i -e DISPLAY="${DISPLAY:-}" "$CONTAINER" \
     /root/miniconda3/envs/holomotion_deploy/bin/python \
     /workspace/sim/sim2sim.py "$@"
