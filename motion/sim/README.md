@@ -6,9 +6,9 @@ against the shared general-purpose tracking policy, so you get a video +
 trajectory dump without training anything per-motion.
 
 ```bash
-./motion/sim/run_holomotion.sh wave_v2          # run it
+./motion/sim/run_holomotion.sh wave_v2          # run it -- watch live in your browser (see below)
 ./motion/sim/run_holomotion.sh --list           # see what's in motion_library
-./motion/sim/run_holomotion.sh cartwheel --gui  # interactive viewer instead of headless+video
+./motion/sim/app.sh                             # the "app": pick a motion from a menu, repeat
 ```
 
 Output lands in `motion/holomotion_ckpt/exported/mujoco_output_model_14000/`
@@ -25,58 +25,52 @@ docker stop g1-detect g1-pose g1-hands
 docker start g1-detect g1-pose g1-hands
 ```
 
-## Watching it live: `--gui`
+## Watching it live: your browser (recommended)
 
-`./motion/sim/run_holomotion.sh <name> --gui` opens the real interactive
-MuJoCo window (`mujoco.viewer.launch_passive`) instead of writing a video —
-X11-forwarded from the container, through the Jetson, to your laptop.
+Every headless run streams its frames live. `run_holomotion.sh` prints a URL
+the moment it starts:
 
-This needs an actual X11-forwarded SSH connection, which **VS Code's
-Remote-SSH tunnel does not provide** (it doesn't carry X11). Use a plain
-terminal instead:
-
-1. **Get an X server running on your laptop** (skip if Linux — you already
-   have one):
-   - macOS: install & launch [XQuartz](https://www.xquartz.org/)
-   - Windows: install & launch [VcXsrv](https://sourceforge.net/projects/vcxsrv/) (or Xming/X410)
-2. **Open a plain terminal** (not VS Code's) and connect with X11 forwarding:
-   ```bash
-   ssh -X unitree@192.168.123.164
-   ```
-3. **Sanity-check forwarding works before touching MuJoCo** — a window
-   should pop up on your laptop within a couple seconds:
-   ```bash
-   xclock
-   ```
-   If nothing appears: the X server on your laptop isn't running, or `-X`
-   didn't take (try `-Y` for trusted forwarding, some setups need it). This
-   is entirely laptop-side — the Jetson's sshd already has `X11Forwarding
-   yes` and `xauth` installed, so if `xclock` fails, the problem isn't here.
-4. **Run it**, from that same terminal:
-   ```bash
-   cd ~/projects/g1
-   ./motion/sim/run_holomotion.sh wave_v2 --gui
-   ```
-
-Expect it to feel laggy — GLX rendering over a forwarded X11 connection
-sends every draw command over the SSH link, unlike the default headless
-path (which renders locally via EGL and only ships out a finished video).
-Fine for eyeballing whether a motion tracks or falls; not fine for judging
-smoothness.
-
-### The "app": `app.sh`
-
-`./motion/sim/app.sh` is a picker that stays open — run it once, pick a
-motion from the numbered menu, watch it live, land back on the menu for the
-next one. No retyping `run_holomotion.sh <name> --gui` each time:
-
-```bash
-cd ~/projects/g1
-./motion/sim/app.sh
+```
+Live view: http://192.168.123.164:8098/  (open this in your browser now)
 ```
 
-Same X11 setup as above applies (this is just `run_holomotion.sh ... --gui`
-under a menu loop).
+Open that on your laptop (any browser, no X server or SSH juggling needed)
+and leave the tab open — it shows whatever's currently playing, and just
+sits idle on the last frame between runs. `app.sh` does this automatically
+too, once, the first time you run it in a session.
+
+This works over an ordinary SSH connection, VS Code Remote-SSH included —
+no X11 forwarding involved. Frames come from the same EGL-rendered path the
+headless mp4 output already uses, just also dropped live as a JPEG
+(`motion/sim/live/frame.jpg`) that `live_view_server.py` serves as an MJPEG
+stream. `run_holomotion.sh` starts that server automatically if it isn't
+already running.
+
+## `--gui`: the real interactive MuJoCo window (usually not worth it)
+
+`./motion/sim/run_holomotion.sh <name> --gui` X11-forwards the actual
+`mujoco.viewer.launch_passive` window instead. It's wired up and the plumbing
+works (DISPLAY/XAUTHORITY forwarding, host networking so the container can
+reach your session's X proxy) — but on this hardware it hits a real ceiling:
+this image's NVIDIA driver has no GLX vendor registration and indirect GLX
+(the classic X11-forwarded 3D protocol) is capped at an ancient OpenGL
+version, so MuJoCo's renderer refuses the context (`OpenGL version 1.5 or
+higher required`) even once the X11 plumbing itself is correct. Confirmed
+2026-08-11 — not a config issue, a protocol-level ceiling.
+
+If you want to chase this further, [VirtualGL](https://virtualgl.org/) is
+the real fix (renders locally on the actual GPU, ships finished frames
+instead of GL commands, sidesteps indirect GLX entirely) — more setup, and
+Tegra/Jetson GPUs aren't its most common target. The browser view above
+gets you "watch it happen live" today without any of that.
+
+If you still want to try `--gui`: get an X server running on your laptop
+(macOS: [XQuartz](https://www.xquartz.org/); Windows: [MobaXterm](https://mobaxterm.mobatek.net/)
+portable edition works well and needs no admin rights, or
+[VcXsrv](https://sourceforge.net/projects/vcxsrv/); Linux: already have one),
+connect with `ssh -X unitree@192.168.123.164` (a plain terminal — **VS
+Code's Remote-SSH tunnel doesn't carry X11**), sanity-check with `xclock`
+first, then `./motion/sim/run_holomotion.sh <name> --gui`.
 
 ## How it's wired
 
@@ -85,7 +79,9 @@ container and execs `sim2sim.py` (container-side) inside it. That container
 bind-mounts `motion/holomotion`, `motion/holomotion_ckpt`, `motion/motion_library`,
 and this `motion/sim` folder itself — so any motion you drop into
 `motion_library/single/` or `combined/` is automatically pickable by name,
-no extra wiring needed.
+no extra wiring needed. It also runs on the host's network namespace
+(`--network host`), needed for `--gui`'s X11 forwarding to reach your SSH
+session's X proxy.
 
 If the container doesn't exist (fresh machine, or it got removed),
 `run_holomotion.sh` bootstraps it automatically via `setup_container.sh` —
@@ -93,3 +89,11 @@ no manual `docker run` needed. `setup_container.sh` reuses a local
 `holomotion-sim2sim-provisioned` image if one exists (has the extra pip deps
 the upstream deploy image doesn't ship — mujoco, hydra, ray, pandas,
 tabulate, tqdm), or builds+saves one from scratch if not.
+
+`live_view_server.py` runs on the host (not in the container) — it just
+tails `motion/sim/live/frame.jpg`, which the container writes straight to
+via the `motion/sim` bind mount, and re-serves it as MJPEG. The write hook
+itself is a small, guarded addition to the vendored
+`eval_mujoco_sim2sim.py` (search `motion/sim live-view hook` in that file) —
+no-op unless `LIVE_STREAM_FRAME_PATH` is set, so it doesn't touch normal
+headless/`--gui` behavior at all.

@@ -4,13 +4,17 @@
 #
 # Usage:
 #   ./motion/sim/run_holomotion.sh wave_v2
-#   ./motion/sim/run_holomotion.sh cartwheel --gui   # real interactive MuJoCo window,
-#                                                     # X11-forwarded to wherever you're
-#                                                     # ssh'd in from -- see README.md.
-#                                                     # Run this from a plain `ssh -X`
-#                                                     # terminal, not a VS Code Remote-SSH
-#                                                     # one (that tunnel doesn't carry X11).
 #   ./motion/sim/run_holomotion.sh --list
+#
+# Watch it live in a browser while it runs (recommended -- see README.md's
+# "Watching it live" section for why): every headless run auto-starts
+# live_view_server.py if it isn't already running and prints the URL below.
+# Open that in any browser on your laptop, no X11/ssh -X/MobaXterm needed.
+#
+# --gui also exists (the real interactive MuJoCo/GLFW window, X11-forwarded)
+# but hits an OpenGL-version ceiling that indirect GLX can't clear on this
+# hardware -- kept around in case you set up VirtualGL later, but the
+# browser view above is the reliable path today.
 #
 # Output (video + robot-trajectory npz) lands in
 #   motion/holomotion_ckpt/exported/mujoco_output_model_14000/
@@ -32,6 +36,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER=holomotion_sim2sim
+LIVE_VIEW_PORT=8098
 
 if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     echo "Container '$CONTAINER' doesn't exist yet -- setting it up..."
@@ -42,6 +47,23 @@ status="$(docker inspect "$CONTAINER" --format '{{.State.Status}}')"
 if [[ "$status" != "running" ]]; then
     echo "Starting $CONTAINER (was: $status)..."
     docker start "$CONTAINER" >/dev/null
+fi
+
+is_headless_run=true
+for arg in "$@"; do
+    [[ "$arg" == "--gui" || "$arg" == "--list" ]] && is_headless_run=false
+done
+
+if [[ "$is_headless_run" == true && $# -gt 0 ]]; then
+    port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3<&- 3>&-; }
+    if ! port_open "$LIVE_VIEW_PORT"; then
+        nohup python3 "$HERE/live_view_server.py" --port "$LIVE_VIEW_PORT" \
+            >/tmp/motion_sim_live_view.log 2>&1 &
+        disown
+        sleep 0.3
+    fi
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "Live view: http://${ip:-<jetson-ip>}:${LIVE_VIEW_PORT}/  (open this in your browser now)"
 fi
 
 exec docker exec -i -e DISPLAY="${DISPLAY:-}" "$CONTAINER" \

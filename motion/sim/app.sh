@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# The "app": pick a motion from a menu, watch it live in MuJoCo, land back on
-# the menu for the next one. Stays open until you quit -- run this once and
-# leave it running instead of retyping run_holomotion.sh each time.
+# The "app": pick a motion from a menu, watch it live (in your browser --
+# see README.md), land back on the menu for the next one. Stays open until
+# you quit -- run this once and leave it running instead of retyping
+# run_holomotion.sh each time.
 #
 # Usage: ./motion/sim/app.sh
-# Needs the same X11 forwarding setup as --gui -- see README.md's
-# "Watching it live" section (X server on your end + ssh -X/-Y, or MobaXterm).
+# First run of the session prints a live-view URL -- open it in your
+# browser and leave the tab open, it'll show whatever's currently playing.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +28,7 @@ while true; do
             echo "Bye."
             exit 0
         elif [[ -n "$choice" ]]; then
-            "$HERE/run_holomotion.sh" "$choice" --gui
+            "$HERE/run_holomotion.sh" "$choice"
             rc=$?
             if [[ $rc -ne 0 ]]; then
                 echo "(that run failed -- exit code $rc, see errors above)"

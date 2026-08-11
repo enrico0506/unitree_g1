@@ -35,6 +35,7 @@ PACKAGE_ROOT = HOLOMOTION_ROOT / "holomotion"
 EVAL_SCRIPT = PACKAGE_ROOT / "src" / "evaluation" / "eval_mujoco_sim2sim.py"
 ROBOT_XML = HOLOMOTION_ROOT / "assets" / "robots" / "unitree" / "G1" / "29dof" / "scene_29dof.xml"
 DEFAULT_ONNX = Path("/workspace/ckpt/exported/model_14000.onnx")
+LIVE_FRAME_PATH = Path("/workspace/sim/live/frame.jpg")
 
 # The eval_mujoco_sim2sim.sh wrapper this vendors from sources train.env and
 # expects a "holomotion_train" conda env; that env doesn't exist in this
@@ -122,6 +123,12 @@ def main() -> None:
         # in a heavy apt dependency to add. EGL renders headless straight
         # through the Tegra GPU and just works here (confirmed 2026-08-11).
         env.setdefault("MUJOCO_GL", "egl")
+        # Live-view: drop every frame as a JPEG for live_view_server.py to
+        # serve as an MJPEG stream, alongside the normal mp4/npz output --
+        # purely additive, always on for headless runs (cheap, no flag
+        # needed). See motion/sim/README.md's "Watching it live" section.
+        LIVE_FRAME_PATH.parent.mkdir(parents=True, exist_ok=True)
+        env["LIVE_STREAM_FRAME_PATH"] = str(LIVE_FRAME_PATH)
     else:
         # --gui opens a real GLFW/GLX window (mujoco.viewer.launch_passive)
         # -- EGL is an offscreen-only context and can't back a window. Needs

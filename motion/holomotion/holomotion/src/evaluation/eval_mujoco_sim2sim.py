@@ -50,6 +50,31 @@ except ImportError:
 
 ONNX_IO_DUMP_DIRNAME = "onnx_io_npy"
 
+# --- motion/sim live-view hook (not upstream HoloMotion) -------------------
+# Optional side-channel: drop the latest rendered frame as a JPEG so
+# motion/sim/live_view_server.py can serve it as an MJPEG stream to a
+# browser. No-op unless LIVE_STREAM_FRAME_PATH is set (motion/sim/sim2sim.py
+# sets it for headless runs) -- doesn't touch record_video/dump_npzs/the mp4
+# output or any other behavior. Added 2026-08-11: indirect GLX over X11
+# forwarding can't clear MuJoCo's OpenGL version floor on this hardware, so
+# this is the practical way to watch a run happen live instead.
+_LIVE_STREAM_FRAME_PATH = os.environ.get("LIVE_STREAM_FRAME_PATH")
+
+
+def _live_stream_write_frame(frame_bgr) -> None:
+    if not _LIVE_STREAM_FRAME_PATH:
+        return
+    ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return
+    tmp_path = _LIVE_STREAM_FRAME_PATH + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(buf.tobytes())
+    os.replace(tmp_path, _LIVE_STREAM_FRAME_PATH)
+
+
+# --- end motion/sim live-view hook ------------------------------------------
+
 try:
     import pynput.keyboard as pynput_kb
 
@@ -2096,6 +2121,7 @@ class MujocoEvaluator:
             # Convert RGB (MuJoCo) -> BGR (OpenCV) before writing
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             self._video_writer.write(frame_bgr)
+            _live_stream_write_frame(frame_bgr)
             self._last_frame_time = now
 
     def _apply_control(self, sleep: bool):
