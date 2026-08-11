@@ -62,7 +62,15 @@ if [[ "$is_headless_run" == true && $# -gt 0 ]]; then
         disown
         sleep 0.3
     fi
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    # Prefer the address you actually connected to sshd on (3rd field of
+    # SSH_CONNECTION: "client_ip client_port server_ip server_port") --
+    # this box has multiple interfaces (eth0 to the robot, wlan0 to your
+    # laptop) and `hostname -I` has no way to know which one you can reach.
+    # Falls back to hostname -I's first address when not run over SSH.
+    ip="$(awk '{print $3}' <<< "${SSH_CONNECTION:-}")"
+    if [[ -z "$ip" ]]; then
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
     echo "Live view: http://${ip:-<jetson-ip>}:${LIVE_VIEW_PORT}/  (open this in your browser now)"
 fi
 
