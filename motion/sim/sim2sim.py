@@ -71,7 +71,13 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="List motions available in the mounted library")
     ap.add_argument("--onnx", type=Path, default=DEFAULT_ONNX, help="Policy checkpoint to evaluate against")
     ap.add_argument("--gui", action="store_true", help="Interactive MuJoCo window instead of headless+video (needs a display)")
-    ap.add_argument("--fps", type=float, default=30.0)
+    # 50.0, not the clips' authored 30fps: the eval's _resample_motion_data_to_
+    # policy_rate (2026-08-11 fix) now writes one video frame per 50Hz policy
+    # step regardless of the clip's native rate, so the video container must
+    # be tagged at that same 50fps or playback duration comes out wrong
+    # (frame_count/30 instead of frame_count/50 -- was stretching every video
+    # to 1.67x its correct length after that fix landed).
+    ap.add_argument("--fps", type=float, default=50.0)
     args = ap.parse_args()
 
     motions = find_motions()
