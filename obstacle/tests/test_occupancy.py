@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone unit tests + benchmark for obstacle/occupancy.py.
 
-Run:  python3 obstacle/test_occupancy.py     (from the repo root)
-      python3 test_occupancy.py               (from inside obstacle/)
+Run:  python3 obstacle/tests/test_occupancy.py     (from the repo root)
+      python3 test_occupancy.py                     (from inside obstacle/tests/)
 
 No ROS / rclpy needed -- pure numpy. Prints PASS/FAIL per test and a per-update
 benchmark; exits non-zero if any test fails.
@@ -14,8 +14,8 @@ import time
 
 import numpy as np
 
-# Allow running from either the repo root or from inside obstacle/.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# obstacle/occupancy.py lives one directory up from obstacle/tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from occupancy import PolarOccupancyGrid, UNKNOWN, FREE, OCCUPIED  # noqa: E402
 

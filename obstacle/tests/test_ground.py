@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone tests for obstacle/ground.py.
 
-Run:  python3 obstacle/test_ground.py
+Run:  python3 obstacle/tests/test_ground.py
 
 Pure numpy, no ROS. Prints PASS/FAIL per test, a benchmark, and reports whether
 the optional `pypatchworkpp` backend was importable in this environment.
@@ -14,9 +14,8 @@ import time
 
 import numpy as np
 
-# Allow both `python3 obstacle/test_ground.py` (from repo root) and running
-# from inside obstacle/.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# obstacle/ground.py lives one directory up from obstacle/tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import ground  # noqa: E402
 

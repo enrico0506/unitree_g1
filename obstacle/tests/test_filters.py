@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_filters.py -- standalone unit tests + benchmark for obstacle/filters.py.
 
-Run:  python3 obstacle/test_filters.py
+Run:  python3 obstacle/tests/test_filters.py
 No ROS / rclpy needed.  Prints PASS/FAIL per test, a final summary, and a per-function
 benchmark on 15000 points.  Exit code 0 iff all tests pass.
 """
@@ -13,8 +13,8 @@ from collections import namedtuple
 
 import numpy as np
 
-# allow running as `python3 obstacle/test_filters.py` from the repo root or in-dir.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# obstacle/filters.py lives one directory up from obstacle/tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from filters import (                                  # noqa: E402
     CUSTOMPOINT_DTYPE,

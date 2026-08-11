@@ -7,8 +7,8 @@ import os, sys, math
 import numpy as np
 import importlib.util
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "sensors", "depth"))
 sys.path.insert(0, os.path.join(ROOT, "obstacle"))
 YAML = os.path.join(ROOT, "obstacle", "obstacle.yaml")
 
@@ -17,7 +17,7 @@ _g = importlib.util.spec_from_file_location("guard", os.path.join(ROOT, "obstacl
 guard = importlib.util.module_from_spec(_g); _g.loader.exec_module(guard)
 Guard = guard.ObstacleGuard
 
-from depth_nearfield import DepthNearField
+from nearfield import DepthNearField
 
 
 def _mk_dnf():
