@@ -123,7 +123,13 @@ def pick_stop_stance():
     """Plan's preference order: walk_straight's own frame 0 IF genuinely
     standing/idle (Step 0 measured it is NOT: double-support but root already
     translating 0.151 m/s), else stair_climbing frame 0 (already used as the
-    planted stance by build_walk_climb_walk). Checked live, not hardcoded."""
+    planted stance by build_walk_climb_walk). Checked live, not hardcoded.
+
+    stair_climbing doesn't exist in motion_library yet (2026-08-11) -- rather
+    than hard-require it, fall back to walk_straight[0] anyway (not idle, but
+    a working stop pose) when it's missing. Preference order is otherwise
+    unchanged, so this self-upgrades back to stair_climbing the moment that
+    clip lands, no code change needed then."""
     walk, raw = load_walk_npz()
     fc0 = raw["foot_contacts"][0]
     idle = (
@@ -131,8 +137,12 @@ def pick_stop_stance():
         and np.linalg.norm(walk["ref_global_velocity"][0, 0, :2]) < 0.05
         and np.abs(walk["ref_dof_vel"][0]).max() < 0.1
     )
-    src = walk if idle else np.load(STAIRS_HOLO, allow_pickle=True)
-    name = "walk_straight[0]" if idle else "stair_climbing[0]"
+    if idle:
+        src, name = walk, "walk_straight[0]"
+    elif STAIRS_HOLO.is_file():
+        src, name = np.load(STAIRS_HOLO, allow_pickle=True), "stair_climbing[0]"
+    else:
+        src, name = walk, "walk_straight[0] (stair_climbing unavailable, not idle)"
     return (src["ref_dof_pos"][0], src["ref_global_translation"][0, 0, :],
             src["ref_global_rotation_quat"][0, 0, :], name)
 
