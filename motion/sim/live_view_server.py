@@ -39,6 +39,14 @@ PLACEHOLDER_JPEG_HTML = """
 </head>
 <body>
 <h1>motion/sim -- live view (auto-refreshes while a run is active)</h1>
+<p style="color:#777; font-size:0.85rem; max-width:40rem; text-align:center;">
+  This streams frames as fast as the Jetson computes them (~9-11fps typical) --
+  slower than the motion's authored real-time pace, so it plays back looking
+  like slow motion. The saved .mp4 in
+  <code>holomotion_ckpt/exported/mujoco_output_model_14000/</code> is encoded
+  at the correct fixed framerate and is NOT slow -- use that to judge actual
+  playback speed/quality, this view is just for watching it happen.
+</p>
 <img src="/stream">
 </body>
 </html>

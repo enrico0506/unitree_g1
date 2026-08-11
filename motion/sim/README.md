@@ -44,6 +44,17 @@ no X11 forwarding involved. Frames come from the same EGL-rendered path the
 headless mp4 output already uses, just also dropped live as a JPEG
 (`motion/sim/live/frame.jpg`) that `live_view_server.py` serves as an MJPEG
 stream. `run_holomotion.sh` starts that server automatically if it isn't
+
+**It plays back in slow motion — that's compute, not a motion/tracking bug.**
+The live view shows frames as fast as the Jetson can compute them (~9-11fps
+typical for this policy), which is slower than the motion's authored
+real-time pace (30fps). A 6.6s motion can take ~20s+ of real time to watch
+live. The saved `.mp4` is unaffected — it's encoded at a fixed correct
+framerate regardless of how long each frame took to compute (confirmed
+2026-08-11: `wave_v2`'s exported mp4 is 198 frames @ 30fps = 6.60s, matching
+its `motion_fps: 30.0` metadata's intended 6.57s almost exactly). **Judge
+actual playback speed/quality from the saved mp4, not the live view.**
+`live_view_server.py`'s page has this same note on it.
 already running.
 
 ## `--gui`: the real interactive MuJoCo window (usually not worth it)
