@@ -64,6 +64,20 @@ path (which renders locally via EGL and only ships out a finished video).
 Fine for eyeballing whether a motion tracks or falls; not fine for judging
 smoothness.
 
+### The "app": `app.sh`
+
+`./motion/sim/app.sh` is a picker that stays open — run it once, pick a
+motion from the numbered menu, watch it live, land back on the menu for the
+next one. No retyping `run_holomotion.sh <name> --gui` each time:
+
+```bash
+cd ~/projects/g1
+./motion/sim/app.sh
+```
+
+Same X11 setup as above applies (this is just `run_holomotion.sh ... --gui`
+under a menu loop).
+
 ## How it's wired
 
 `run_holomotion.sh` (host) starts/creates the `holomotion_sim2sim` docker
