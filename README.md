@@ -81,7 +81,7 @@ view. Toggle off / close the tab → it idles at ~0% GPU, protecting the robot.
 
 The code for this feature lives in **[perception/pose/](perception/pose/)**
 (its own [README](perception/pose/README.md)) plus the `/camera/pose/*` routes
-in `scripts/robot_web_controller.py` and `web/pose.js`.
+in `scripts/robot_web_controller.py` and `web/perception/pose.js`.
 
 ---
 

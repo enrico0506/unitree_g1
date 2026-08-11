@@ -394,6 +394,38 @@ def required_points(r, k0=3, r0=1.0, r_max=None):
 # =====================================================================================
 # (c) Range-scaled per-sector k-th-nearest distance
 # =====================================================================================
+def _sector_blocks(ang_deg, horiz, n_sectors, start_deg):
+    """Bin points into angular sectors and sort them into per-sector range blocks.
+
+    The shared front half of sector_kth_nearest and sector_tripwire: both only ever
+    need "the j-th NEAREST point of sector i", and after this the answer is a single
+    lookup, ``h_sorted[starts[i] + j]``.
+
+    Returns
+    -------
+    counts   : (n_sectors,) int64 -- points per sector.
+    h_sorted : (N,) float64       -- `horiz` sorted primarily by sector, secondarily by
+                                     range, so sector i occupies the contiguous block
+                                     h_sorted[starts[i] : starts[i] + counts[i]] in
+                                     ASCENDING range order.
+    starts   : (n_sectors,) int64 -- exclusive cumulative sum of counts, i.e. each
+                                     sector's block offset (valid even when empty
+                                     sectors are interspersed).
+    """
+    bin_deg = 360.0 / n_sectors
+    sector = np.floor((ang_deg - start_deg) / bin_deg).astype(np.int64)
+    sector %= n_sectors                                  # wrap the +180 edge into bin 0
+
+    counts = np.bincount(sector, minlength=n_sectors).astype(np.int64)
+    # sort primarily by sector, secondarily by range -> contiguous ascending blocks.
+    order = np.lexsort((horiz, sector))
+
+    # exclusive-cumsum block starts (valid even with interspersed empty sectors).
+    starts = np.zeros(n_sectors, dtype=np.int64)
+    starts[1:] = np.cumsum(counts)[:-1]
+    return counts, horiz[order], starts
+
+
 def sector_kth_nearest(ang_deg, horiz, n_sectors=180, start_deg=-180.0, k=3,
                        range_scaled_mincount=True, k0=3, r0=1.0, r_max=3.0):
     """Per-sector k-th-nearest horizontal distance over a full 360 deg ring.
@@ -429,10 +461,9 @@ def sector_kth_nearest(ang_deg, horiz, n_sectors=180, start_deg=-180.0, k=3,
 
     Vectorisation
     -------------
-    No Python per-sector loop.  Points are sorted by (sector, horiz) via np.lexsort, so
-    each sector occupies a contiguous ascending-range block.  np.bincount gives per-
-    sector counts; the block start offsets are the exclusive cumulative sum of counts,
-    so the sector minimum is block[start] and the k-th element is block[start + k'-1].
+    No Python per-sector loop.  _sector_blocks() sorts the points by (sector, horiz) so
+    each sector occupies a contiguous ascending-range block; the sector minimum is then
+    block[start] and the k-th element is block[start + k'-1].
     """
     ang_deg = np.asarray(ang_deg, dtype=np.float64).reshape(-1)
     horiz = np.asarray(horiz, dtype=np.float64).reshape(-1)
@@ -443,22 +474,8 @@ def sector_kth_nearest(ang_deg, horiz, n_sectors=180, start_deg=-180.0, k=3,
     if ang_deg.size == 0:
         return dist, counts
 
-    bin_deg = 360.0 / n_sectors
-    sector = np.floor((ang_deg - start_deg) / bin_deg).astype(np.int64)
-    sector %= n_sectors                                  # wrap the +180 edge into bin 0
-
-    counts = np.bincount(sector, minlength=n_sectors).astype(np.int64)
+    counts, h_sorted, starts = _sector_blocks(ang_deg, horiz, n_sectors, start_deg)
     populated = counts > 0
-    if not populated.any():
-        return dist, counts
-
-    # sort primarily by sector, secondarily by range -> contiguous ascending blocks.
-    order = np.lexsort((horiz, sector))
-    h_sorted = horiz[order]
-
-    # exclusive-cumsum block starts (valid even with interspersed empty sectors).
-    starts = np.zeros(n_sectors, dtype=np.int64)
-    starts[1:] = np.cumsum(counts)[:-1]
 
     # nearest range per populated sector = first element of its sorted block.
     nearest = np.full(n_sectors, np.nan, dtype=np.float64)
@@ -502,17 +519,10 @@ def sector_tripwire(ang_deg, horiz, n_sectors=180, start_deg=-180.0,
     near = horiz <= float(tripwire_range)
     if not near.any():
         return out
-    a = ang_deg[near]
-    h = horiz[near]
-
-    bin_deg = 360.0 / n_sectors
-    sector = np.floor((a - start_deg) / bin_deg).astype(np.int64) % n_sectors
-    counts = np.bincount(sector, minlength=n_sectors).astype(np.int64)
-
-    order = np.lexsort((h, sector))
-    h_sorted = h[order]
-    starts = np.zeros(n_sectors, dtype=np.int64)
-    starts[1:] = np.cumsum(counts)[:-1]
+    # Bin ONLY the near subset, so a sector's block holds just its within-range points
+    # and block[start] is therefore its nearest such point.
+    counts, h_sorted, starts = _sector_blocks(ang_deg[near], horiz[near],
+                                              n_sectors, start_deg)
 
     fired = counts >= int(tripwire_min)
     out[fired] = h_sorted[starts[fired]]                 # nearest within tripwire_range

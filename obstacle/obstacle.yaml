@@ -236,7 +236,7 @@ use_deskew: true             # IMU-gyro motion-compensate the cloud (needs /livo
 # --- D435i depth fusion (fills the Mid-360's near-GROUND blind zone) -------
 # The head RealSense D435i is tilted ~47 deg DOWN, so it sees the floor ~0.5-2 m
 # in front -- exactly where the up-looking Mid-360 is blind. DepthNearField
-# (scripts/depth_nearfield.py) reuses the dashboard's already-decoded depth cloud
+# (sensors/depth/nearfield.py) reuses the dashboard's already-decoded depth cloud
 # (no second camera open), corrects the mount pitch, drops the floor, and reports
 # the nearest forward near-ground obstacle. The guard mixes it into the forward
 # distance (slow + stop). Depth fusion is now ALWAYS ON -- the runtime toggle has

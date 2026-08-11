@@ -232,7 +232,7 @@ class ObstacleGuard:
     def _run(self):
         """Poll the shm file by mtime; cache the parsed dict under the lock.
 
-        Pattern mirrors OdomReader/LidarSource in scripts/lidar_source.py: a tiny
+        Pattern mirrors OdomReader/LidarSource in sensors/depth/pointcloud.py: a tiny
         daemon loop that keeps the latest-good snapshot behind a lock. Tolerates a
         missing / partial / non-JSON file by keeping the last good frame and just
         not advancing 'last_fresh' (so the fault machine notices staleness).
@@ -284,6 +284,16 @@ class ObstacleGuard:
             return None
         return v if math.isfinite(v) else None
 
+    def _scale01(self, data, key, fallback=1.0):
+        """Read a 0..1 speed scale out of the shm dict, clamped to [0, 1].
+
+        A missing / null / non-finite value yields `fallback` (1.0 == "no braking"),
+        so an old or truncated JSON without the key never crashes the guard and never
+        silently brakes. Shared by apply()'s hot path and telemetry().
+        """
+        s = self._num(data.get(key))
+        return fallback if s is None else clamp(s, 0.0, 1.0)
+
     @staticmethod
     def _ring_usable(ring):
         """True only if `ring` is a dict with a non-empty dist list AND FINITE,
@@ -319,16 +329,16 @@ class ObstacleGuard:
             self._enable_time = time.monotonic()
             self._fault_time = 0.0
             self._fault_spoken = False
-            self._reset_slew()                            # never start from a stale low scale
+            self._reset_governing_state()                            # never start from a stale low scale
             self._speak("on", "toggle", cooldown=0.0)     # one word, normal voice
         else:
             self.enabled = False
             self.mode = "DISABLED"
             self._autodis_hold = False                    # manual disable: hand back control cleanly
-            self._reset_slew()                            # leave pass-through clean for next enable
+            self._reset_governing_state()                            # leave pass-through clean for next enable
             self._speak("off", "toggle", cooldown=0.0)    # one word, normal voice
 
-    def _reset_slew(self):
+    def _reset_governing_state(self):
         """Reset the slew-limited applied scales to full (1.0) AND the blind-zone
         predictor.
 
@@ -496,15 +506,11 @@ class ObstacleGuard:
 
         # --- per-direction smooth scales + global tight factor (defaults 1.0
         #     so an old / short JSON without these keys never crashes). -------
-        def _scale(key):
-            s = self._num(data.get(key))
-            return 1.0 if s is None else clamp(s, 0.0, 1.0)
-
-        scale_front = _scale("scale_front")
-        scale_back = _scale("scale_back")
-        scale_left = _scale("scale_left")
-        scale_right = _scale("scale_right")
-        tight_factor = _scale("tight_factor")
+        scale_front = self._scale01(data, "scale_front")
+        scale_back = self._scale01(data, "scale_back")
+        scale_left = self._scale01(data, "scale_left")
+        scale_right = self._scale01(data, "scale_right")
+        tight_factor = self._scale01(data, "tight_factor")
 
         # RAW distances drive the per-direction HARD STOPS (no smoothing/slew).
         front_raw = self._num(data.get("front_m"))
@@ -549,10 +555,10 @@ class ObstacleGuard:
         # result -- no double-latching. (stop, emergency): emergency -> instant snap;
         # else a soft, shaper-ramped stop. Front uses front_eff (incl. the dead-reckoned
         # blind-zone / depth estimate). Evaluated every cycle so latches release when clear.
-        s_fwd, e_fwd = self._stop_check("fwd", front_eff)
-        s_back, e_back = self._stop_check("back", back_raw)
-        s_left, e_left = self._stop_check("left", left_raw)
-        s_right, e_right = self._stop_check("right", right_raw)
+        stops = (self._stop_check("fwd", front_eff),
+                 self._stop_check("back", back_raw),
+                 self._stop_check("left", left_raw),
+                 self._stop_check("right", right_raw))
 
         # --- choose gating path: ring (360 travel-direction) or legacy 4-wedge ---
         ring = data.get("ring") if self.ring_gating else None
@@ -566,11 +572,13 @@ class ObstacleGuard:
                 pass                                     # never let depth break the guard
         use_ring = self._ring_usable(ring)
 
-        # slew timing (shared by both paths)
-        now_t = time.monotonic()
-        dt = (now_t - self._last_apply_t) if self._last_apply_t > 0.0 else 0.0
+        # Slew timing, shared by both gating paths (and by the blind-zone predictor's
+        # dead-reckoning below). Clamped to 0.1 s so a stalled command thread cannot
+        # jump the scales / the predicted wall by an arbitrarily large step.
+        slew_now = time.monotonic()
+        dt = (slew_now - self._last_apply_t) if self._last_apply_t > 0.0 else 0.0
         dt = clamp(dt, 0.0, 0.1)
-        self._last_apply_t = now_t
+        self._last_apply_t = slew_now
         rate = self.scale_slew_per_s
 
         if use_ring:
@@ -630,23 +638,8 @@ class ObstacleGuard:
 
             # 3) PER-DIRECTION STOP -- graded (soft ramp vs emergency snap) + hysteretic,
             #    from the decisions computed above. Only the travel direction is gated.
-            #    front_eff feeds s_fwd so a blind-zone wall still stops the robot.
-            if vx > 0.0 and s_fwd:
-                vx = 0.0
-                if e_fwd:
-                    self._hard[0] = True
-            if vx < 0.0 and s_back:
-                vx = 0.0
-                if e_back:
-                    self._hard[0] = True
-            if vy > 0.0 and s_left:
-                vy = 0.0
-                if e_left:
-                    self._hard[1] = True
-            if vy < 0.0 and s_right:
-                vy = 0.0
-                if e_right:
-                    self._hard[1] = True
+            #    front_eff feeds the "fwd" decision so a blind-zone wall still stops us.
+            vx, vy = self._apply_direction_stops(vx, vy, stops)
 
         # --- update the blind-zone predictor for the NEXT cycle -----------
         # Dead-reckons a forward obstacle through the ~1 m front blind cone. Seeded and
@@ -702,18 +695,7 @@ class ObstacleGuard:
         # front/back/left/right stop (the ring block gates only the TRAVEL direction), so it
         # runs for both paths; in the wedge path it re-affirms the stops already applied.
         # A soft stop zeroes the target (shaper ramps it); only an emergency sets _hard (snap).
-        if vx > 0.0 and s_fwd:
-            vx = 0.0
-            if e_fwd: self._hard[0] = True
-        if vx < 0.0 and s_back:
-            vx = 0.0
-            if e_back: self._hard[0] = True
-        if vy > 0.0 and s_left:
-            vy = 0.0
-            if e_left: self._hard[1] = True
-        if vy < 0.0 and s_right:
-            vy = 0.0
-            if e_right: self._hard[1] = True
+        vx, vy = self._apply_direction_stops(vx, vy, stops)
         if self._hard[0]:
             vx = 0.0
         if self._hard[1]:
@@ -724,6 +706,40 @@ class ObstacleGuard:
         # Remember the forward speed actually applied, for next cycle's dead-reckoning.
         self._last_vx_cmd = vx
         return self._clamp_out(vx, vy, vyaw)
+
+    def _apply_direction_stops(self, vx, vy, stops):
+        """Zero vx / vy wherever the direction they are travelling in is stopped.
+
+        `stops` is the per-direction ``(stop, emergency)`` result of _stop_check, in the
+        fixed order (fwd, back, left, right). Only the direction an axis is ACTUALLY
+        moving in gates that axis. A routine stop just zeroes the target and lets the
+        downstream shaper ramp it to 0; an EMERGENCY stop additionally raises the axis's
+        _hard flag so the shaper bypasses its ramp and the stop snaps instantly.
+
+        Latch-free and idempotent (all latching already happened in _stop_check), which
+        is why both the legacy wedge path and the final safety pass can call it -- the
+        second call over an already-zeroed axis is a no-op.
+
+        Returns the possibly-zeroed (vx, vy).
+        """
+        (s_fwd, e_fwd), (s_back, e_back), (s_left, e_left), (s_right, e_right) = stops
+        if vx > 0.0 and s_fwd:
+            vx = 0.0
+            if e_fwd:
+                self._hard[0] = True
+        if vx < 0.0 and s_back:
+            vx = 0.0
+            if e_back:
+                self._hard[0] = True
+        if vy > 0.0 and s_left:
+            vy = 0.0
+            if e_left:
+                self._hard[1] = True
+        if vy < 0.0 and s_right:
+            vy = 0.0
+            if e_right:
+                self._hard[1] = True
+        return vx, vy
 
     def _enter_fault(self, now):
         """Transition into FAULT: brake forward. No speech here -- the one-word
@@ -899,21 +915,15 @@ class ObstacleGuard:
             points = pts if isinstance(pts, list) else []
             zone = data.get("zone", "CLEAR")
 
-            def _tscale(key, fallback=None):
-                s = self._num(data.get(key))
-                if s is None:
-                    return fallback
-                return clamp(s, 0.0, 1.0)
-
             # scale_front is the canonical forward scale; speed_scale stays equal
             # to it (the node writes both; fall back to the legacy speed_scale key
             # if an old JSON lacks scale_front).
-            legacy_ss = _tscale("speed_scale", 1.0)
-            scale_front = _tscale("scale_front", legacy_ss)
-            scale_back = _tscale("scale_back", 1.0)
-            scale_left = _tscale("scale_left", 1.0)
-            scale_right = _tscale("scale_right", 1.0)
-            tight_factor = _tscale("tight_factor", 1.0)
+            legacy_ss = self._scale01(data, "speed_scale")
+            scale_front = self._scale01(data, "scale_front", legacy_ss)
+            scale_back = self._scale01(data, "scale_back")
+            scale_left = self._scale01(data, "scale_left")
+            scale_right = self._scale01(data, "scale_right")
+            tight_factor = self._scale01(data, "tight_factor")
             speed_scale = scale_front          # speed_scale == scale_front
             raw_side = data.get("side")
             if not isinstance(raw_side, dict):

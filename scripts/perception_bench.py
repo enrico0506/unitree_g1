@@ -188,7 +188,7 @@ def run_bench(noise=0.02, sway_amp=2.0, seed=0, scns=None):
 def small_scenarios():
     """Fine-detection stress set: thin poles at range + a small pole. These are the
     body-height objects the Mid-360 CAN see; cables ON THE FLOOR are depth-only (the sim
-    models only the lidar, so they are exercised by obstacle/test_depth_ring.py instead)."""
+    models only the lidar, so they are exercised by obstacle/tests/test_depth_ring.py instead)."""
     C = lambda cx, cy, r, **k: dict(type="circle", cx=cx, cy=cy, r=r, **k)
     fwd = lambda: dict(policy="forward", start=(0, 0, 0), goal=(20, 0), dur=14.0)
     return {

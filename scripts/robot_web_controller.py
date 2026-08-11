@@ -56,9 +56,6 @@ except Exception:      # keep the dashboard importable if this IDL is unavailabl
 
 import yaml
 
-from camera_source import CameraSource
-from lidar_source import LidarSource, pack_cloud, OdomReader
-from map_builder import MapBuilder
 from cmd_shaper import CommandShaper
 from step_pacer import StepPacer
 # Interactive "wave back" demo: the pose->gesture reactor + its safety-gated robot bridge.
@@ -72,12 +69,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 CONFIG_PATH = BASE_DIR / "config" / "robot.yaml"
 
-# Obstacle feature lives in the top-level 'obstacle' package. Only scripts/ is on
-# sys.path when this file runs directly, so add BASE_DIR for the package import.
-sys.path.insert(0, str(BASE_DIR))   # so the top-level 'obstacle' package imports
+# Raw hardware sensor readers live in the top-level 'sensors' package (camera/depth);
+# obstacle/perception/mapping/odometry are their own top-level packages (processing,
+# not raw hardware). Only scripts/ is on sys.path when this file runs directly, so
+# add BASE_DIR for these package imports.
+sys.path.insert(0, str(BASE_DIR))
 from obstacle.guard import ObstacleGuard
 from obstacle.manager import ObstacleManager
-from depth_nearfield import DepthNearField   # D435i near-ground depth fusion (domain 0)
+from sensors.depth.pointcloud import LidarSource, pack_cloud, OdomReader
+from sensors.depth.nearfield import DepthNearField   # D435i near-ground depth fusion (domain 0)
+from sensors.camera.source import CameraSource
+from mapping.map_builder import MapBuilder
+from perception.pose.client import PoseClient
+from perception.detect.client import DetectClient
+from perception.hands.client import HandsClient
 
 OBSTACLE_CFG_PATH = BASE_DIR / "obstacle" / "obstacle.yaml"
 
@@ -724,6 +729,9 @@ camera_ir: CameraSource = None
 ir_proc = None   # subprocess.Popen | None -- lazily started/stopped, see _ir_start/_ir_stop
 pose: CameraSource = None
 detect: CameraSource = None
+pose_client: PoseClient = None
+detect_client: DetectClient = None
+hands_client: HandsClient = None
 lidar: LidarSource = None
 odom: OdomReader = None
 mapper: MapBuilder = None
@@ -1600,7 +1608,7 @@ def make_state_msg():
 
 def make_nav_state_msg():
     """Nav tab telemetry ({type:"nav_state"}): the robot's position relative to the
-    patrol circle, tagged real/sim so one dashboard renderer (web/nav.js) handles
+    patrol circle, tagged real/sim so one dashboard renderer (web/nav/nav.js) handles
     both. Real: this process's own odom + g1_nav's cross-process patrol/person shm
     files. Sim: scripts/sim_runner.py's mujoco dry-run -- an entirely separate
     process that never touches DDS/LocoClient (see that script's own docstring)."""
@@ -1951,7 +1959,7 @@ def _ensure_ir_proc_running():
         return   # already running
     try:
         ir_proc = subprocess.Popen(
-            [sys.executable, str(BASE_DIR / "scripts" / "ir_service.py"),
+            [sys.executable, str(BASE_DIR / "sensors" / "camera" / "ir_service.py"),
              CAMERA_IR_DEVICE, str(CAMERA_STREAM_HZ), CAMERA_IR_SHM])
         print(f"[IR] ir_service.py started (pid {ir_proc.pid}).", flush=True)
     except OSError as e:
@@ -1996,6 +2004,7 @@ async def ir_demand_watch_loop():
 async def lifespan(app: FastAPI):
     global client, reader, arm_client, camera, camera_ir, pose, detect, lidar, odom, mapper, depth_nf, depth_dumper
     global guard, obstacle_mgr, shaper, pacer, audio, remote_watcher, greeting, voice, wireless_pub
+    global pose_client, detect_client, hands_client
     print(f"Initializing DDS on interface: {INTERFACE}", flush=True)
     ChannelFactoryInitialize(DOMAIN_ID, INTERFACE)
 
@@ -2059,7 +2068,7 @@ async def lifespan(app: FastAPI):
     # Camera runs in its OWN process (own DDS participant + RPC), so a busy/blocked
     # locomotion RPC can't starve it. It writes frames to shared memory; we read them.
     cam_proc = subprocess.Popen(
-        [sys.executable, str(BASE_DIR / "scripts" / "camera_service.py"),
+        [sys.executable, str(BASE_DIR / "sensors" / "camera" / "service.py"),
          INTERFACE, str(CAMERA_STREAM_HZ), CAMERA_SHM])
     camera = CameraSource(path=CAMERA_SHM)
     print("Camera service (separate process) started.", flush=True)
@@ -2085,6 +2094,13 @@ async def lifespan(app: FastAPI):
     # "no signal" -- the raw camera feed is unaffected.
     detect = CameraSource(path=DETECT_SHM)
     detect.backend = "detect"
+
+    # Thin service-layer clients: centralize all shm reads/writes for the
+    # tracks/labels/demand-heartbeat side of each lane so route handlers below
+    # never touch a shm path directly.
+    pose_client = PoseClient(POSE_TRACKS, POSE_LABELS, POSE_DEMAND)
+    detect_client = DetectClient(DETECT_TRACKS, DETECT_DEMAND)
+    hands_client = HandsClient(HANDS_TRACKS, HANDS_DEMAND)
 
     odom = OdomReader()
     odom.start()
@@ -2447,19 +2463,12 @@ async def camera_ir_stream():
 # heartbeats POSE_DEMAND so the container only runs the GPU while someone watches.
 # ---------------------------------------------------------------------------
 
-def _fresh(path, ttl=2.5):
-    """True if `path` was written within `ttl` seconds (overlay JSON liveness)."""
-    try:
-        return (time.time() - os.path.getmtime(path)) < ttl
-    except OSError:
-        return False
-
 
 @app.get("/camera/pose/status")
 async def pose_status():
     # Liveness now tracks the geometry JSON (the browser draws it on a canvas; the
     # service no longer bakes an annotated JPEG).
-    return JSONResponse({"live": _fresh(POSE_TRACKS), "backend": "pose"})
+    return JSONResponse({"live": pose_client.is_live(), "backend": "pose"})
 
 
 @app.get("/camera/pose/stream")
@@ -2469,11 +2478,7 @@ async def pose_stream():
 
     async def gen():
         while True:
-            try:                       # heartbeat -> pose_service runs while watched
-                with open(POSE_DEMAND, "wb") as f:
-                    f.write(b"1")
-            except OSError:
-                pass
+            pose_client.demand()       # heartbeat -> pose_service runs while watched
             jpeg = pose.get_jpeg() if pose else None
             if jpeg:
                 yield (
@@ -2497,16 +2502,8 @@ async def pose_tracks():
     Polling this also heartbeats POSE_DEMAND, so the pose container only runs the
     GPU while the Skeleton overlay is on (the browser polls this once a second).
     """
-    try:
-        with open(POSE_DEMAND, "wb") as f:
-            f.write(b"1")
-    except OSError:
-        pass
-    try:
-        with open(POSE_TRACKS) as f:
-            return JSONResponse(json.load(f))
-    except (OSError, ValueError):
-        return JSONResponse({"w": 0, "h": 0, "items": []})
+    pose_client.demand()
+    return JSONResponse(pose_client.tracks())
 
 
 @app.post("/camera/pose/label")
@@ -2520,20 +2517,7 @@ async def pose_label(req: Request):
     name = str(data.get("name", "")).strip()[:32]
     if not tid:
         return JSONResponse({"ok": False, "error": "missing id"}, status_code=400)
-    labels = {}
-    try:
-        with open(POSE_LABELS) as f:
-            labels = json.load(f) or {}
-    except (OSError, ValueError):
-        pass
-    if name:
-        labels[tid] = name
-    else:
-        labels.pop(tid, None)
-    tmp = POSE_LABELS + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(labels, f)
-    os.replace(tmp, POSE_LABELS)      # atomic -> pose_service never reads a partial file
+    labels = pose_client.set_label(tid, name)
     return JSONResponse({"ok": True, "labels": labels})
 
 
@@ -2545,7 +2529,7 @@ async def pose_label(req: Request):
 
 @app.get("/camera/detect/status")
 async def detect_status():
-    return JSONResponse({"live": _fresh(DETECT_TRACKS), "backend": "detect"})
+    return JSONResponse({"live": detect_client.is_live(), "backend": "detect"})
 
 
 @app.get("/camera/detect/stream")
@@ -2555,11 +2539,7 @@ async def detect_stream():
 
     async def gen():
         while True:
-            try:                       # heartbeat -> detect_service runs while watched
-                with open(DETECT_DEMAND, "wb") as f:
-                    f.write(b"1")
-            except OSError:
-                pass
+            detect_client.demand()     # heartbeat -> detect_service runs while watched
             jpeg = detect.get_jpeg() if detect else None
             if jpeg:
                 yield (
@@ -2583,16 +2563,8 @@ async def detect_objects():
     Polling this also heartbeats DETECT_DEMAND, so the detect container only runs
     the GPU while the Object Detection overlay is on.
     """
-    try:
-        with open(DETECT_DEMAND, "wb") as f:
-            f.write(b"1")
-    except OSError:
-        pass
-    try:
-        with open(DETECT_TRACKS) as f:
-            return JSONResponse(json.load(f))
-    except (OSError, ValueError):
-        return JSONResponse({"w": 0, "h": 0, "items": []})
+    detect_client.demand()
+    return JSONResponse(detect_client.tracks())
 
 
 # ---------------------------------------------------------------------------
@@ -2605,22 +2577,14 @@ async def detect_objects():
 
 @app.get("/camera/hands/status")
 async def hands_status():
-    return JSONResponse({"live": _fresh(HANDS_TRACKS), "backend": "hands"})
+    return JSONResponse({"live": hands_client.is_live(), "backend": "hands"})
 
 
 @app.get("/camera/hands/tracks")
 async def hands_tracks():
     """Hand geometry {w, h, items:[{hand, score, landmarks:[[x,y,z]x21]}]}."""
-    try:
-        with open(HANDS_DEMAND, "wb") as f:
-            f.write(b"1")
-    except OSError:
-        pass
-    try:
-        with open(HANDS_TRACKS) as f:
-            return JSONResponse(json.load(f))
-    except (OSError, ValueError):
-        return JSONResponse({"w": 0, "h": 0, "items": []})
+    hands_client.demand()
+    return JSONResponse(hands_client.tracks())
 
 
 # ---------------------------------------------------------------------------

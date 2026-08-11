@@ -278,10 +278,13 @@ def _segment_patchwork(points):
         ng = np.asarray(idx_fn(), dtype=np.int64)
         mask[ng] = True
         return mask
+    # No index accessor on this build: fall back to the returned nonground COORDS.
+    # Those carry no input ordering, and matching them back point-by-point would be
+    # far too expensive for the hot path -- so we only handle the one unambiguous
+    # case, "every input point came back as nonground", and otherwise leave the mask
+    # all-False (the caller then sees no obstacles from Patchwork++).
     nonground = np.asarray(pw.getNonground(), dtype=np.float64)
     if nonground.shape[0] == n:
-        # Ambiguous ordering; treat every returned point as an obstacle by
-        # nearest match is overkill -- just flag all-nonground count.
         mask[:] = True
     return mask
 

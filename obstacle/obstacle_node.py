@@ -1082,7 +1082,7 @@ class ObstacleNode(Node):
         own low-percentile plane -- the surface objects actually rest on. That is far
         more reliable than the node's per-frame floor fit: the Mid-360 is ~30 deg
         nose-up so it barely sees the floor, and MEASURED live, leveling by that fit
-        removed almost none of the tilt (fe~9 deg in, resid~8 deg out). viz-only."""
+        removed almost none of the tilt (~9 deg in, ~8 deg residual out). viz-only."""
         if len(x) == 0:
             return
         self._viz_accum.append(
