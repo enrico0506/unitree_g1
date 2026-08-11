@@ -1,0 +1,3 @@
+# generated clips are build artefacts -- regenerate with qa_check.py or
+# generate_walk_to_point.py --output
+generated/
