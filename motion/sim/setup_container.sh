@@ -45,7 +45,7 @@ DEPLOY_PIP=/root/miniconda3/envs/holomotion_deploy/bin/pip
 # hydra-core installs --no-deps (its dep resolution wants to drag in a newer
 # omegaconf than the one already pinned/working in this env).
 HYDRA_DEP="hydra-core==1.3.2"
-EXTRA_DEPS="mujoco ray pandas tabulate tqdm"
+EXTRA_DEPS="mujoco ray pandas tabulate tqdm imageio-ffmpeg"
 
 if docker image inspect "$PROVISIONED_IMAGE" >/dev/null 2>&1; then
     RUN_IMAGE="$PROVISIONED_IMAGE"

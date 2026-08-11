@@ -163,11 +163,50 @@ def main() -> None:
     onnx_stem = args.onnx.stem
     out_dir = args.onnx.parent / f"mujoco_output_{onnx_stem}"
     motion_stem = npz_path.stem
+    video_path = out_dir / f"{motion_stem}.mp4"
+    if headless and video_path.is_file():
+        _transcode_to_h264(video_path)
+
     print()
     print(f"Done. Output (host path: motion/holomotion_ckpt/exported/mujoco_output_{onnx_stem}/):")
     if headless:
-        print(f"  video: {out_dir / f'{motion_stem}.mp4'}")
+        print(f"  video: {video_path}")
     print(f"  robot trajectory npz: {out_dir / f'{motion_stem}_robot.npz'}")
+
+
+def _transcode_to_h264(video_path: Path) -> None:
+    """cv2.VideoWriter (the vendored eval script's video output) encodes
+    with the 'mp4v' fourcc, which is MPEG-4 Part 2 (FMP4) -- not H.264.
+    Browsers and VS Code's built-in video preview only decode H.264/VP8/9/
+    AV1 natively, so every video this pipeline produces fails to open
+    ("An error occurred while loading the video file") without this.
+    Transcodes in place via a static ffmpeg binary (imageio-ffmpeg, no apt/
+    system-package involvement -- this container has a pre-existing broken
+    cuda-compat-12-2 dependency that `apt --fix-broken install` would
+    resolve by *removing*, which risks breaking CUDA; not touching that).
+    Best-effort: leaves the original FMP4 file in place if anything fails,
+    doesn't fail the run over it. Confirmed needed 2026-08-11."""
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        print(f"(skipping H.264 transcode -- imageio_ffmpeg not installed; {video_path} won't preview in a browser/VS Code)")
+        return
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    # ffmpeg picks its output muxer from the filename's extension -- it must
+    # end in .mp4, not just contain "mp4" somewhere in the name.
+    tmp_path = video_path.with_name(video_path.stem + ".tmp.mp4")
+    cmd = [
+        ffmpeg_exe, "-y", "-loglevel", "error",
+        "-i", str(video_path),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        str(tmp_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not tmp_path.is_file():
+        print(f"(H.264 transcode failed, leaving original FMP4 file as-is: {result.stderr.strip()[-500:]})")
+        tmp_path.unlink(missing_ok=True)
+        return
+    tmp_path.replace(video_path)
 
 
 if __name__ == "__main__":
