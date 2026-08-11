@@ -31,6 +31,11 @@
 # nowhere. --network host makes them the same loopback. Confirmed needed
 # 2026-08-11: GLFW errored "X11: Failed to open display localhost:10.0"
 # without this even with DISPLAY/XAUTHORITY correctly forwarded in.
+#
+# /workspace/repo (whole repo root) is for one-off authoring scripts outside
+# motion/sim's own scope (e.g. motion/walk_to_point/) that assume repo-root-
+# relative paths ("motion/motion_library/...") rather than the narrower
+# per-purpose mounts above -- run those with cwd=/workspace/repo.
 
 set -euo pipefail
 
@@ -78,6 +83,7 @@ docker run -d --name "$CONTAINER" \
     -v "$MOTION_ROOT/holomotion_ckpt:/workspace/ckpt" \
     -v "$MOTION_ROOT/motion_library:/workspace/motions" \
     -v "$MOTION_ROOT/sim:/workspace/sim" \
+    -v "$REPO_ROOT:/workspace/repo" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     -v "$HOME/.Xauthority:/root/.ssh-xauth:ro" \
     -e XAUTHORITY=/root/.ssh-xauth \
